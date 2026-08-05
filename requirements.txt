@@ -1,0 +1,24 @@
+# Nano-vLLM dependencies
+#
+# Verified on: Python 3.13.11 / CUDA 13.0 / RTX 5070 Laptop (Blackwell, sm_120).
+# Versions are pinned exactly: this project compares numerical output against
+# reference implementations, and a silent library upgrade is indistinguishable
+# from a bug in your kernel.
+#
+# torch and triton must match your CUDA build, so install them from the CUDA
+# wheel index first, then everything else:
+#
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r requirements.txt
+
+torch==2.11.0
+triton==3.6.0           # ships with torch; pinned because Phase 3 and 6 kernels target it
+
+transformers==5.14.1    # Phase 2: the correctness oracle, plus tokenizers
+safetensors==0.8.0      # Phase 2: weight loading
+
+numpy==2.4.2
+scipy==1.17.1           # Phase 7: chi-square test in test_rejection_sampler.py
+
+pytest==9.0.3
+hypothesis==6.152.9     # Phase 1: property tests over block pool operations
