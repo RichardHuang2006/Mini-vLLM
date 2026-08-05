@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+
+.venv/
+venv/
+
+# benchmark artifacts (Phase 8)
+bench_results/
+*.ncu-rep
+*.nsys-rep
+
+.DS_Store
