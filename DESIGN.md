@@ -1,13 +1,13 @@
 <div align="center">
 
-# Nano-vLLM
+# Mini-vLLM
 
-**A PagedAttention LLM inference engine**
+**A paged-attention LLM inference engine, built bottom-up**
 
-`Python` · `PyTorch` · `CUDA`
+`Python` · `PyTorch` · `CUDA C++`
 
-Single-node, multi-GPU-capable serving engine implementing paged KV cache management,<br/>
-continuous batching, fused attention/norm/MLP kernels, and speculative decoding.
+A single-GPU serving engine for Qwen3-0.6B: a readable reference model first,<br/>
+then hand-written CUDA kernels, then a paged KV cache and a continuous-batching scheduler.
 
 </div>
 
@@ -17,16 +17,17 @@ continuous batching, fused attention/norm/MLP kernels, and speculative decoding.
 
 | § | Section | Summary |
 |---|---|---|
-| [1](#1-goals--non-goals) | Goals / Non-Goals | What v1 does and deliberately does not do |
-| [2](#2-system-architecture) | System Architecture | Components and request lifecycle |
-| [3](#3-paged-kv-cache) | Paged KV Cache | Block pool, block tables, COW, radix prefix cache |
-| [4](#4-continuous-batching-scheduler) | Continuous Batching Scheduler | Iteration-level scheduling, preemption, chunked prefill |
-| [5](#5-fused-cuda-kernels) | Fused CUDA Kernels | FlashAttention, FP8 KV, RMSNorm + SwiGLU |
-| [6](#6-speculative-decoding) | Speculative Decoding | Draft/verify with distribution-preserving rejection sampling |
-| [7](#7-data--control-flow-summary) | Data / Control Flow | End-to-end path through the engine |
-| [8](#8-testing--validation) | Testing & Validation | Correctness strategy per subsystem |
-| [9](#9-performance-targets) | Performance Targets | Metrics and acceptance thresholds |
-| [10](#10-future-work) | Future Work | Post-v1 directions |
+| [1](#1-goals--non-goals) | Goals / Non-Goals | What this engine does and deliberately does not do |
+| [2](#2-notation) | Notation | The shape-symbol contract used everywhere |
+| [3](#3-the-qwen3-model) | The Qwen3 Model | Architecture we reconstruct in Phase 1 |
+| [4](#4-system-architecture) | System Architecture | Components and the request lifecycle |
+| [5](#5-cuda-kernels) | CUDA Kernels | Online softmax, tiling, occupancy |
+| [6](#6-paged-kv-cache) | Paged KV Cache | Block pool, block tables, page-walking attention |
+| [7](#7-continuous-batching-scheduler) | Continuous Batching Scheduler | Iteration-level scheduling, chunked prefill, piggybacking |
+| [8](#8-data--control-flow) | Data / Control Flow | End-to-end path through the engine |
+| [9](#9-testing--validation) | Testing & Validation | The differential-testing strategy |
+| [10](#10-performance-targets) | Performance Targets | Metrics and acceptance thresholds |
+| [11](#11-future-work) | Future Work | Deliberately deferred features |
 
 ---
 
@@ -36,30 +37,115 @@ continuous batching, fused attention/norm/MLP kernels, and speculative decoding.
 
 | Goal | Mechanism |
 |---|---|
-| Near-vLLM throughput on a single node | Paged KV cache + continuous batching |
-| Near-zero internal fragmentation in KV allocation | Fixed-size block pool, no contiguous per-sequence reservation |
-| Latency reduction **without** altering the output distribution | Speculative decoding with modified rejection sampling |
-| Kernel-level efficiency | Fused attention, fused norm + activation, FP8 KV cache |
+| Understand every layer of an inference engine by building it | Bottom-up: model → kernels → cache → scheduler |
+| A correct, readable reference at every step | A slow PyTorch path is kept as the oracle for each fast path |
+| Real GPU efficiency, written by hand | Hand-written CUDA C++ kernels for norm, activation, and attention |
+| Near-zero KV fragmentation and high batch occupancy | Paged KV cache + continuous batching |
 
 ### Non-Goals
 
-- **Multi-node tensor/pipeline parallelism.** Out of scope for v1; interfaces are left extensible.
-- **Weight quantization.** Only the KV cache is quantized (to FP8).
-- **General-purpose serving frontend.** No HTTP/gRPC layer — the engine exposes a Python API.
+These are cut on purpose to keep the course the size of [tiny-llm](https://github.com/skyzh/tiny-llm). Each is a
+reasonable follow-up once the main line works; none is on the critical path to a working engine.
+
+- **Radix-tree prefix caching.** Cross-request prefix reuse. Paging and COW are enough to demonstrate the block
+  abstraction; the radix tree is bookkeeping, not a new idea.
+- **FP8 KV quantization.** A memory win, not a correctness or architecture concept.
+- **CUDA graph capture.** A launch-overhead optimization layered on an already-correct decode path.
+- **Preemption by swap, speculative decoding, MoE, weight quantization.** Each is a self-contained extension.
+- **Multi-GPU, and any HTTP/gRPC frontend.** The engine exposes a Python API only.
 
 ---
 
-## 2. System Architecture
+## 2. Notation
+
+One symbol table, used in every design section and every plan step. Shapes are written most-significant dimension
+first, matching PyTorch's row-major layout.
+
+| Symbol | Meaning |
+|---|---|
+| `B` | Batch size (number of sequences in a forward pass) |
+| `L` | Query length — number of *new* tokens fed this step (`L = 1` in decode, `L > 1` in prefill) |
+| `S` | Key/value source length — total tokens attended to, including the cache |
+| `E` | Hidden size (`hidden_size`, the per-token embedding width) |
+| `H_q` | Number of query heads |
+| `H_k` | Number of key/value heads (`H_k ≤ H_q` under GQA; `H_q % H_k == 0`) |
+| `D` | Head dimension (`head_dim`) |
+| `V` | Vocabulary size |
+| `P` | Page size — tokens per KV block (a power of two, default 16) |
+| `N..` | Zero or more leading batch dimensions |
+
+The GQA group size is `G = H_q / H_k`: each KV head is shared by `G` query heads.
+
+---
+
+## 3. The Qwen3 Model
+
+Mini-vLLM builds **Qwen3-0.6B**, the same model as tiny-llm, so its book chapters can be read alongside this code.
+Qwen3-0.6B is a decoder-only transformer with these dimensions:
+
+| Field | Value |
+|---|---|
+| `num_hidden_layers` | 28 |
+| `hidden_size` (`E`) | 1024 |
+| `num_attention_heads` (`H_q`) | 16 |
+| `num_key_value_heads` (`H_k`) | 8 |
+| `head_dim` (`D`) | 128 |
+| `intermediate_size` | 3072 |
+| `vocab_size` (`V`) | 151936 |
+| `rms_norm_eps` | 1e-6 |
+| `rope_theta` | 1,000,000 |
+| `tie_word_embeddings` | true |
+
+Note `H_q · D = 16 · 128 = 2048 ≠ E = 1024`: the attention projection is *wider* than the hidden size, so `wq`
+maps `E → H_q·D` and `wo` maps `H_q·D → E`.
+
+**Per layer** (pre-norm residual):
+
+```text
+h  = x + Attention(RMSNorm(x))
+out = h + SwiGLU_MLP(RMSNorm(h))
+```
+
+**Attention block**, including the two features that distinguish Qwen3 from Qwen2.5:
+
+```text
+q = wq · x                              -> B, L, H_q, D
+k = wk · x                              -> B, L, H_k, D
+v = wv · x                              -> B, L, H_k, D
+q = RMSNorm(q, q_norm)                  # QK-norm: RMSNorm over the head_dim of q ...
+k = RMSNorm(k, k_norm)                  # ... and of k, before RoPE
+q = RoPE(q, positions)                  # rotary embedding takes explicit positions
+k = RoPE(k, positions)
+attn = softmax(q·kᵀ / sqrt(D) + causal_mask) · v   # GQA: each KV head serves G query heads
+out = wo · attn                         -> B, L, E
+```
+
+- **QK-norm.** An RMSNorm applied to each query and key head vector (over `D`) before RoPE. Qwen2.5 lacks it;
+  omitting it silently corrupts Qwen3 outputs.
+- **GQA.** `H_k < H_q`, so KV heads are repeated `G` times to match the query heads (or, in the fast kernels,
+  indexed with `q_head // G`). With Qwen3-0.6B, `G = 2`, so the `H_k` dimension is exercised for real.
+
+**SwiGLU MLP**: `down( silu(gate(x)) * up(x) )`, where `gate` and `up` map `E → intermediate`, `down` maps back.
+
+The LM head is tied to the embedding matrix (`tie_word_embeddings=true`): logits are `embedding_weightᵀ · h`.
+
+Weights are stored and computed in **BF16**; numerically sensitive reductions (RMSNorm mean-square, softmax,
+online-softmax state) accumulate in **FP32**.
+
+---
+
+## 4. System Architecture
+
+The engine is assembled in dependency order, and each layer is usable on its own before the next is added.
 
 ```mermaid
 flowchart TD
-    R["Incoming requests"] --> S["Scheduler"]
-    S <--> BM["BlockManager"]
-    BM --> BT[("Block tables<br/>and block pool")]
+    R["Incoming requests"] --> S["Scheduler<br/>(continuous batching)"]
+    S <--> BM["BlockManager<br/>(block pool + tables)"]
     S --> BB["Batch builder<br/>(ragged, mixed-phase)"]
-    BB --> MR["ModelRunner<br/>(CUDA graphs)"]
-    MR --> K["Fused kernels<br/>(attention / norm / MLP)"]
-    K --> SP["Sampler<br/>(+ SpecDecode verify)"]
+    BB --> M["Qwen3 model<br/>(paged)"]
+    M --> K["CUDA kernels<br/>(rmsnorm / rope / swiglu / attention)"]
+    K --> SP["Sampler"]
     SP --> OUT["Token stream out"]
     SP -.->|extend or free blocks| BM
     SP -.->|reschedule unfinished| S
@@ -67,273 +153,182 @@ flowchart TD
 
 **Request lifecycle**
 
-```
-enqueue → schedule → allocate blocks → forward pass → sample / verify
+```text
+enqueue → schedule → allocate blocks → forward pass → sample
         → free or extend blocks → repeat until EOS or max_len
 ```
 
+The build order deliberately runs *opposite* to the data-flow arrows: we build the model and kernels first (so we
+can generate text and measure it), and only then wrap them in the cache and scheduler that a production engine puts
+in front.
+
 ---
 
-## 3. Paged KV Cache
+## 5. CUDA Kernels
 
-### 3.1 Physical layout
+Every kernel replaces a slow PyTorch expression that already passed its test, and is checked against it. The point
+is not to beat cuBLAS; it is to write the tiling, the reductions, and the online softmax by hand and understand why
+they are shaped the way they are.
 
-The KV cache is a single pre-allocated tensor pool partitioned into fixed-size **blocks**:
+### 5.1 Elementwise and reduction kernels
 
-```text
-K_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-V_cache: [num_blocks, block_size, num_kv_heads, head_dim]
-```
-
-| Parameter | Value | Rationale |
+| Kernel | Collapses | Why it helps |
 |---|---|---|
-| `block_size` | 16 tokens (tunable) | Balances internal fragmentation against block-table overhead |
-| Allocation | Free list, non-contiguous | Removes the need for per-sequence contiguous reservation |
+| **RMSNorm** | mean-square reduction + normalize + scale → one kernel | Avoids two extra global-memory round trips over the activation |
+| **RoPE** | position table gather + rotate-pairs → one kernel | Fuses the rotation into a single pass over `q` and `k` |
+| **SwiGLU** | `silu(gate) * up` → one kernel after the two GEMMs | Avoids a separate elementwise pass over the intermediate |
 
-### 3.2 Block table indirection
+The design pattern for all three: **one CUDA block per row** (one token, or one head vector), vectorized loads
+(`float4` / `__half2`), and warp-level reductions (`__shfl_down_sync`) for any statistic. Because these ops are
+memory-bound, the score to report is achieved bandwidth versus the card's peak, not raw wall-clock.
 
-Each sequence owns a **block table**: a list of physical block indices mapping logical token
-position to physical storage.
+### 5.2 Attention: online softmax
 
-```text
-Sequence S (logical)  │ t0 t1 t2 ... t15 │ t16 t17 ...      │
-                      │     block 0      │     block 1      │
-Block table[S]        │       7          │       42         │  ← physical block ids
+Attention never materializes the full `S`-wide score row. It streams over K/V tiles, keeping a running max `m`,
+running denominator `l`, and accumulator `O`, rescaling on each tile — the FlashAttention recurrence:
 
-logical position p ──▶ physical block = block_table[p // block_size]
-                       offset         = p %  block_size
+```python
+for tile_j in kv_tiles:                 # streamed
+    S_j   = (Q @ K_j.T) * scale         # + causal mask inside the diagonal tile
+    m_new = max(m, rowmax(S_j))
+    P_j   = exp(S_j - m_new)
+    l     = exp(m - m_new) * l + rowsum(P_j)
+    O     = exp(m - m_new) * O + P_j @ V_j     # O rescaled by the SAME factor as l
+    m     = m_new
+O /= l                                  # final normalize
 ```
 
-Attention kernels gather K/V through the block table at launch time (passed as an `int32`
-tensor), with no host-side copy or reshape. This is precisely what buys non-contiguous
-physical storage while preserving contiguous logical semantics.
+The single most important idea in the course is that `O` is rescaled by `exp(m_old - m_new)` — the *same* factor as
+`l` — because the previously accumulated `P·V` terms were computed against the old maximum. Getting this wrong
+produces plausible-but-wrong text, the hardest kind of bug to catch.
 
-### 3.3 Copy-on-write block sharing
+Two attention shapes, both implemented twice (dense first, then paged):
 
-> Used for parallel sampling (beam / n-best) and shared prefixes.
+| Kernel | Query length | Grid | Extra concern |
+|---|---|---|---|
+| **Decode** | `L = 1` | one block per `(sequence, kv_head)` | Pure reduction over `S`; no query tiling |
+| **Prefill** | `L > 1` | one block per `(sequence, head, query-tile)` | Causal mask *within* the diagonal tile; skip tiles above the diagonal |
 
-Blocks are refcounted. Forking a sequence increments refcounts on shared blocks rather than
-copying them. On a write to a block with `refcount > 1`:
+Prefill tiles over queries as well as keys and uses shared memory to stage each K/V tile. Skipping key tiles
+strictly above the diagonal is both a real speedup and a classic source of off-by-one bugs.
 
-1. Allocate a new physical block.
-2. Copy the shared block's contents.
-3. Decrement the old refcount and repoint the forking sequence's block-table entry.
+### 5.3 Occupancy and correctness notes
 
-Only the **last partial block** is ever copied — earlier blocks in a shared prefix stay fully
-shared and effectively read-only for the sequence's lifetime.
+- **FP32 accumulation.** `m`, `l`, `O`, and the RMSNorm mean-square accumulate in FP32 even though storage is BF16.
+- **Shared-memory budget.** Prefill tile sizes are bounded by shared memory per SM (`sm_120`: 100 KB opt-in). The
+  tile size is a tunable, not a constant baked into the algorithm.
+- **`__syncthreads()` discipline.** Every shared-memory tile load is followed by a barrier before the tile is read.
+- **Correctness before speed.** The first version of the prefill kernel uses scalar FMA inner loops. A tensor-core
+  (`mma`) inner loop is an *optional* later upgrade behind the same correctness test.
 
-```text
-Before fork      seq A: [b0, b1, b2*]                          refcount(b2) = 1
-Fork → seq B     seq A: [b0, b1, b2*]   seq B: [b0, b1, b2*]   refcount(b2) = 2
-B appends        seq A: [b0, b1, b2*]   seq B: [b0, b1, b3 ]   refcount(b2) = 1
-                                                    └─ COW copy of b2
-```
+---
 
-### 3.4 Radix-tree prefix caching
+## 6. Paged KV Cache
 
-**Goal:** reuse KV blocks across *unrelated* requests that share a prompt prefix — system
-prompts, few-shot templates, shared document context.
+Introduced in Phase 4, only after continuous batching has shown why a growing dense cache does not scale.
 
-A global radix tree is keyed by token sequences; edges are labeled with token spans and nodes
-store the physical block id covering that span.
+### 6.1 Physical layout
 
-On each new request:
-
-1. Walk the tree, matching the incoming prompt at **block granularity** — a prefix only counts
-   as cached at a `block_size` boundary.
-2. Refcount and reuse the longest matching prefix's blocks under COW semantics ([§3.3](#33-copy-on-write-block-sharing)).
-3. Compute the remaining prompt suffix normally and insert it into the tree.
+One pre-allocated pool per layer, partitioned into fixed-size **pages** (blocks) of `P` tokens:
 
 ```text
-root
-└── "You are a helpful..."                 (blk 3)
-    ├── "...assistant. Answer concisely."  (blk 7)  ← req A, req C
-    └── "...assistant. Answer in detail."  (blk 9)  ← req B
+K_cache: [num_blocks, P, H_k, D]
+V_cache: [num_blocks, P, H_k, D]
 ```
 
-**Eviction.** LRU over tree leaves. A node becomes evictable only once its block's refcount
-reaches zero (no live sequence references it). Eviction then walks upward, merging internal
-nodes that have become childless.
+Allocation is a free list, so pages are non-contiguous — this is what removes per-sequence contiguous reservation
+and the fragmentation it causes.
 
-### 3.5 Block manager API
+### 6.2 Block table indirection
+
+Each sequence owns a **block table** mapping logical position to physical page:
+
+```text
+logical position p ──▶ physical block = block_table[p // P]
+                       offset         = p %  P
+```
+
+The attention kernel performs this gather *inside* the kernel via index arithmetic on an `int32` `block_table`
+tensor — there is no host-side scatter/gather and no reshape. This is what buys non-contiguous physical storage
+while preserving contiguous logical semantics.
+
+### 6.3 Copy-on-write sharing
+
+Pages are refcounted. Forking a sequence increments refcounts rather than copying. On a write to a page with
+`refcount > 1`, allocate a fresh page, copy, decref the old, and repoint the block-table entry. Only the last
+partial page is ever copied; earlier pages of a shared prefix stay shared.
+
+### 6.4 Block manager API
 
 ```python
 class BlockManager:
-    def allocate(self, seq_id, num_tokens) -> BlockTable: ...
-    def can_allocate(self, num_tokens) -> bool: ...            # scheduler admission control
-    def append_slot(self, seq_id) -> PhysicalBlockId: ...      # grow by one block
-    def fork(self, parent_seq_id, child_seq_id) -> None: ...   # COW refcount bump
-    def free(self, seq_id) -> None: ...
-    def match_prefix(self, token_ids) -> tuple[BlockTable, int]: ...  # radix lookup
+    def can_allocate(self, num_tokens) -> bool: ...   # scheduler admission control
+    def allocate(self, seq) -> None: ...              # reserve pages for a new sequence
+    def append_slot(self, seq) -> None: ...           # grow by one token, add a page if needed
+    def fork(self, parent, child) -> None: ...         # COW refcount bump, zero copies
+    def free(self, seq) -> None: ...
 ```
 
 ---
 
-## 4. Continuous Batching Scheduler
+## 7. Continuous Batching Scheduler
 
-### 4.1 Iteration-level scheduling
+Design goal: a scheduling decision may change *timing*, never *output*. Every scheduler test asserts token-identical
+output against the single-sequence path.
 
-Unlike static (request-level) batching, the batch is re-formed **every decode iteration**:
+### 7.1 Iteration-level scheduling
+
+The batch is re-formed **every decode iteration**, not held fixed for a request's lifetime:
 
 ```python
-while True:
-    running = admit_new_requests(waiting_queue, budget=token_budget)
-    batch   = build_batch(running)            # mixed prefill + decode
-    logits  = model_runner.forward(batch)
-    tokens  = sampler.sample(logits)          # or spec-decode verify (§6)
-
+while work_remains:
+    running = admit_new_requests(waiting, budget=token_budget)   # gated by can_allocate
+    batch   = build_batch(running)                               # mixed prefill + decode
+    logits  = model.forward(batch)
+    tokens  = sampler.sample(logits)
     for seq in running:
-        if seq.is_done():
-            free(seq)
-            emit(seq)
-        else:
-            block_manager.append_slot_if_needed(seq)
+        if seq.is_done(): free(seq); emit(seq)
+        else:             block_manager.append_slot(seq)
 ```
 
-A finished sequence is evicted and replaced by a waiting one **within the same iteration
-boundary**, so there is no head-of-line blocking behind the longest sequence in the batch.
+A finished sequence is replaced by a waiting one within the same iteration boundary, so there is no head-of-line
+blocking behind the longest sequence in the batch.
 
-### 4.2 Iteration-level preemption
+### 7.2 Chunked prefill
 
-When admission would exceed the free block count, the scheduler preempts the lowest-priority
-running sequence (FCFS or priority-weighted) and picks a recovery strategy via cost model:
-
-| Strategy | Action | Best when |
-|---|---|---|
-| **Swap** | Copy KV blocks to CPU pinned memory, free the GPU blocks | Sequence is long; PCIe transfer beats recompute |
-| **Recompute** | Drop KV blocks; re-run prefill from prompt + generated tokens on resume | Sequence is short relative to swap bandwidth |
-
-Preempted sequences re-enter the waiting queue **at the front** to avoid starvation.
-
-### 4.3 Chunked prefill
-
-Long prompts are split into fixed-size chunks (e.g. 512 tokens) and spread across iterations,
-interleaved with other sequences' decode steps, instead of monopolizing an iteration:
+Long prompts are split into fixed-size chunks and spread across iterations, tracked by a `num_computed_tokens`
+counter on the sequence, so a 2000-token prefill cannot monopolize an iteration:
 
 ```text
 token_budget = 2048 per iteration
-
-iteration i    │ prefill_chunk(seqA, 512) │ decode(seqB) │ decode(seqC) │ ...
-iteration i+1  │ prefill_chunk(seqA, 512) │ decode(seqB) │ decode(seqC) │ ...
+iter i    │ prefill_chunk(A, 512) │ decode(B) │ decode(C) │ ...
+iter i+1  │ prefill_chunk(A, 512) │ decode(B) │ decode(C) │ ...
 ```
 
-This bounds tail latency for decode-phase requests that would otherwise stall behind a long
-prefill — the classic head-of-line problem in prefill-prioritized batching.
+This bounds tail latency for decode-phase requests that would otherwise stall behind a long prefill.
 
-### 4.4 Stall-free piggyback decoding
+### 7.3 Stall-free piggyback decoding
 
-When a prefill chunk does not fill the token budget, the scheduler piggybacks pending
-single-token decode steps from other sequences into the *same* forward pass, rather than
-issuing a separate near-empty kernel launch:
+When a prefill chunk does not fill the token budget, pending single-token decodes are piggybacked into the *same*
+forward pass:
 
 ```text
-Batch = │ prefill_chunk(seqA, 300 tok) │ decode(seqB, 1) │ decode(seqC, 1) │ ...
-        └────────── one fused forward pass, ragged sequence lengths ─────────┘
+Batch = │ prefill_chunk(A, 300) │ decode(B, 1) │ decode(C, 1) │ ...
+        └────── one ragged forward pass, query length varies per sequence ──────┘
 ```
 
-This requires the attention kernel to handle **ragged batches** — query length varies from 1
-(decode) up to the chunk size (prefill) — in a single launch. Per-sequence metadata
-(`seq_lens`, `context_lens`, `block_tables`) is passed as tensors, so there is no host-side
-branching per sequence.
+This is why the attention kernel must accept **ragged batches**: query length varies from 1 (decode) to the chunk
+size (prefill) within one launch, with per-sequence loop bounds read from `seq_lens` / `context_lens` tensors and no
+host-side per-sequence branching.
 
-### 4.5 Admission control
+### 7.4 Admission control
 
-`can_allocate()` ([§3.5](#35-block-manager-api)) gates admission: a waiting request is pulled into `running` only if
-the block manager can guarantee blocks for at least one more decode step. This prevents an OOM
-mid-iteration.
+`can_allocate()` gates admission: a waiting request enters `running` only if the manager can guarantee pages for at
+least one more decode step, which prevents an OOM mid-iteration.
 
 ---
 
-## 5. Fused CUDA Kernels
-
-### 5.1 FlashAttention (paged, ragged)
-
-Tiled computation loops over K/V blocks fetched via the block table ([§3.2](#32-block-table-indirection)), never
-materializing the full attention matrix. **Online softmax** keeps a running max `m_i` and
-running sum `l_i` per tile, eliminating a separate max-reduction pass over the full sequence:
-
-```python
-for tile_j in kv_tiles:                                  # streamed via block table
-    S_j   = (Q @ K_j.T) * scale
-    m_new = max(m_i, rowmax(S_j))
-    P_j   = exp(S_j - m_new)
-    l_new = exp(m_i - m_new) * l_i + rowsum(P_j)
-    O_i   = exp(m_i - m_new) * O_i + P_j @ V_j
-    m_i, l_i = m_new, l_new
-
-O_i /= l_i                                               # final rescale
-```
-
-- **Grid:** one CTA per `(sequence, query-head, query-tile)`.
-- **Ragged lengths:** handled by a per-CTA loop bound read from `seq_lens[seq_id]`.
-- **Paged gather:** performed inside the kernel via index arithmetic
-  (`block_table[pos // block_size]`, `pos % block_size`) — not a host-side scatter/gather op.
-
-### 5.2 FP8 KV quantization
-
-- K/V stored as FP8 (E4M3) with a per-block scale factor (per-tensor is tunable), computed at
-  write time.
-- Dequantization is fused into the attention kernel's K/V load — load FP8 byte, convert,
-  multiply by scale, all inline in the tile-loading step before the QKᵀ GEMM. No separate
-  dequant pass.
-- Halves the KV cache footprint versus FP16, which translates proportionally into more
-  concurrent sequences per fixed GPU memory budget.
-
-### 5.3 Fused RMSNorm + SwiGLU
-
-| Fusion | What it collapses | Why |
-|---|---|---|
-| **RMSNorm** | Mean-square reduction + normalize + scale → one kernel | Avoids writing the intermediate normalized tensor to global memory twice |
-| **SwiGLU MLP** | `SiLU(xW1) * (xW3)` gate → one kernel after the two GEMMs | Avoids a separate elementwise pass over the intermediate activation |
-
-Both use vectorized loads (`float4` / `half2`) and warp-level reductions for the norm statistic.
-
----
-
-## 6. Speculative Decoding
-
-### 6.1 Mechanism
-
-A small draft model proposes `k` tokens autoregressively (cheap and sequential). The target
-model then verifies all `k` proposals **in a single forward pass** — verification is just
-scoring, so there is no sequential dependency until acceptance is resolved.
-
-```text
-draft    d1 → d2 → d3 → d4                        k = 4, sequential, cheap
-target   forward([prefix, d1, d2, d3, d4])        logits for positions 1..4 in ONE pass
-verify   rejection-sample each position against the target distribution
-```
-
-### 6.2 Rejection sampling (distribution-preserving)
-
-For each proposed token `d_i` with draft probability `q(d_i)` and target probability `p(d_i)`:
-
-```text
-accept d_i with probability  min(1, p(d_i) / q(d_i))
-
-if rejected:
-    sample a replacement from  normalize(max(0, p - q))
-    stop — discard remaining proposals d_{i+1..k}
-
-if all k accepted:
-    sample one bonus token from p(·) at position k+1     (a free extra token)
-```
-
-> This is the standard Leviathan/Chen-style modified rejection sampling. It guarantees the
-> accepted sequence is distributed **exactly** as if sampled from the target model alone,
-> independent of draft quality — draft quality affects *speed*, never *correctness*.
-
-### 6.3 Scheduler integration
-
-- Draft + verify is treated as a single scheduling unit. KV cache for the draft's speculative
-  tokens is allocated eagerly and truncated on rejection: the block manager rolls the block
-  table length back to the accepted position, which is pure metadata with no data movement.
-- `k` is tunable per request, or adapted online from the rolling acceptance rate — raise `k`
-  when acceptance is high, shrink it when acceptance drops to cut wasted verification compute.
-
----
-
-## 7. Data / Control Flow Summary
+## 8. Data / Control Flow
 
 ```mermaid
 sequenceDiagram
@@ -341,52 +336,77 @@ sequenceDiagram
     participant C as Client
     participant S as Scheduler
     participant B as BlockManager
-    participant M as ModelRunner
-    participant D as SpecDecode / Sampler
+    participant M as Qwen3 (paged)
+    participant D as Sampler
 
-    C->>S: submit request
-    S->>B: match_prefix (radix cache)
-    B-->>S: cached blocks + matched_len
-    S->>B: allocate (remaining tokens)
-    S->>M: ragged batch (chunked prefill + decode + piggyback, §4.4)
-    M->>M: fused kernels (§5)
+    C->>S: submit request(s)
+    S->>B: can_allocate? then allocate
+    S->>M: ragged batch (chunked prefill + decode piggyback)
+    M->>M: CUDA kernels (§5)
     M->>D: logits
-    D->>D: verify (§6) or sample
     D->>B: append_slot / free
     D-->>C: emit token(s) / mark done
+    D-->>S: reschedule unfinished
 ```
 
 ---
 
-## 8. Testing & Validation
+## 9. Testing & Validation
+
+The central difficulty: a wrong answer still looks like fluent text. Correctness cannot be eyeballed. So every fast
+component is checked against a slow, obvious one that already passed — **differential testing**.
+
+```mermaid
+flowchart LR
+    HF["HuggingFace<br/>transformers"] -->|"Phase 1"| REF["Readable model<br/>(dense, PyTorch)"]
+    REF -->|"Phase 2"| CACHE["Cached model<br/>(dense KV)"]
+    CACHE -->|"Phase 3"| CUDA["CUDA kernels"]
+    CUDA -->|"Phase 4"| PAGED["Paged + scheduled"]
+```
 
 | Area | Test | Pass criterion |
 |---|---|---|
-| **Paging correctness** | Paged attention vs. reference unpaged (contiguous KV) implementation on identical inputs | Match within FP16/FP8 numerical tolerance |
-| **COW correctness** | Fork a sequence, mutate one branch | Other branch's tokens/logits unaffected; refcounts return to 0 after both are freed |
-| **Radix cache correctness** | Two requests sharing a prefix vs. run independently | Identical logits for the shared portion — no cross-contamination via cache reuse |
-| **Spec-decode distribution** | KS test on token frequency over many trials | Output distribution matches target-only sampling |
-| **Scheduler stress** | Adversarial mix of very long and very short sequences | Chunked prefill bounds decode tail latency vs. a naive prefill-prioritized baseline |
+| Model correctness | Full forward vs. HF `transformers` | Logits within FP16 tolerance **and** greedy tokens match exactly for 32 steps |
+| Each CUDA kernel | Kernel vs. the PyTorch expression it replaces | Match within tolerance; greedy tokens unchanged end to end |
+| Paging correctness | Paged attention vs. dense-gather reference, with a **shuffled** block table | Identical output — the shuffle proves the indirection |
+| COW correctness | Fork, mutate one branch | Other branch unchanged; refcounts return to 0 after both freed |
+| Scheduler | Chunked / piggybacked / preempted runs vs. single-sequence | **Token-identical** output; a leak check confirms no pages leak |
+
+Two levers make this sharp:
+
+- **Greedy decoding** (`temperature=0`) forces two correct implementations to produce *token-identical* output — a
+  far stronger signal than comparing float tensors.
+- **A leak-check fixture** asserts the block pool is fully free at teardown, catching refcount bugs at the moment
+  they are introduced.
+
+### Numerical tolerances
+
+| Comparison | rtol / atol | Note |
+|---|---|---|
+| Single op, FP32 | `1e-5` | Near-exact |
+| Single op, BF16 | `1e-2` | Reductions in different orders |
+| Full-model logits, BF16 | `2e-2` | Error accumulates across 28 layers |
+| Greedy token IDs | **exact** | The strongest check — prefer it |
 
 ---
 
-## 9. Performance Targets
+## 10. Performance Targets
 
 | Metric | Target |
 |---|---|
-| Throughput (tok/s, batched) | Parity with reference vLLM on the same GPU and model |
-| KV cache fragmentation | Near-zero — paging eliminates internal fragmentation by construction |
+| Model correctness | Greedy output token-identical to HF `transformers` |
+| Kernel bandwidth (RMSNorm/RoPE/SwiGLU) | A reported fraction of the card's peak memory bandwidth |
+| Attention throughput | Within a stated factor of PyTorch SDPA on the same shapes |
+| Batched throughput (tok/s) | Large win over HF `generate` at batch sizes > 1 — the paging + continuous-batching payoff |
+| KV fragmentation | Near-zero by construction |
 | P99 decode latency under mixed load | Bounded by chunked prefill; no unbounded head-of-line stall |
-| Speculative decoding speedup | ≥ 1.5–2× wall-clock decode-step reduction at acceptance rate ≥ 0.6–0.7 |
-| KV memory footprint | ~2× reduction via FP8 versus the FP16 baseline |
+
+Hardware of record: RTX 5070 Laptop, 8 GB, Blackwell `sm_120`.
 
 ---
 
-## 10. Future Work
+## 11. Future Work
 
-- **Tensor parallelism** — shard the block manager and attention kernels across multiple GPUs.
-- **Adaptive block size** — select per model from `head_dim` / `num_heads` to minimize
-  block-table overhead.
-- **Tree speculative decoding** — verify multiple draft branches simultaneously rather than a
-  single linear chain.
-- **Disaggregated prefill/decode** — run the two phases on separate GPU pools.
+The [Non-Goals](#1-goals--non-goals) are the natural extensions, each with a ready-made correctness test once the
+main line is green: radix-tree prefix caching, FP8 KV quantization, CUDA graph capture, preemption by swap,
+speculative decoding, tensor/pipeline parallelism, and a network serving frontend.
