@@ -141,6 +141,7 @@ class LLM:
         max_sequences: int = 32,
         chunk_size: int = 512,
         enable_chunked_prefill: bool = True,
+        prefill_priority: bool = False,
         use_cuda_kernels: bool = True,
         kv_fraction: float = DEFAULT_KV_FRACTION,
     ) -> None:
@@ -182,6 +183,7 @@ class LLM:
                 max_sequences=max_sequences,
                 chunk_size=chunk_size,
                 enable_chunked_prefill=enable_chunked_prefill,
+                prefill_priority=prefill_priority,
             ),
             manager=self.manager,
         )
@@ -222,6 +224,25 @@ class LLM:
             self.config.head_dim,
             self.config.dtype,
         )
+
+    def reconfigure(self, **changes) -> None:
+        """Swap the scheduling policy between runs, keeping the weights and the pool.
+
+        For [Step 5.2](../../PLAN.md)'s A/B, where the same request set is replayed
+        under chunked prefill and under a prefill-prioritized baseline. Loading the
+        model twice to change one boolean would double the resident weights and halve
+        the pool the second engine sizes itself against, which would make the two runs
+        differ in more than the policy.
+
+        Only between runs: the queues have to be empty, because a sequence mid-prefill
+        has been chunked under a policy that is about to stop existing.
+        """
+        if self.scheduler.num_unfinished:
+            raise ValueError(
+                f"{self.scheduler.num_unfinished} sequences are still in flight; "
+                "the policy can only change between runs"
+            )
+        self.scheduler = Scheduler(replace(self.scheduler.config, **changes), manager=self.manager)
 
     # ---------------------------------------------------------------- admission
 

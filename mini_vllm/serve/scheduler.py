@@ -60,12 +60,20 @@ class SchedulerConfig:
     ``enable_chunked_prefill`` defaults on as of [Step 4.4] and exists as a flag
     because turning it off is how the tests get their reference: the same prompt in
     one pass, which must produce the same logits as the chunked run.
+
+    ``prefill_priority`` inverts the pass order — prompts before decode steps — which
+    is the policy vLLM shipped before chunked prefill and the baseline
+    [Step 5.2](../../PLAN.md) measures against. It is off because it is worse: with
+    it on, a prompt long enough to eat the budget leaves nothing for the sequences a
+    caller is already reading, and their next token waits for the whole prompt. Kept
+    reachable so that claim can be a number instead of an assertion.
     """
 
     max_batched_tokens: int = 2048
     max_sequences: int = 16
     chunk_size: int = 512
     enable_chunked_prefill: bool = True
+    prefill_priority: bool = False
 
     def __post_init__(self) -> None:
         if self.max_batched_tokens < 1:
@@ -198,6 +206,10 @@ class Scheduler:
         cannot get its next slot preempts the newest running sequence and tries again,
         which keeps the oldest requests — the ones a caller has been waiting on
         longest — making progress under pressure.
+
+        `prefill_priority` runs the same three passes in the opposite order. It is the
+        baseline, not an alternative: what it buys is a prompt that finishes a little
+        sooner, and what it costs is every decode behind that prompt.
         """
         output = SchedulerOutput()
         budget = self.config.max_batched_tokens
@@ -213,8 +225,45 @@ class Scheduler:
         for sequence in self.running:
             (prefilling if sequence.is_prefill() else decoding).append(sequence)
 
-        for sequence in decoding:
-            if sequence.num_uncomputed_tokens == 0:
+        if self.config.prefill_priority:
+            budget = self._advance(prefilling, output, budget, promised)
+            budget = self._admit(output, budget, promised)
+            budget = self._advance(decoding, output, budget, promised)
+        else:
+            budget = self._advance(decoding, output, budget, promised)
+            budget = self._advance(prefilling, output, budget, promised)
+            budget = self._admit(output, budget, promised)
+
+        if not output.scheduled and self.has_work and self.manager is not None:
+            # Every other empty iteration is impossible: the token budget is at least 1
+            # and both queues are non-empty, so something would have been scheduled.
+            # This one means the pool cannot back a single sequence of this length, and
+            # returning an empty batch would leave the engine spinning on it forever.
+            raise OutOfBlocks(
+                f"nothing can run: {len(self.running)} running and {len(self.waiting)} waiting "
+                f"sequences with {self.manager.num_free_blocks} of "
+                f"{self.manager.num_blocks} blocks free. The pool is too small for even one "
+                "sequence at this length — raise num_blocks or shorten the request."
+            )
+        return output
+
+    # ----------------------------------------------------------------- the passes
+
+    def _advance(
+        self,
+        sequences: list[Sequence],
+        output: SchedulerOutput,
+        budget: int,
+        promised: dict[int, int],
+    ) -> int:
+        """Give each already-running sequence its next tokens, in the order given.
+
+        Returns what is left of the budget. It can *grow*: preempting a victim that
+        was already scheduled this iteration hands its tokens back, which is why the
+        budget is threaded through rather than kept as a field.
+        """
+        for sequence in sequences:
+            if not sequence.is_prefill() and sequence.num_uncomputed_tokens == 0:
                 # Nothing to feed it and it has not finished, so the loop would spin
                 # forever. It means `commit` was called without the sampled token for
                 # a sequence that had finished its prompt — worth saying plainly here
@@ -233,17 +282,10 @@ class Scheduler:
                 continue
             self._schedule(output, sequence, count, promised)
             budget += refund - count
+        return budget
 
-        for sequence in prefilling:
-            count = self._tokens_for(sequence, budget)
-            if count == 0:
-                continue
-            refund = self._make_room_for(sequence, count, output, promised)
-            if refund is None:
-                continue
-            self._schedule(output, sequence, count, promised)
-            budget += refund - count
-
+    def _admit(self, output: SchedulerOutput, budget: int, promised: dict[int, int]) -> int:
+        """Take arrivals off the front of the waiting queue while they fit."""
         while self.waiting and len(self.running) < self.config.max_sequences:
             candidate = self.waiting[0]
             count = self._tokens_for(candidate, budget)
@@ -269,19 +311,7 @@ class Scheduler:
             self.running.append(candidate)
             self._schedule(output, candidate, count, promised)
             budget -= count
-
-        if not output.scheduled and self.has_work and self.manager is not None:
-            # Every other empty iteration is impossible: the token budget is at least 1
-            # and both queues are non-empty, so something would have been scheduled.
-            # This one means the pool cannot back a single sequence of this length, and
-            # returning an empty batch would leave the engine spinning on it forever.
-            raise OutOfBlocks(
-                f"nothing can run: {len(self.running)} running and {len(self.waiting)} waiting "
-                f"sequences with {self.manager.num_free_blocks} of "
-                f"{self.manager.num_blocks} blocks free. The pool is too small for even one "
-                "sequence at this length — raise num_blocks or shorten the request."
-            )
-        return output
+        return budget
 
     # ------------------------------------------------------------ memory pressure
 

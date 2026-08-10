@@ -36,24 +36,35 @@ takes one padded rectangle, so sixteen prompts of 32 to 512 tokens all run for 5
 the engine gives each sequence its own length and admits a replacement the iteration a
 request finishes. Continuous batching and paging are what that gap is made of.
 
+`--mode scheduler` (Step 5.2) measures the *scheduler* rather than the model, on an
+adversarial mix: many 32-token requests with a 2048-token prompt dropped in every
+twentieth, arriving on a Poisson schedule. It replays that schedule twice through one
+engine — once with chunked prefill, once with the prefill-prioritized policy vLLM
+shipped before it — and reports the tail of the inter-token latency. Throughput barely
+moves between the two, which is the point: the same work is done either way, and what
+changes is who waits for it.
+
 Run it::
 
     python -m mini_vllm.bench --mode single --input-len 128 --output-len 128 --warmup 2
     python -m mini_vllm.bench --mode single --compare hf
     python -m mini_vllm.bench --mode kernels
     python -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16 --compare hf
+    python -m mini_vllm.bench --mode scheduler --num-requests 2000
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import random
 import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable, Sequence as SequenceABC
+from dataclasses import dataclass, field
 
 import torch
 
@@ -66,7 +77,9 @@ __all__ = [
     "ClockSampler",
     "GpuState",
     "KernelCase",
+    "LatencyStats",
     "SingleResult",
+    "StressRequest",
     "ThroughputResult",
     "build_input_ids",
     "copy_ceiling",
@@ -77,6 +90,10 @@ __all__ = [
     "measure_hf",
     "measure_hf_throughput",
     "measure_ours",
+    "percentile",
+    "poisson_arrivals",
+    "run_stress",
+    "stress_requests",
     "theoretical_bandwidth",
     "throughput_prompts",
 ]
@@ -639,6 +656,44 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 )
             )
 
+        # A prefill chunk, which is the case the scalar kernel *loses*: the oracle
+        # materializes an L x S score matrix but computes it with cuBLAS, and tensor
+        # cores beat any amount of shared-memory tidiness at this arithmetic intensity.
+        # It is in the table because leaving it out would be choosing the shapes that
+        # flatter the kernel — see [Step 3.6] in PLAN.md, deferred on purpose.
+        for query_len, context_len in ((512, 2048), (2048, 2048)):
+            blocks_each = -(-context_len // block_size)
+            keys = torch.randn(
+                blocks_each, block_size, kv_heads, head_dim, device="cuda", dtype=dtype
+            )
+            values = torch.randn_like(keys)
+            block_tables = (
+                torch.randperm(blocks_each, device="cuda", dtype=torch.int32)
+                .reshape(1, blocks_each)
+                .contiguous()
+            )
+            q = torch.randn(query_len, query_heads, head_dim, device="cuda", dtype=dtype)
+            cu_seqlens = torch.tensor([0, query_len], device="cuda", dtype=torch.int32)
+            contexts = torch.tensor([context_len], device="cuda", dtype=torch.int32)
+            lengths = torch.tensor([query_len], device="cuda", dtype=torch.int32)
+            moved = (
+                q.numel() + keys.numel() + values.numel()
+            ) * q.element_size()
+
+            paged = (keys, values, block_tables, cu_seqlens, contexts, lengths)
+            cases.append(
+                KernelCase(
+                    label=f"paged_attention L={query_len} S={context_len} (prefill chunk)",
+                    kernel=lambda q=q, p=paged, ql=query_len, s=context_len: module.paged_attention(
+                        q, *p, ql, s, scale
+                    ),
+                    reference=lambda q=q, p=paged, ql=query_len, s=context_len: ops.paged_attention(
+                        q, *p, ql, s, scale
+                    ),
+                    bytes_moved=moved,
+                )
+            )
+
     return cases
 
 
@@ -888,6 +943,357 @@ def report_throughput(arguments) -> None:
     _report_gpu_state(state)
 
 
+# -------------------------------------------------------------- scheduler stress
+
+# The adversarial mix, and every default here is chosen to make the head-of-line stall
+# visible rather than to flatter the scheduler. Many short requests are what a chat
+# workload is; the occasional 2048-token prompt is a document summary landing in the
+# middle of it, and it is the one request that can hurt everybody else.
+STRESS_SHORT_LEN = 32
+STRESS_LONG_LEN = 2048
+STRESS_LONG_EVERY = 20
+STRESS_OUTPUT_LEN = 32
+
+
+@dataclass(frozen=True)
+class StressRequest:
+    """One arrival: when it shows up, what it asks for, and how much it wants back."""
+
+    arrival: float
+    prompt_token_ids: tuple[int, ...]
+    output_len: int
+
+    @property
+    def prompt_len(self) -> int:
+        return len(self.prompt_token_ids)
+
+
+def poisson_arrivals(num_requests: int, rate: float, seed: int = 0) -> list[float]:
+    """Arrival times of a Poisson process of `rate` requests per second.
+
+    Poisson rather than evenly spaced because evenly spaced is the easy case: the hard
+    thing about a scheduler is a *burst*, and exponential gaps produce them for free —
+    a third of the gaps are shorter than a third of the mean. Rate 0 means "all at
+    once", which is the throughput workload from Step 5.1 rather than a serving one.
+    """
+    if num_requests < 0:
+        raise ValueError(f"num_requests must be >= 0, got {num_requests}")
+    if rate < 0:
+        raise ValueError(f"rate must be >= 0, got {rate}")
+    if rate == 0:
+        return [0.0] * num_requests
+
+    generator = random.Random(seed)
+    times, clock = [], 0.0
+    for _ in range(num_requests):
+        clock += generator.expovariate(rate)
+        times.append(clock)
+    return times
+
+
+def stress_requests(
+    num_requests: int,
+    rate: float,
+    vocab_size: int,
+    short_len: int = STRESS_SHORT_LEN,
+    long_len: int = STRESS_LONG_LEN,
+    long_every: int = STRESS_LONG_EVERY,
+    output_len: int = STRESS_OUTPUT_LEN,
+    seed: int = 0,
+) -> list[StressRequest]:
+    """`num_requests` arrivals, one long prompt every `long_every` short ones.
+
+    Prompts are random token ids, not text. Nothing here reads the output, and a
+    tokenizer call per request would put minutes of Python between the engine and the
+    thing being measured.
+    """
+    generator = random.Random(seed + 1)
+    arrivals = poisson_arrivals(num_requests, rate, seed)
+
+    requests = []
+    for index, arrival in enumerate(arrivals):
+        is_long = long_every > 0 and index % long_every == long_every - 1
+        length = long_len if is_long else short_len
+        prompt = tuple(generator.randrange(1, vocab_size) for _ in range(length))
+        requests.append(
+            StressRequest(arrival=arrival, prompt_token_ids=prompt, output_len=output_len)
+        )
+    return requests
+
+
+def percentile(values: SequenceABC[float], fraction: float) -> float:
+    """The nearest-rank percentile: the smallest sample at or above `fraction` of them.
+
+    No interpolation. A P99 that averages two neighbours reports a latency that no
+    request experienced, and the point of a tail figure is that somebody waited it.
+    """
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))
+    return ordered[index]
+
+
+@dataclass
+class LatencyStats:
+    """One policy's run over the stress mix, in the units an SLO is written in.
+
+    `inter_token` is the gap between consecutive tokens of the *same* sequence, which
+    is the latency a caller reading a stream actually sees. Its tail is the metric this
+    step exists to move: a mean hides a stall, because one iteration spent on a
+    2048-token prompt is amortized away by the hundreds of fast iterations around it.
+    """
+
+    label: str
+    num_requests: int
+    completed: int
+    generated_tokens: int
+    seconds: float
+    ttft: list[float] = field(default_factory=list)
+    inter_token: list[float] = field(default_factory=list)
+    iteration_seconds: list[float] = field(default_factory=list)
+    preemptions: int = 0
+    iterations: int = 0
+
+    @property
+    def tokens_per_second(self) -> float:
+        return self.generated_tokens / self.seconds if self.seconds else 0.0
+
+    @property
+    def p50_inter_token_ms(self) -> float:
+        return percentile(self.inter_token, 0.50) * 1000.0
+
+    @property
+    def p99_inter_token_ms(self) -> float:
+        return percentile(self.inter_token, 0.99) * 1000.0
+
+    @property
+    def max_inter_token_ms(self) -> float:
+        return max(self.inter_token, default=0.0) * 1000.0
+
+    @property
+    def max_iteration_ms(self) -> float:
+        """The slowest single iteration, which is the tail's floor.
+
+        Worth reporting beside the inter-token tail because it separates the two things
+        that produce a long gap: a decode that was not scheduled for several iterations
+        (a policy problem, which is what this mode is about) and one iteration that took
+        a long time (a machine problem — allocator growth, a driver stall, something else
+        on the GPU). A P99 gap of roughly one iteration is the scheduler behaving.
+        """
+        return max(self.iteration_seconds, default=0.0) * 1000.0
+
+    @property
+    def p99_iteration_ms(self) -> float:
+        return percentile(self.iteration_seconds, 0.99) * 1000.0
+
+    @property
+    def stalled_seconds(self) -> float:
+        """Total time callers spent waiting *beyond* a normal iteration, summed.
+
+        The load-robust view of the same thing the tail describes. A percentile answers
+        "how bad was the bad case", which depends on how many callers were unlucky and
+        therefore on the arrival rate; this answers "how much waiting did the policy
+        cause in total", which does not. One median iteration per gap is the floor —
+        nobody gets a token faster than the engine produces one — so only the excess
+        counts.
+        """
+        floor = percentile(self.iteration_seconds, 0.50)
+        return sum(max(gap - floor, 0.0) for gap in self.inter_token)
+
+    @property
+    def p50_ttft_ms(self) -> float:
+        return percentile(self.ttft, 0.50) * 1000.0
+
+    @property
+    def p99_ttft_ms(self) -> float:
+        return percentile(self.ttft, 0.99) * 1000.0
+
+    def describe(self) -> str:
+        return (
+            f"{self.label:<20} "
+            f"decode p50 {self.p50_inter_token_ms:6.1f} ms  "
+            f"p99 {self.p99_inter_token_ms:7.1f} ms  "
+            f"max {self.max_inter_token_ms:7.1f} ms   "
+            f"TTFT p99 {self.p99_ttft_ms:8.1f} ms   "
+            f"{self.tokens_per_second:7.1f} out tok/s"
+        )
+
+
+def run_stress(
+    llm, requests: SequenceABC[StressRequest], label: str, progress_every: int = 0
+) -> LatencyStats:
+    """Replay an arrival schedule through the engine, timing every token.
+
+    The driver is the honest shape for a synchronous engine: admit whatever is due,
+    run one iteration, record what came out. Arrivals are therefore quantized to
+    iteration boundaries, and the wait that quantization causes is counted in TTFT —
+    which is correct, because a real server admits at the same boundaries.
+
+    Timing is taken after `step` returns, and `step` samples, which reads a device
+    tensor and so waits for the iteration's work. No extra synchronize is needed and
+    adding one would time it.
+    """
+    pending = deque(sorted(requests, key=lambda request: request.arrival))
+    arrival_of: dict[int, float] = {}
+    last_token_at: dict[int, float] = {}
+    stats = LatencyStats(
+        label=label, num_requests=len(requests), completed=0, generated_tokens=0, seconds=0.0
+    )
+    preemptions_before = llm.stats.preemptions
+
+    started = time.perf_counter()
+    while pending or llm.scheduler.num_unfinished:
+        now = time.perf_counter() - started
+        while pending and pending[0].arrival <= now:
+            request = pending.popleft()
+            sequence = llm.add_request(
+                request.prompt_token_ids, max_tokens=request.output_len, ignore_eos=True
+            )
+            arrival_of[sequence.seq_id] = now
+
+        if not llm.scheduler.num_unfinished:
+            time.sleep(max(pending[0].arrival - now, 0.0))
+            continue
+
+        before = time.perf_counter()
+        emitted = llm.step()
+        stats.iteration_seconds.append(time.perf_counter() - before)
+
+        for sequence, _token in emitted:
+            at = time.perf_counter() - started
+            previous = last_token_at.get(sequence.seq_id)
+            if previous is None:
+                stats.ttft.append(at - arrival_of[sequence.seq_id])
+            else:
+                stats.inter_token.append(at - previous)
+            last_token_at[sequence.seq_id] = at
+            stats.generated_tokens += 1
+            stats.completed += int(sequence.is_done())
+
+        stats.iterations += 1
+        # The finished list is a record for the tests; over thousands of requests it
+        # would hold every prompt of the run in memory.
+        llm.scheduler.finished.clear()
+
+        if progress_every and stats.iterations % progress_every == 0:
+            print(
+                f"  {label}: {stats.completed}/{len(requests)} done, "
+                f"{len(pending)} unarrived, {llm.scheduler.num_unfinished} in flight",
+                flush=True,
+            )
+
+    stats.seconds = time.perf_counter() - started
+    stats.preemptions = llm.stats.preemptions - preemptions_before
+    llm.manager.check_no_leaks()
+    return stats
+
+
+def run_scheduler(arguments) -> tuple[list[LatencyStats], GpuState | None]:
+    """`--mode scheduler`: the same arrival schedule under both policies."""
+    from mini_vllm import LLM
+
+    print(f"loading {arguments.model} into the engine ...")
+    llm = LLM(
+        arguments.model,
+        device=arguments.device,
+        max_sequences=arguments.max_sequences,
+        max_batched_tokens=arguments.max_batched_tokens,
+        chunk_size=arguments.chunk_size,
+        use_cuda_kernels=arguments.use_cuda_kernels,
+        kv_fraction=arguments.kv_fraction,
+    )
+    print(f"  {llm}")
+
+    requests = stress_requests(
+        num_requests=arguments.num_requests,
+        rate=arguments.rate,
+        vocab_size=llm.config.vocab_size,
+        short_len=arguments.short_len,
+        long_len=arguments.long_len,
+        long_every=arguments.long_every,
+        output_len=arguments.output_len,
+        seed=arguments.seed,
+    )
+    long_prompts = sum(1 for request in requests if request.prompt_len == arguments.long_len)
+    print(
+        f"  {len(requests)} requests at {arguments.rate:.1f}/s: "
+        f"{len(requests) - long_prompts} of {arguments.short_len} tokens, "
+        f"{long_prompts} of {arguments.long_len}"
+    )
+
+    # Same requests, same engine, same pool — one boolean pair apart. The chunked run
+    # goes first so that a crash in the baseline still leaves the interesting number.
+    policies = (
+        ("chunked prefill", {"enable_chunked_prefill": True, "prefill_priority": False}),
+        ("prefill-priority", {"enable_chunked_prefill": False, "prefill_priority": True}),
+    )
+
+    results = []
+    with ClockSampler() as sampler:
+        for label, changes in policies:
+            print(f"running: {label} ...", flush=True)
+            llm.reconfigure(**changes)
+            results.append(run_stress(llm, requests, label, arguments.progress_every))
+
+    return results, sampler.peak
+
+
+def report_scheduler(arguments) -> None:
+    """Print the policy comparison for `--mode scheduler`."""
+    results, state = run_scheduler(arguments)
+
+    print(
+        f"\n{arguments.num_requests} requests, Poisson at {arguments.rate:.1f}/s, "
+        f"one {arguments.long_len}-token prompt every {arguments.long_every}, "
+        f"{arguments.output_len} output tokens each.\n"
+        f"budget {arguments.max_batched_tokens} tokens per iteration, "
+        f"chunk {arguments.chunk_size}.\n"
+    )
+    for result in results:
+        print(result.describe())
+        print(
+            f"{'':20} {result.completed} completed, {result.iterations} iterations "
+            f"(p99 {result.p99_iteration_ms:.0f} ms, slowest {result.max_iteration_ms:.0f} ms), "
+            f"{result.stalled_seconds:.1f} s of decode stalled, "
+            f"{result.preemptions} preemptions, no leaked blocks"
+        )
+
+    if len(results) == 2:
+        chunked, baseline = results
+        rows = (
+            ("worst decode gap", chunked.max_inter_token_ms, baseline.max_inter_token_ms, "ms"),
+            ("P99 decode gap", chunked.p99_inter_token_ms, baseline.p99_inter_token_ms, "ms"),
+            ("slowest iteration", chunked.max_iteration_ms, baseline.max_iteration_ms, "ms"),
+            ("decode stalled", chunked.stalled_seconds, baseline.stalled_seconds, "s"),
+            ("output rate", chunked.tokens_per_second, baseline.tokens_per_second, "tok/s"),
+        )
+        print("\nchunked prefill against the baseline, on identical arrivals:")
+        for label, ours, theirs, unit in rows:
+            print(
+                f"  {label:<20} {ours:8.1f} {unit:<6} vs {theirs:8.1f} {unit:<6} "
+                f"{theirs / max(ours, 1e-9):5.2f}x"
+            )
+
+        print(
+            f"\nThe worst gap is the claim that holds regardless of load. Chunking bounds an\n"
+            f"iteration to the {arguments.max_batched_tokens}-token budget, so it bounds the "
+            "longest a decode can wait —\nby configuration, rather than by whatever prompt "
+            f"happens to arrive. The baseline lets a\n{arguments.long_len}-token prompt take "
+            "an iteration to itself and excludes the decodes from it, so\ntheir wait is that "
+            "prompt's length plus the next iteration.\n"
+            "\n`decode stalled` is the same total waiting under both policies, which is the "
+            "honest\nshape of the result: chunked prefill *redistributes* the stall rather "
+            "than removing it —\nmany decodes waiting one chunk each instead of a few waiting "
+            "a whole prompt. Whether that\nshows up in P99 depends on how many decodes are in "
+            "flight when a long prompt lands, so\nread the P99 row together with the TTFT "
+            "above it: a run whose queue never grows has few\nvictims per prompt and a P99 "
+            "that misses them entirely."
+        )
+
+    _report_gpu_state(state)
+
+
 def build_input_ids(tokenizer, input_len: int, batch: int, device) -> torch.Tensor:
     """A prompt of exactly ``input_len`` tokens, repeated across the batch."""
     repeats = -(-input_len // max(len(tokenizer(FILLER).input_ids), 1))
@@ -1018,13 +1424,32 @@ def report_kernels(arguments) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Mini-vLLM.")
-    parser.add_argument("--mode", default="single", choices=["single", "kernels", "throughput"])
+    parser.add_argument(
+        "--mode", default="single", choices=["single", "kernels", "throughput", "scheduler"]
+    )
     parser.add_argument("--input-len", type=int, default=128)
-    parser.add_argument("--output-len", type=int, default=128)
+    # Resolved below, because the right default depends on the mode: a latency run
+    # wants a long generation from few requests, and a stress run wants the opposite.
+    parser.add_argument("--output-len", type=int, default=None)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--batch-sizes", default="1,4,16", help="--mode throughput: concurrency to sweep")
     parser.add_argument("--max-batched-tokens", type=int, default=2048)
+    parser.add_argument("--max-sequences", type=int, default=32)
+    parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--kv-fraction", type=float, default=0.4)
+    parser.add_argument("--num-requests", type=int, default=2000, help="--mode scheduler")
+    # Near what this card sustains on the mix below, because that is where a scheduler is
+    # interesting. Far under capacity, a long prompt catches only one or two decodes and
+    # the tail percentiles never see it; far over, every policy ends up with an unbounded
+    # queue and the tail measures the backlog instead of the decision. The run reports
+    # TTFT: around a second means the rate is about right for this machine, tens of
+    # seconds means lower it.
+    parser.add_argument("--rate", type=float, default=16.0, help="--mode scheduler: arrivals/sec")
+    parser.add_argument("--short-len", type=int, default=STRESS_SHORT_LEN)
+    parser.add_argument("--long-len", type=int, default=STRESS_LONG_LEN)
+    parser.add_argument("--long-every", type=int, default=STRESS_LONG_EVERY)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--progress-every", type=int, default=0, help="iterations between updates")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--model", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
@@ -1036,12 +1461,17 @@ def main() -> None:
         help="route ops through hand-written kernels where they exist (Phase 3)",
     )
     arguments = parser.parse_args()
+    if arguments.output_len is None:
+        arguments.output_len = STRESS_OUTPUT_LEN if arguments.mode == "scheduler" else 128
 
     if arguments.mode == "kernels":
         report_kernels(arguments)
         return
     if arguments.mode == "throughput":
         report_throughput(arguments)
+        return
+    if arguments.mode == "scheduler":
+        report_scheduler(arguments)
         return
 
     results, state = run_single(arguments)

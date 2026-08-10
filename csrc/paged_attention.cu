@@ -53,6 +53,20 @@ constexpr int kPrefillWarps = 8;
 constexpr int kPrefillThreads = kPrefillWarps * kWarpSize;  // one warp per query row
 constexpr int kPrefillTileKeys = 16;                        // K and V tiles in shared memory
 
+// How many keys a warp scores before it touches the running softmax. One at a time is
+// the readable version and it is what this kernel did first; it also spends most of its
+// issue slots waiting. Each key costs a cross-lane reduction of the dot product — five
+// dependent shuffles, and nothing else in that warp can proceed until the last one
+// lands — plus a rescale of the whole accumulator and two exponentials. Scoring a group
+// first gives the scheduler that many independent reduction chains to interleave, and
+// lets one rescale and one `expf(running_max - new_max)` cover the group.
+//
+// Eight measured fastest of 1, 4, 8 and 16 (13.3, 8.4, 7.5 and 11.7 ms for a 512-query
+// chunk over a 2048-token context, one layer, bf16). The curve has an interior optimum
+// because the scores and their weights are registers on top of the query and the
+// accumulator: too few and the reductions serialize, too many and occupancy falls.
+constexpr int kPrefillKeysPerStep = 8;
+
 // The head dimension is held in registers, `head_dim / 32` floats per lane, twice
 // over (the query and the accumulator). 256 keeps that at 8 + 8 registers; Qwen3-0.6B
 // uses 128.
@@ -385,31 +399,58 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
     __syncthreads();
 
     if (active) {
-      for (int j = 0; j < tile; ++j) {
-        if (tile_start + j >= visible) {
-          break;  // keys ascend, so the first masked one ends this row's tile
-        }
+      // Keys ascend, so this row's tile ends at the first masked one and `scoreable` is
+      // how many of the staged keys it may see at all.
+      const int scoreable =
+          static_cast<int>(min(static_cast<int64_t>(tile), max(visible - tile_start, int64_t{0})));
 
-        float dot = 0.0f;
+      for (int j = 0; j < scoreable; j += kPrefillKeysPerStep) {
+        const int count = min(kPrefillKeysPerStep, scoreable - j);
+
+        float dots[kPrefillKeysPerStep] = {};
         for (int i = 0; i < lanes; ++i) {
           const int64_t d = i * kWarpSize + lane;
           if (d < head_dim) {
-            dot += query_reg[i] * key_tile[j * head_dim + d];
+            const float query_value = query_reg[i];
+#pragma unroll
+            for (int u = 0; u < kPrefillKeysPerStep; ++u) {
+              if (u < count) {
+                dots[u] += query_value * key_tile[(j + u) * head_dim + d];
+              }
+            }
           }
         }
-        // Every lane needs the score: each holds its own slice of the accumulator
-        // and rescales it by the same factor.
-        dot = warp_all_reduce_sum(dot) * scale;
+        // Every lane needs every score: each holds its own slice of the accumulator and
+        // rescales it by the same factors. Four reductions issued together rather than
+        // one at a time is the whole of this loop's optimization.
+#pragma unroll
+        for (int u = 0; u < kPrefillKeysPerStep; ++u) {
+          dots[u] = warp_all_reduce_sum(dots[u]) * scale;
+        }
 
-        const float new_max = fmaxf(running_max, dot);
+        float step_max = -INFINITY;
+        for (int u = 0; u < count; ++u) {
+          step_max = fmaxf(step_max, dots[u]);
+        }
+        const float new_max = fmaxf(running_max, step_max);
         const float correction = __expf(running_max - new_max);
-        const float weight = __expf(dot - new_max);
 
-        running_sum = running_sum * correction + weight;
+        float weights[kPrefillKeysPerStep] = {};
+        float step_sum = 0.0f;
+        for (int u = 0; u < count; ++u) {
+          weights[u] = __expf(dots[u] - new_max);
+          step_sum += weights[u];
+        }
+        running_sum = running_sum * correction + step_sum;
+
         for (int i = 0; i < lanes; ++i) {
           const int64_t d = i * kWarpSize + lane;
           if (d < head_dim) {
-            accumulator[i] = accumulator[i] * correction + weight * value_tile[j * head_dim + d];
+            float total = accumulator[i] * correction;
+            for (int u = 0; u < count; ++u) {
+              total += weights[u] * value_tile[(j + u) * head_dim + d];
+            }
+            accumulator[i] = total;
           }
         }
         running_max = new_max;
