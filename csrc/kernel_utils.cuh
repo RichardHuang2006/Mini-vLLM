@@ -70,13 +70,20 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
   return value;
 }
 
-// Sum across the whole block: reduce within each warp by shuffling, then reduce
-// the one partial per warp in the first warp. Only thread 0's result is valid,
-// which is enough — the caller broadcasts it through shared memory.
+// Both block reductions below share one contract, and getting it wrong is the
+// classic source of a kernel that is right at 32 threads and wrong at 256:
 //
-// `scratch` is passed in rather than declared here so a kernel that reduces more
-// than once (attention reduces a max and a sum) controls its own shared memory
-// and the barriers around it.
+//   * only thread 0's return value is meaningful — broadcast it through shared
+//     memory if the rest of the block needs it;
+//   * `scratch` must hold at least one float per warp;
+//   * two reductions in a row must be separated by a `__syncthreads()`, because
+//     warp 0 is still *reading* `scratch` after the function returns while the
+//     other warps are free to run ahead and overwrite it.
+//
+// `scratch` is a parameter rather than a static `__shared__` array so a kernel
+// that reduces a max and a sum in the same iteration can reuse one buffer and
+// place those barriers itself.
+
 __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
   const int lane = threadIdx.x % kWarpSize;
   const int warp = threadIdx.x / kWarpSize;
@@ -90,6 +97,23 @@ __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
 
   value = (threadIdx.x < static_cast<unsigned>(warps)) ? scratch[threadIdx.x] : 0.0f;
   return warp == 0 ? warp_reduce_sum(value) : 0.0f;
+}
+
+__device__ __forceinline__ float block_reduce_max(float value, float* scratch) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  const int warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
+
+  value = warp_reduce_max(value);
+  if (lane == 0) {
+    scratch[warp] = value;
+  }
+  __syncthreads();
+
+  // The identity for a max is -inf, not zero: a block whose scores are all
+  // negative would otherwise come back with a max of 0 from the unused lanes.
+  value = (threadIdx.x < static_cast<unsigned>(warps)) ? scratch[threadIdx.x] : -INFINITY;
+  return warp == 0 ? warp_reduce_max(value) : -INFINITY;
 }
 
 }  // namespace mini_vllm

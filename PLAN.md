@@ -928,6 +928,40 @@ pytest tests/test_decode_attention_cuda.py -v -m cuda
 > must be rescaled by `exp(m_old - m_new)` — the *same* factor as `l`, not just `l` — is the single most important
 > idea in the course. Get it wrong and you get fluent, confident, wrong text.
 
+**What it measured** (Step 3.4, now done). Decode goes from 73 to **~97 tok/s** end to end, and per-kernel it is
+**8.2x** the oracle at S=128, **2.6x** at S=1024 and **4.4x** at S=8192. The first version was only two of those
+three:
+
+| context | first version | after splitting the key axis | vs. the PyTorch oracle |
+| ------- | ------------- | ---------------------------- | ---------------------- |
+| S=128   | 19 µs         | 19 µs (one split, unchanged) | 8.2x                   |
+| S=1024  | 124 µs        | 88 µs                        | 2.6x                   |
+| S=8192  | 1392 µs       | 218 µs                       | 4.4x                   |
+
+The first version put one block on each `(sequence, query head)`, which for a single sequence is **16 blocks on a
+36-SM card**: half the machine idle before the kernel even starts, and at S=8192 it was measurably *slower than
+PyTorch* (0.69x, 24 GB/s of a 384 GB/s card). Batch size cannot fix that — a decode step is one token wide by
+definition — so the fix is to split the **key** axis as well, flash-decoding style: each split runs the recurrence
+over its slice of the cache and writes its own `(m, l, O)`, and a merge kernel combines them. 154 GB/s at S=8192,
+6.4x faster than before, and short contexts take one split and skip the merge so nothing regresses.
+
+> **Learn (the part the plan did not say):** the merge **is** the recurrence, one level up — rescale each split by
+> `exp(m_split - m_global)` and sum. That means the single most important idea above is now implemented twice, in two
+> places, and can be wrong in each independently. It also means the tolerance test that covers the tile loop does not
+> cover the merge at all, because short contexts never take the split path. `test_the_merge_rescales_across_splits`
+> exists for exactly that: a spike placed in the last split, where a merge that rescales the weights but not the
+> outputs still returns a convex combination of the wrong vectors.
+
+> **Learn:** the two phases inside one tile parallelize along *different* axes, and this is worth seeing once. `QKᵀ`
+> reduces over `D`, so a warp owns a key and its lanes stride over `D`. `P·V` reduces over the keys, so a thread owns
+> one `d` and walks the tile. Both end up coalesced; picking either decomposition for both phases makes one of them
+> read memory 32 lanes at a time.
+
+**What is still on the table.** 154 GB/s is 40% of peak, not 80%: the `P·V` inner loop is a serial FMA chain with one
+load in flight per thread. Fixing it means more accumulators or a wider tile, and it is deliberately **not** done here
+— [Step 4.8](#step-48--paged-attention-kernels) rewrites this kernel to walk a page table, so it is the wrong version
+to micro-optimize.
+
 #### Step 3.5 — Flash prefill
 
 **Write** `csrc/flash_prefill.cu` · **Test** `tests/test_flash_prefill_cuda.py`

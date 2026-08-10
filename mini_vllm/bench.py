@@ -38,6 +38,7 @@ Run it::
 from __future__ import annotations
 
 import argparse
+import math
 import shutil
 import subprocess
 import threading
@@ -538,6 +539,28 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                     label=f"rope H={heads} D={head_dim} ({note})",
                     kernel=lambda x=x, p=positions: module.rope(x, p, tables.cos, tables.sin),
                     reference=lambda x=x, p=positions: ops.rope(x, p, tables.cos, tables.sin),
+                    bytes_moved=moved,
+                )
+            )
+
+    if "decode_attention" in implemented:
+        # Attention is the one kernel whose work grows with the context rather
+        # than with the batch, so the axis swept here is the cache length. At 8192
+        # the K/V of a single layer is 32 MB — exactly this card's L2 — which is
+        # why only the longest context here is honestly DRAM-bound.
+        query_heads, kv_heads, head_dim = 16, 8, 128
+        scale = 1.0 / math.sqrt(head_dim)
+        for source_len in (128, 1024, 8192):
+            q = torch.randn(1, query_heads, 1, head_dim, device="cuda", dtype=dtype)
+            k = torch.randn(1, kv_heads, source_len, head_dim, device="cuda", dtype=dtype)
+            v = torch.randn_like(k)
+            # The kernel reads K and V once each and writes one row of output.
+            moved = (k.numel() + v.numel()) * k.element_size()
+            cases.append(
+                KernelCase(
+                    label=f"decode_attention S={source_len}",
+                    kernel=lambda q=q, k=k, v=v: module.decode_attention(q, k, v, scale),
+                    reference=lambda q=q, k=k, v=v: ops.attention(q, k, v),
                     bytes_moved=moved,
                 )
             )
