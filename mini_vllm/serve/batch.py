@@ -38,6 +38,23 @@ from mini_vllm.serve.sequence import Sequence
 
 __all__ = ["ForwardBatch"]
 
+# What an unused block-table entry holds. See the field's comment: a kernel bounded by
+# `context_lens` never reads it, so a read is a bug worth making impossible to miss.
+PADDING_BLOCK = -1
+
+
+def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> torch.Tensor:
+    """Stack per-sequence block tables into one rectangle, right-padded.
+
+    Rectangular because the kernel indexes it as `block_tables[seq, logical_block]`,
+    and a ragged tensor of pointers would put a second indirection inside the inner
+    loop. The width is the widest table in *this* batch, not the longest a sequence
+    could ever be, so a batch of short sequences carries a small tensor.
+    """
+    widest = max((len(table) for table in tables), default=0)
+    padded = [list(table) + [PADDING_BLOCK] * (widest - len(table)) for table in tables]
+    return torch.tensor(padded, dtype=torch.int32, device=device).reshape(len(tables), widest)
+
 
 @dataclass(frozen=True)
 class ForwardBatch:
@@ -57,6 +74,20 @@ class ForwardBatch:
     context_lens: torch.Tensor  # int32 [num_sequences], S per sequence
     seq_ids: tuple[int, ...]
     sampling_params: tuple[SamplingParams, ...]
+
+    # Paging ([Step 4.7]). Optional because the dense runner has no use for them and
+    # the pure-scheduling tests should not have to build a block manager to construct
+    # a batch.
+    #
+    #   slot_mapping  int32 [total_tokens]        where each new K/V is written
+    #   block_tables  int32 [num_sequences, max]  right-padded with -1
+    #
+    # The padding value is -1 rather than 0 on purpose: a kernel bounds its walk by
+    # `context_lens` and never reads the padding, so a read that *does* happen is a
+    # bug, and -1 makes it a visibly impossible block id instead of a quiet read of
+    # whatever sequence owns block 0.
+    slot_mapping: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         count = len(self.seq_ids)
@@ -112,6 +143,24 @@ class ForwardBatch:
         if bool((self.seq_lens < 1).any()):
             raise ValueError(f"every sequence must contribute a token, got {self.seq_lens.tolist()}")
 
+        if self.slot_mapping is not None and self.slot_mapping.shape[0] != total:
+            raise ValueError(
+                f"slot_mapping has {self.slot_mapping.shape[0]} entries for {total} tokens; "
+                "every token written this pass needs a slot"
+            )
+        if self.block_tables is not None:
+            if self.block_tables.shape[0] != count:
+                raise ValueError(
+                    f"block_tables has {self.block_tables.shape[0]} rows for {count} sequences"
+                )
+            # Whether each row holds *enough* blocks for its context is not checkable
+            # here — that needs the block size, which belongs to the manager — and the
+            # attention path checks it against the pool it is about to read. What is
+            # checkable is that a sequence with a context has any pages at all.
+            empty = [i for i in range(count) if not bool((self.block_tables[i] >= 0).any())]
+            if empty:
+                raise ValueError(f"sequences {empty} attend over cached tokens with no blocks")
+
     # ---------------------------------------------------------------- properties
 
     @property
@@ -156,6 +205,7 @@ class ForwardBatch:
         cls,
         scheduled: Iterable[tuple[Sequence, int]],
         device: torch.device | str = "cpu",
+        manager: object | None = None,
     ) -> ForwardBatch:
         """Build from `(sequence, tokens to compute now)` pairs, in one pass.
 
@@ -167,6 +217,11 @@ class ForwardBatch:
         Positions start at each sequence's `num_computed_tokens`, which is why
         [Step 1.3] insisted RoPE take an explicit position tensor: a chunk's tokens
         are at positions 512..1023, and nothing in the tensor shapes says so.
+
+        Pass `manager` (a `BlockManager`) to fill in the paging metadata as well. It
+        is optional so that a scheduling test can build a batch without a pool, and
+        typed loosely to keep `serve` from importing `block` — the dependency runs the
+        other way, since the manager needs `Sequence`.
         """
         input_ids: list[int] = []
         positions: list[int] = []
@@ -175,6 +230,8 @@ class ForwardBatch:
         context_lens: list[int] = []
         seq_ids: list[int] = []
         params: list[SamplingParams] = []
+        slots: list[int] = []
+        tables: list[tuple[int, ...]] = []
 
         for sequence, count in scheduled:
             if count < 1:
@@ -195,6 +252,11 @@ class ForwardBatch:
             seq_ids.append(sequence.seq_id)
             params.append(sequence.sampling_params)
 
+            if manager is not None:
+                table = manager.table(sequence)
+                slots.extend(int(slot) for slot in manager.slot_mapping(sequence, count))
+                tables.append(table.block_ids)
+
         as_int64 = {"dtype": torch.int64, "device": device}
         as_int32 = {"dtype": torch.int32, "device": device}
         return cls(
@@ -205,6 +267,8 @@ class ForwardBatch:
             context_lens=torch.tensor(context_lens, **as_int32),
             seq_ids=tuple(seq_ids),
             sampling_params=tuple(params),
+            slot_mapping=None if manager is None else torch.tensor(slots, **as_int32),
+            block_tables=None if manager is None else _pad_tables(tables, device),
         )
 
     @classmethod
