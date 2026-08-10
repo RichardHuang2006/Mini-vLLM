@@ -11,7 +11,7 @@ VENV    = .venv
 VENVBIN = $(VENV)/bin
 TORCH_INDEX = https://download.pytorch.org/whl/cu130
 
-.PHONY: setup ext test test-cpu bench bench-kernels clean help
+.PHONY: setup ext test test-cpu bench bench-throughput bench-scheduler bench-kernels clean help
 .DEFAULT_GOAL := help
 
 # ------------------------------------------------------------------- setup ---
@@ -44,7 +44,20 @@ test-cpu:
 # TTFT and decode tok/s for the cached model. Warns if it caught the GPU running
 # below its clocks, which would make every number meaningless.
 bench:
-	$(PYTHON) -m mini_vllm.bench --mode single
+	$(PYTHON) -m mini_vllm.bench --mode single --compare hf --use-cuda-kernels
+
+# The headline: output tokens/sec over a whole request set against
+# `transformers.generate`, swept over concurrency. Downloads Qwen3-0.6B on first
+# run. This is the table in the README (Phase 5).
+bench-throughput:
+	$(PYTHON) -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16,32 \
+		--compare hf --use-cuda-kernels --kv-fraction 0.35
+
+# Chunked prefill against a prefill-prioritized baseline on one Poisson arrival
+# schedule: decode-latency tails, and a leak check over the whole run. Takes a
+# few minutes — it serves 2000 requests twice.
+bench-scheduler:
+	$(PYTHON) -m mini_vllm.bench --mode scheduler --num-requests 2000 --use-cuda-kernels
 
 # Achieved memory bandwidth for each hand-written kernel, next to the PyTorch
 # expression it replaced. The score for a memory-bound op is its share of peak
@@ -63,6 +76,8 @@ help:
 	@echo "  ext       force-rebuild the csrc/ CUDA extension, print the toolchain"
 	@echo "  test      run the pytest suite (cuda/oracle tests skip when unavailable)"
 	@echo "  test-cpu  run only the tests needing neither a GPU nor model weights"
-	@echo "  bench     TTFT and decode tok/s (Step 2.3 onward)"
+	@echo "  bench     TTFT and decode tok/s for one request, against transformers"
+	@echo "  bench-throughput  the headline: output tok/s vs transformers, by concurrency"
+	@echo "  bench-scheduler   decode-latency tails: chunked prefill vs prefill-first"
 	@echo "  bench-kernels  achieved bandwidth per kernel vs the torch it replaced"
 	@echo "  clean     remove .venv, build/, caches, and __pycache__"
