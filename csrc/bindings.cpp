@@ -7,6 +7,10 @@
 
 torch::Tensor hello(const torch::Tensor& x, double a, double b);
 torch::Tensor rmsnorm(const torch::Tensor& x, const torch::Tensor& weight, double eps);
+torch::Tensor rope(const torch::Tensor& x,
+                   const torch::Tensor& positions,
+                   const torch::Tensor& cos,
+                   const torch::Tensor& sin);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -24,4 +28,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"),
         py::arg("weight"),
         py::arg("eps") = 1e-6);
+
+  m.def("rope",
+        &rope,
+        "rotary position embedding at explicit positions, tables gathered in-kernel (Step 3.2)",
+        py::arg("x"),
+        py::arg("positions"),
+        py::arg("cos"),
+        py::arg("sin"));
 }

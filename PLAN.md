@@ -816,20 +816,49 @@ Three things were worth more than the speedup:
 
 **Write** `csrc/rope.cu` · **Test** `tests/test_rope_cuda.py`
 
-- Fuse the position gather and the rotate-halves into one pass over `q` and `k`. One thread group per
-  `(token, head)`; read the precomputed `cos`/`sin` rows for the token's position.
+- Fuse the position gather and the rotate-halves into one pass over `q` and `k`. One thread per rotated *pair*
+  (element `i` with element `i + D/2`, the unit the rotation couples); read the precomputed `cos`/`sin` rows for the
+  token's position.
 
 ```text
-q: (B·L) x H_q x D    k: (B·L) x H_k x D    positions: (B·L)
-cos/sin: max_seq_len x (D/2)
+q: B x L x H_q x D    k: B x L x H_k x D    positions: L  or  B x L
+cos/sin: max_seq_len x D, fp32, angles duplicated across the halves
 ```
+
+The tables are `max_seq_len x D` rather than `x D/2` because [Step 1.3](#step-13--rope-with-explicit-positions) built
+them that way: the angle for element `i` is repeated at `i + D/2` so the rotation is one elementwise expression
+instead of two. The kernel reads both rows even though they are equal, which keeps it a transcription of the oracle
+rather than a claim about the table's layout.
 
 **Done when:** matches [Step 1.3](#step-13--rope-with-explicit-positions) to BF16 tolerance for contiguous and
 non-contiguous positions; end-to-end greedy output unchanged:
 
 ```bash
 pytest tests/test_rope_cuda.py -v -m cuda
+pytest tests/test_rope_cuda.py -v -m oracle
+python -m mini_vllm.bench --mode kernels
 ```
+
+**What it measured** (Step 3.2, now done). **269 GB/s** on the DRAM-bound shape — 70% of theoretical peak, or 92% of
+the `copy_` ceiling — and **12x** the PyTorch expression, which is a wider margin than RMSNorm's because the oracle
+materializes more: two gathers, a `cat` for `rotate_half`, and two `B x L x H x D` temporaries, none of which the
+fused kernel writes at all. End to end, adding it on top of Step 3.1 takes decode from **49 to 71 tok/s** and TTFT
+from ~25 ms to ~18 ms; cumulatively the two kernels have moved decode from the PyTorch path's 34 tok/s to 71, a
+**2.1x**, with the model file never edited — only two flags in `CUDA_KERNELS`.
+
+**It stops here deliberately.** 70% of peak is below RMSNorm's 77%, and the temptation is to vectorize the loads to
+16 bytes per thread. The access pattern is already fully coalesced (32 consecutive threads cover 64 contiguous bytes
+of a half-row), so what remains is the table traffic, and the kernel is within 8% of what a bare `copy_` achieves on
+this machine. That is the definition of "near the ceiling" from [Step 3.1](#step-31--rmsnorm-kernel), and chasing it
+would be chasing noise — the thing this plan says not to do, which is worth doing on purpose once.
+
+> **Learn:** the test that earns its place here is not a tolerance check, it is
+> `test_a_decode_token_matches_its_place_in_a_prefill`. Keys are rotated *before* they enter the cache, so a token
+> rotated as part of a prefill and the same token arriving later as a single decode step must come out identical. A
+> kernel that used its own token index instead of the gathered position passes every shape and dtype test and fails
+> only this one — and in production it would present as a model that starts well and drifts as the context grows,
+> which is the hardest possible thing to debug. Phase 4 makes it sharper still: a prefill chunk and several decodes
+> share one forward pass, so the positions in a single launch are genuinely unordered.
 
 #### Step 3.3 — SwiGLU kernel
 

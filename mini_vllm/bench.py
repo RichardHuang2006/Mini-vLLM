@@ -481,15 +481,17 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
     implemented = ops.cuda_kernel_names()
     cases: list[KernelCase] = []
 
+    def token_counts(width: int) -> tuple[tuple[int, str], ...]:
+        return (
+            (1, "decode, 1 token"),
+            (128, "prefill, 128 tokens"),
+            (rows_exceeding_l2(width, dtype), "past L2, DRAM-bound"),
+        )
+
     if "rmsnorm" in implemented:
         hidden_size = 1024  # Qwen3-0.6B's E
         weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
-        row_counts = (
-            (1, "decode, 1 token"),
-            (128, "prefill, 128 tokens"),
-            (rows_exceeding_l2(hidden_size, dtype), "past L2, DRAM-bound"),
-        )
-        for rows, note in row_counts:
+        for rows, note in token_counts(hidden_size):
             x = torch.randn(rows, hidden_size, device="cuda", dtype=dtype)
             moved = (2 * x.numel() + weight.numel()) * x.element_size()
             cases.append(
@@ -497,6 +499,29 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                     label=f"rmsnorm E={hidden_size} ({note})",
                     kernel=lambda x=x, weight=weight: module.rmsnorm(x, weight, 1e-6),
                     reference=lambda x=x, weight=weight: ops.rmsnorm(x, weight, 1e-6),
+                    bytes_moved=moved,
+                )
+            )
+
+    if "rope" in implemented:
+        from mini_vllm.positional_encoding import RoPE
+
+        heads, head_dim = 16, 128  # Qwen3-0.6B's H_q and D
+        per_token = heads * head_dim
+        longest = max(rows for rows, _ in token_counts(per_token))
+        tables = RoPE(head_dim, longest, 1_000_000.0, device="cuda")
+
+        for rows, note in token_counts(per_token):
+            x = torch.randn(1, rows, heads, head_dim, device="cuda", dtype=dtype)
+            positions = torch.arange(rows, device="cuda")
+            # The table rows are shared by every head of a token, so they add
+            # `D` fp32 pairs per token on top of the activation traffic.
+            moved = 2 * x.numel() * x.element_size() + 2 * rows * head_dim * 4
+            cases.append(
+                KernelCase(
+                    label=f"rope H={heads} D={head_dim} ({note})",
+                    kernel=lambda x=x, p=positions: module.rope(x, p, tables.cos, tables.sin),
+                    reference=lambda x=x, p=positions: ops.rope(x, p, tables.cos, tables.sin),
                     bytes_moved=moved,
                 )
             )

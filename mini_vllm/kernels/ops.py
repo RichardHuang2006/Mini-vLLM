@@ -42,7 +42,7 @@ __all__ = [
 # True by the Phase 3 step named beside it, one at a time.
 CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "rmsnorm": (True, "Step 3.1"),
-    "rope": (False, "Step 3.2"),
+    "rope": (True, "Step 3.2"),
     "swiglu": (False, "Step 3.3"),
     "decode_attention": (False, "Step 3.4"),
     "prefill_attention": (False, "Step 3.5"),
@@ -104,9 +104,14 @@ def rope(
     sin: torch.Tensor,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Rotary embedding at explicit positions. Kernel: Step 3.2."""
-    if _use_kernel("rope", use_cuda, x):
-        raise NotImplementedError("rope kernel is marked available but not wired up")
+    """Rotary embedding at explicit positions. Kernel: Step 3.2.
+
+    The kernel wants fp32 tables, which is what `RoPE` builds regardless of the
+    activation dtype, and a head axis to broadcast the position across. Anything
+    else is the oracle's problem.
+    """
+    if _use_kernel("rope", use_cuda, x) and cos.dtype == torch.float32 and x.dim() >= 3:
+        return load_extension().rope(x, positions, cos, sin)
     return apply_rope(x, positions, cos, sin)
 
 
