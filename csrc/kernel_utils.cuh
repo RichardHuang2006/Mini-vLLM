@@ -60,6 +60,21 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   return value;
 }
 
+// The butterfly variant: every lane comes back with the total, not just lane 0.
+//
+// Worth the separate function because the two are used for different things. A
+// reduction whose result one thread stores wants the cheaper `shfl_down` tree above;
+// a reduction whose result every lane then *computes with* — a score that the whole
+// warp uses to update its own slice of an accumulator, as the paged prefill kernel
+// does — would otherwise need a broadcast shuffle afterwards anyway.
+__device__ __forceinline__ float warp_all_reduce_sum(float value) {
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
 // The same tree, for a maximum. Needed by the online softmax in Step 3.4, where
 // the running max and the running sum are reduced side by side.
 __device__ __forceinline__ float warp_reduce_max(float value) {

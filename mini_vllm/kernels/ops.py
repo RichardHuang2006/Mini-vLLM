@@ -28,6 +28,7 @@ from mini_vllm import attention as reference_attention
 from mini_vllm.basics import silu
 from mini_vllm.kernels.extension import load_extension
 from mini_vllm.layer_norm import rms_norm
+from mini_vllm.paged_attention import paged_attention_gathered as reference_paged_attention
 from mini_vllm.positional_encoding import apply_rope
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "attention",
     "cuda_kernel_names",
     "dispatch_report",
+    "paged_attention",
     "rmsnorm",
     "rope",
     "swiglu",
@@ -52,6 +54,7 @@ CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "swiglu": (True, "Step 3.3"),
     "decode_attention": (True, "Step 3.4"),
     "flash_prefill": (True, "Step 3.5"),
+    "paged_attention": (True, "Step 4.8"),
 }
 
 # Kernels that are correct, tested, and deliberately *not* the default, with the
@@ -71,6 +74,10 @@ NOT_YET_FASTER: dict[str, str] = {
 # which bounds the head dimension it can serve. Qwen3-0.6B uses 128; anything
 # wider goes to the oracle rather than to a kernel that would refuse it.
 MAX_KERNEL_HEAD_DIM = 192
+
+# The paged kernel holds the query and the accumulator in registers instead, `D / 32`
+# floats per lane of each, which is where its own ceiling comes from.
+MAX_PAGED_HEAD_DIM = 256
 
 
 def _use_kernel(name: str, use_cuda: bool, x: torch.Tensor) -> bool:
@@ -187,6 +194,84 @@ def attention(
         return load_extension().flash_prefill(q, k, v, scale)
 
     return reference_attention.scaled_dot_product_attention_grouped(q, k, v, mask=mask)
+
+
+def paged_attention(
+    q: torch.Tensor,
+    key_pool: torch.Tensor,
+    value_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    context_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+    max_context_len: int,
+    scale: float | None = None,
+    use_cuda: bool = False,
+) -> torch.Tensor:
+    """Ragged attention over a paged cache. Kernel: Step 4.8.
+
+    ::
+
+        q:    T x H_q x D              every scheduled token, sequences concatenated
+        pools num_blocks x P x H_k x D
+        out:  T x H_q x D
+
+    The fallback here is not the same kind of fallback as elsewhere. The PyTorch path
+    for `rmsnorm` is a slower way to do the same work; the PyTorch path for this
+    *copies every sequence's whole cache into a contiguous temporary first*, which is
+    the traffic paging exists to remove. It is the oracle, not an alternative, and the
+    engine's own `--mode throughput` numbers are only meaningful on the kernel path.
+
+    `max_query_len` and `max_context_len` are passed as plain integers rather than
+    read off `seq_lens` and `context_lens` on the device. They decide a grid shape and
+    a split count, so reading them from a tensor would mean a device-to-host
+    synchronization on the critical path of every iteration — and the caller already
+    knows them, because it built the batch out of Python integers.
+    """
+    if scale is None:
+        scale = 1.0 / math.sqrt(q.shape[-1])
+
+    if _use_kernel("paged_attention", use_cuda, q) and _kernel_can_page(
+        q, key_pool, value_pool, block_tables
+    ):
+        return load_extension().paged_attention(
+            q,
+            key_pool,
+            value_pool,
+            block_tables,
+            cu_seqlens_q,
+            context_lens,
+            seq_lens,
+            int(max_query_len),
+            int(max_context_len),
+            scale,
+        )
+
+    return reference_paged_attention(
+        q, key_pool, value_pool, block_tables, cu_seqlens_q, context_lens, scale
+    )
+
+
+def _kernel_can_page(
+    q: torch.Tensor,
+    key_pool: torch.Tensor,
+    value_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+) -> bool:
+    """Whether the paged kernel can serve this call.
+
+    The kernel walks the pools by slot arithmetic rather than by stride, so it needs
+    them contiguous — a narrowed view would have it reading the wrong pages rather
+    than reading slowly, which is why this is a condition and not a copy.
+    """
+    if q.dim() != 3 or q.dtype != key_pool.dtype or q.dtype != value_pool.dtype:
+        return False
+    if q.dtype == torch.float64 or q.shape[-1] > MAX_PAGED_HEAD_DIM:
+        return False
+    if not (q.is_contiguous() and key_pool.is_contiguous() and value_pool.is_contiguous()):
+        return False
+    return block_tables.dtype == torch.int32 and block_tables.is_contiguous()
 
 
 def _kernel_can_attend(

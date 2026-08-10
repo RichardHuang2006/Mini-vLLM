@@ -585,6 +585,47 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 )
             )
 
+    if "paged_attention" in implemented:
+        # The engine's actual decode shape: a batch of sequences, one token each,
+        # attending over pages scattered through a pool. The reference is the
+        # dense-gather oracle, and the speedup column here is measuring something
+        # different from the rows above — not a better loop over the same data, but
+        # the removal of a full copy of every sequence's cache per iteration.
+        query_heads, kv_heads, head_dim, block_size = 16, 8, 128, 16
+        scale = 1.0 / math.sqrt(head_dim)
+
+        for batch, context_len in ((1, 8192), (16, 1024), (64, 1024)):
+            blocks_each = -(-context_len // block_size)
+            pool_blocks = batch * blocks_each
+            keys = torch.randn(
+                pool_blocks, block_size, kv_heads, head_dim, device="cuda", dtype=dtype
+            )
+            values = torch.randn_like(keys)
+            # Shuffled on purpose: a pool in logical order would give the kernel
+            # sequential reads it will not get after a few thousand allocations.
+            shuffled = torch.randperm(pool_blocks, device="cuda", dtype=torch.int32)
+            block_tables = shuffled.reshape(batch, blocks_each).contiguous()
+
+            q = torch.randn(batch, query_heads, head_dim, device="cuda", dtype=dtype)
+            cu_seqlens = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+            contexts = torch.full((batch,), context_len, device="cuda", dtype=torch.int32)
+            lengths = torch.ones(batch, device="cuda", dtype=torch.int32)
+            moved = 2 * batch * context_len * kv_heads * head_dim * keys.element_size()
+
+            paged = (keys, values, block_tables, cu_seqlens, contexts, lengths)
+            cases.append(
+                KernelCase(
+                    label=f"paged_attention B={batch} S={context_len} (decode)",
+                    kernel=lambda q=q, p=paged, s=context_len: module.paged_attention(
+                        q, *p, 1, s, scale
+                    ),
+                    reference=lambda q=q, p=paged, s=context_len: ops.paged_attention(
+                        q, *p, 1, s, scale
+                    ),
+                    bytes_moved=moved,
+                )
+            )
+
     return cases
 
 
