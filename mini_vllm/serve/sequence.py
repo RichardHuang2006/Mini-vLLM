@@ -26,6 +26,7 @@ import enum
 import itertools
 from dataclasses import dataclass, field
 
+from mini_vllm.block.block_table import BlockTable
 from mini_vllm.sampler import SamplingParams
 
 __all__ = ["Sequence", "SequenceStatus"]
@@ -90,9 +91,11 @@ class Sequence:
     num_computed_tokens: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
 
-    # Set by the block manager in [Step 4.7]; until paging exists the cache is
-    # indexed by sequence and this stays None.
-    block_table: object | None = None
+    # The sequence's pages, set by the block manager ([Step 4.7]) and the single home
+    # for them: the manager reads and writes this field rather than keeping a registry
+    # of its own, because two places recording which blocks a sequence holds is two
+    # places that can disagree about when to free them.
+    block_table: BlockTable | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt_token_ids:
