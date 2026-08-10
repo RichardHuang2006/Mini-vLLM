@@ -18,62 +18,11 @@
 #include <c10/cuda/CUDAException.h>
 #include <torch/extension.h>
 
-#include <algorithm>
-#include <cstdint>
+#include "kernel_utils.cuh"
 
 namespace {
 
-constexpr int kWarpSize = 32;
-constexpr int kMaxThreads = 1024;
-
-// 16 bytes is the widest load a thread can issue (LDG.E.128), so it sets the
-// vector width: 8 bf16/fp16 lanes, 4 fp32, 2 fp64.
-constexpr int kBytesPerVector = 16;
-
-template <typename scalar_t>
-struct alignas(kBytesPerVector) Vector {
-  static constexpr int kLanes = kBytesPerVector / sizeof(scalar_t);
-  scalar_t lane[kLanes];
-};
-
-// The un-vectorized fallback, for widths that are not a multiple of the vector
-// width or pointers that are not 16-byte aligned. Same code path, one lane wide.
-template <typename scalar_t>
-struct Scalar {
-  static constexpr int kLanes = 1;
-  scalar_t lane[1];
-};
-
-// Sum 32 lanes in five shuffles. The mask says all 32 lanes participate, so the
-// caller must launch whole warps — `threads_for` below is what guarantees it.
-// A partial warp here is not slow, it is undefined.
-__device__ __forceinline__ float warp_reduce_sum(float value) {
-#pragma unroll
-  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset);
-  }
-  return value;
-}
-
-// Sum across the whole block: reduce within each warp by shuffling, then reduce
-// the one partial per warp in the first warp. Only thread 0's result is valid,
-// which is enough — the caller broadcasts it through shared memory.
-__device__ __forceinline__ float block_reduce_sum(float value) {
-  __shared__ float warp_totals[kMaxThreads / kWarpSize];
-
-  const int lane = threadIdx.x % kWarpSize;
-  const int warp = threadIdx.x / kWarpSize;
-  const int warps = (blockDim.x + kWarpSize - 1) / kWarpSize;
-
-  value = warp_reduce_sum(value);
-  if (lane == 0) {
-    warp_totals[warp] = value;
-  }
-  __syncthreads();
-
-  value = (threadIdx.x < static_cast<unsigned>(warps)) ? warp_totals[threadIdx.x] : 0.0f;
-  return warp == 0 ? warp_reduce_sum(value) : 0.0f;
-}
+using namespace mini_vllm;
 
 // One block per row. `chunk_t` is either Vector<scalar_t> or Scalar<scalar_t>,
 // which is the only difference between the fast and the fallback launch.
@@ -112,8 +61,9 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
     }
   }
 
+  __shared__ float warp_totals[kMaxThreads / kWarpSize];
   __shared__ float inverse_rms;
-  const float total = block_reduce_sum(sum_squares);
+  const float total = block_reduce_sum(sum_squares, warp_totals);
   if (threadIdx.x == 0) {
     inverse_rms = rsqrtf(total / static_cast<float>(dim) + eps);
   }
@@ -140,19 +90,6 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
   }
 }
 
-// Enough threads to cover the row one chunk each, capped at the block limit.
-// Rounding up to a whole warp is required, not tidiness: the reduction shuffles
-// with a full 32-lane mask, so a block of, say, 100 threads would leave the last
-// warp partially populated and its shuffle undefined.
-int threads_for(int64_t chunks) {
-  const int64_t rounded = ((chunks + kWarpSize - 1) / kWarpSize) * kWarpSize;
-  return static_cast<int>(std::min<int64_t>(std::max<int64_t>(rounded, kWarpSize), kMaxThreads));
-}
-
-bool is_vector_aligned(const void* pointer) {
-  return reinterpret_cast<uintptr_t>(pointer) % kBytesPerVector == 0;
-}
-
 template <typename scalar_t>
 void launch_rmsnorm(const at::Tensor& input,
                     const at::Tensor& weight,
@@ -164,10 +101,6 @@ void launch_rmsnorm(const at::Tensor& input,
   const scalar_t* weight_pointer = weight.data_ptr<scalar_t>();
   scalar_t* out_pointer = out.data_ptr<scalar_t>();
 
-  // A tensor view can start part way into its storage — `h[:, -1:, :]` is one
-  // the model actually produces — so 16-byte alignment is a property of this
-  // call rather than of the dtype, and has to be checked rather than assumed.
-  // A misaligned 128-bit load does not degrade, it faults.
   constexpr int kLanes = Vector<scalar_t>::kLanes;
   const bool vectorizable = dim % kLanes == 0 && is_vector_aligned(input_pointer) &&
                             is_vector_aligned(weight_pointer) && is_vector_aligned(out_pointer);
