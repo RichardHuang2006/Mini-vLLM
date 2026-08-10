@@ -20,6 +20,16 @@ torch::Tensor flash_prefill(const torch::Tensor& q,
                             const torch::Tensor& k,
                             const torch::Tensor& v,
                             double scale);
+torch::Tensor paged_attention(const torch::Tensor& q,
+                              const torch::Tensor& key_pool,
+                              const torch::Tensor& value_pool,
+                              const torch::Tensor& block_tables,
+                              const torch::Tensor& cu_seqlens_q,
+                              const torch::Tensor& context_lens,
+                              const torch::Tensor& seq_lens,
+                              int64_t max_query_len,
+                              int64_t max_context_len,
+                              double scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -66,5 +76,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),
+        py::arg("scale"));
+
+  m.def("paged_attention",
+        &paged_attention,
+        "ragged decode + prefill attention over a paged KV cache, gathering "
+        "through the block table inside the kernel (Step 4.8)",
+        py::arg("q"),
+        py::arg("key_pool"),
+        py::arg("value_pool"),
+        py::arg("block_tables"),
+        py::arg("cu_seqlens_q"),
+        py::arg("context_lens"),
+        py::arg("seq_lens"),
+        py::arg("max_query_len"),
+        py::arg("max_context_len"),
         py::arg("scale"));
 }
