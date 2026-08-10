@@ -101,12 +101,26 @@ Detected on this machine:
 matches the one PyTorch was built against and raises otherwise. The system `nvcc` is 12.8 while this PyTorch is
 cu130, and `/usr/local/cuda-13` is a dangling symlink with no toolkit behind it. **Nothing in Phase 3 or 4 compiles
 until this is fixed**, which is why proving a real kernel builds and loads is Step 0.1's entire job, before anything
-depends on it. Likely fixes, in order of preference:
+depends on it.
 
-1. `pip install nvidia-cuda-nvcc-cu13` (consistent with the already-installed `nvidia-cuda-runtime-cu13 13.0.96`),
-   then point `CUDA_HOME` at that wheel's toolkit directory.
-2. Install a full CUDA 13 toolkit and repoint `/etc/alternatives/cuda-13`.
-3. Fall back to a `torch==2.x+cu128` wheel matching the system 12.8 `nvcc`.
+**How it was actually resolved** (Step 0.1, now done). The system toolkit is left alone; the CUDA 13 compiler comes
+from pip wheels instead, and `mini_vllm/kernels/extension.py` assembles them into a `CUDA_HOME` under `build/` that
+torch accepts. Three things made this less mechanical than it sounds, each of which is now an assertion in
+`tests/test_env.py`:
+
+1. **The toolkit is scattered across site-packages trees.** nvcc and its nvvm backend land in one, the runtime
+   headers and libraries in another, so no single directory looks like a CUDA install. The include and library search
+   paths have to be merged, not chosen.
+2. **`nvidia-cuda-cccl` is required and is not a dependency of anything.** `cuda_fp16.h` includes `<nv/target>`,
+   which the nvcc wheel does not ship, so the first compile fails on a missing header.
+3. **The compiler wheels must share a minor version, and pip will not do that for you.** `nvidia-cuda-nvcc` has
+   loose bounds on `nvidia-nvvm` and `nvidia-cuda-crt`, so a plain install produced nvvm 13.3 driving ptxas 13.0
+   (`ptxas fatal: Unsupported .version 9.3`), and mixing a 13.0 CCCL with a 13.3 nvcc trips CCCL's own
+   `"CUDA compiler and CUDA toolkit headers are incompatible"` guard. All four are pinned to the 13.0 line in
+   `requirements.txt`, matching torch's cu130 runtime.
+
+The alternatives, if a future machine needs them: install a real CUDA 13 toolkit and point `CUDA_HOME` at it, or drop
+to a `torch==2.x+cu128` wheel matching the system 12.8 `nvcc`.
 
 **On raw CUDA C++ instead of Triton.** tiny-llm's kernels are Metal C++ compiled as an MLX extension; the faithful
 translation is CUDA C++ compiled as a torch extension. You write the tiling, the shared-memory staging, the warp
@@ -121,52 +135,69 @@ exact dimensions and the two Qwen3-specific features (QK-norm, GQA).
 
 ## Repo layout
 
-The end state. Create directories as their first file arrives, not up front. `minivllm/` is the Python package;
-`csrc/` holds CUDA sources compiled into one extension.
+The end state. Create directories as their first file arrives, not up front. `mini_vllm/` is the Python package,
+grouped by lifecycle stage the way [Mini-GPT](../Mini-GPT/PLAN.md#repo-layout) is; `csrc/` holds the CUDA sources
+compiled into one extension.
 
 ```text
-minivllm/
-├── basics.py                 1.1
-├── attention.py              1.2, 1.4
-├── positional_encoding.py    1.3
-├── layer_norm.py             1.5
-├── embedding.py              1.6
-├── sampler.py                1.10
-├── generate.py               1.9, 2.2
-├── kv_cache.py               2.1
-├── sequence.py               4.1
-├── engine.py                 4.9
-├── model/
-│   ├── loader.py             1.7
-│   ├── qwen3.py              1.8
-│   └── qwen3_cached.py       2.2
-├── kernels/
-│   ├── extension.py          0.1   (JIT build/load of csrc/)
-│   └── ops.py                3.1-3.6, 4.8  (typed Python wrappers)
-├── block/
-│   ├── block_pool.py         4.5
-│   ├── block_table.py        4.6
-│   └── block_manager.py      4.7
-├── runner/
-│   └── batch.py              4.2
-└── scheduler/
-    └── scheduler.py          4.3, 4.4
-
-csrc/
-├── bindings.cpp              0.1  (extended by each kernel step)
-├── hello.cu                  0.1
-├── rmsnorm.cu                3.1
-├── rope.cu                   3.2
-├── swiglu.cu                 3.3
-├── decode_attention.cu       3.4
-├── flash_prefill.cu          3.5, 3.6
-└── paged_attention.cu        4.8
-
-tests/            one test_*.py mirroring each source file
-benchmarks/       5.1, 5.2
-requirements.txt  0.1
-pyproject.toml    0.1  (pytest config)
+Mini-vLLM/
+├── Makefile                      0.1   setup / ext / test / bench / clean
+├── requirements.txt              0.1
+├── pytest.ini                    0.1   pythonpath = . ; markers
+├── mini_vllm/
+│   ├── __init__.py               0.1, 4.9   re-exports LLM
+│   ├── basics.py                 1.1
+│   ├── attention.py              1.2, 1.4
+│   ├── positional_encoding.py    1.3
+│   ├── layer_norm.py             1.5
+│   ├── embedding.py              1.6
+│   ├── sampler.py                1.10
+│   ├── generate.py               1.9, 2.2
+│   ├── kv_cache.py               2.1
+│   ├── bench.py                  2.3, 3.1, 5.1, 5.2   one harness, four modes
+│   ├── model/
+│   │   ├── loader.py             1.7
+│   │   ├── qwen3.py              1.8   the frozen oracle
+│   │   └── qwen3_cached.py       2.2
+│   ├── kernels/
+│   │   ├── extension.py          0.1   JIT build/load of csrc/
+│   │   └── ops.py                3.1-3.6, 4.8   typed Python wrappers
+│   ├── block/
+│   │   ├── block_pool.py         4.5
+│   │   ├── block_table.py        4.6
+│   │   └── block_manager.py      4.7
+│   └── serve/
+│       ├── sequence.py           4.1
+│       ├── batch.py              4.2
+│       ├── scheduler.py          4.3, 4.4
+│       └── engine.py             4.9
+├── csrc/
+│   ├── bindings.cpp              0.1   extended by each kernel step
+│   ├── hello.cu                  0.1
+│   ├── rmsnorm.cu                3.1
+│   ├── rope.cu                   3.2
+│   ├── swiglu.cu                 3.3
+│   ├── decode_attention.cu       3.4
+│   ├── flash_prefill.cu          3.5, 3.6
+│   └── paged_attention.cu        4.8
+└── tests/                        one test_*.py per source file
 ```
+
+Three notes on why it is shaped this way.
+
+**`model/` and `kernels/` stay separate, and never share code.** `model/qwen3.py` is frozen once
+[Step 1.8](#step-18--the-full-qwen3-model) is green — it imports nothing from `kernels/` and stays pure PyTorch,
+because it is the oracle every kernel is diffed against. If a kernel and its readable twin ever shared an
+implementation, the differential test would be comparing a thing against itself and would prove nothing.
+
+**`serve/` is one subsystem, not four.** The sequence state, the batch builder, the scheduler, and the engine are a
+single control loop passing one `ForwardBatch` between them; splitting them across sibling top-level directories
+would suggest a modularity that does not exist. `block/` is separate because it is pure integer bookkeeping with no
+GPU dependency — which is exactly why [Steps 4.5–4.7](#step-45--block-pool) can be written away from the machine.
+
+**One test file per source file, not per phase.** This diverges from Mini-GPT's phase-grouped suite on purpose:
+every step here ends with a single `pytest tests/test_x.py` command that must go green before you commit, and that
+loop is the spine of the plan. The cost is more files; the benefit is that a step's "Done when" is one command.
 
 ---
 
@@ -195,8 +226,8 @@ Established once in [Step 0.2](#step-02--shared-test-infrastructure) and used by
 
 | Marker | Meaning | Run with |
 |---|---|---|
-| *(none)* | Pure CPU logic, milliseconds | `pytest -m "not gpu"` |
-| `@pytest.mark.gpu` | Needs CUDA (kernels, model forward) | `pytest -m gpu` |
+| *(none)* | Pure CPU logic, milliseconds | `pytest -m "not cuda"` |
+| `@pytest.mark.cuda` | Needs CUDA (kernels, model forward) | `pytest -m cuda` |
 | `@pytest.mark.oracle` | Needs the Qwen3-0.6B weights downloaded | `pytest -m oracle` |
 | `@pytest.mark.slow` | Statistical or stress tests, minutes | `pytest -m slow` |
 
@@ -221,15 +252,44 @@ Conventions that pay off later:
 Comparing floats needs a threshold tight enough to catch bugs and loose enough to tolerate legal reassociation.
 Starting points, keyed by dtype so `assert_allclose` can choose automatically:
 
-| Comparison | rtol / atol | Note |
+| Comparison | Threshold | Note |
 |---|---|---|
-| Single op, FP32 | `1e-5` | Should be near-exact |
-| Single op, BF16 | `1e-2` | Reductions in different orders |
-| Full-model logits, BF16 | `2e-2` | Error accumulates across 28 layers |
+| Single op, FP32 | `1e-5` rtol/atol | Should be near-exact |
+| Single op, BF16 | `1e-2` rtol/atol | Reductions in different orders |
+| Full-model logits, FP32 | `1e-4` relative norm | Isolates arithmetic from rounding |
+| Full-model logits, BF16 | `5e-2` relative norm | Not elementwise — see below |
 | Greedy token IDs | **exact** | The strongest check available — prefer it |
 
+**Full-model BF16 logits need a different instrument, not a looser tolerance** — measured while doing
+[Step 1.8](#step-18--the-full-qwen3-model). An elementwise `atol` on a BF16 residual stream mostly reports magnitude:
+BF16 keeps 8 mantissa bits, so one ULP at magnitude 512 is an absolute difference of 4, and two *correct*
+implementations that disagree by a single bit look like `atol=4`. Compare `‖ours − theirs‖ / ‖theirs‖` instead. This
+model sits at 1.7% against HuggingFace on real text, while the subtlest wrong model worth worrying about — Qwen2's
+`rope_theta` of 10000 instead of Qwen3's 1e6 — sits at 14%, so a 5% ceiling has roughly 3x of room on either side.
+Measure it on **real text**: random token ids are chaotically amplified through 28 layers, reaching 11% while proving
+nothing.
+
+Prefer the exact checks wherever they exist, and note that FP32 gives you one. With rounding out of the way a correct
+implementation agrees with HuggingFace to ~1e-6 relative and *every* argmax matches, which is a far stronger statement
+than any BF16 tolerance. So when a comparison looks marginal, rerun it in FP32: an error that survives is real, and
+one that vanishes was rounding all along.
+
+**Changing a tensor's shape changes its arithmetic** — measured while doing [Step 2.2](#step-22--cached-model-and-serving-loop),
+and the reason that step's exact check has to run in FP32. A decode step multiplies a `1 x D` query by the cache; a full
+recompute multiplies `S x D`. Same numbers, same operation, but cuBLAS picks a different kernel for a matrix-vector
+product than for a matrix-matrix one, and a different kernel sums in a different order. The two disagree by 2% relative
+in BF16 — while the *prefill* path, which keeps the original shapes, comes out **bitwise identical**. That pairing is
+the proof: shape is the only variable, so shape is the whole explanation.
+
+This is not a caching quirk, it is the rule for every optimization that follows. A tiled kernel, a fused kernel, a
+paged cache, a batched-together request — each one reassociates a sum, so each one forfeits bitwise equality in BF16
+while remaining exactly correct. Plan for it now: assert token identity in **FP32**, where there is enough headroom
+that reassociation does not change any argmax, and in BF16 assert *drift plus a near-tie characterization* instead.
+The alternative — loosening the BF16 tolerance until it passes — trades a real check for a decoration.
+
 When a logits comparison fails, diff **layer by layer** with a forward hook rather than staring at the final tensor.
-A per-layer diff against the oracle turns a mystery into an address.
+A per-layer diff against the oracle turns a mystery into an address — and the *shape* of the curve is the diagnosis:
+smoothly growing error is rounding, a jump at one layer is the bug.
 
 ---
 
@@ -240,23 +300,29 @@ Two steps, then you never think about tooling again. The whole point is to prove
 
 #### Step 0.1 — Dependencies & CUDA extension toolchain
 
-**Write** `requirements.txt`, `pyproject.toml`, `csrc/hello.cu`, `csrc/bindings.cpp`, `minivllm/kernels/extension.py` ·
-**Test** `tests/test_env.py`
+**Write** `requirements.txt`, `Makefile`, `pytest.ini`, `csrc/hello.cu`, `csrc/bindings.cpp`,
+`mini_vllm/kernels/extension.py` · **Test** `tests/test_env.py`
 
 - Pin `torch`, `transformers`, `safetensors`, `numpy`, `pytest`, `hypothesis` (property tests in Phase 4),
   `huggingface-hub`. Record the CUDA-wheel index URL as a comment.
-- `pyproject.toml` holds pytest config only: register the four markers from
-  [Test conventions](#test-conventions), set `testpaths`, and add `pythonpath = ["."]` so no install step is needed.
+- `pytest.ini` holds pytest config only: register the four markers from
+  [Test conventions](#test-conventions), set `testpaths = tests` and `pythonpath = .` so `import mini_vllm` works
+  with no install step.
+- `Makefile` is the entry point for every later phase, matching the other Mini projects: `setup` (venv + pinned
+  deps), `ext` (force a rebuild of the CUDA extension), `test` (`python -m pytest -q`), `bench`
+  (`python -m mini_vllm.bench`), `clean`, and a default `help`. `ext` exists because a stale JIT cache is the first
+  thing to suspect when a kernel change appears to do nothing.
 - `csrc/hello.cu`: a trivial `y = a*x + b` (axpby) CUDA kernel over a 1-D tensor — the direct analog of tiny-llm's
   `axpby` first extension. `csrc/bindings.cpp` exposes it with `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)`.
-- `minivllm/kernels/extension.py`: a `load_extension()` helper that JIT-compiles all of `csrc/` via
-  `torch.utils.cpp_extension.load(..., extra_cuda_cflags=["-arch=sm_120"])` and caches the module. This is where the
+- `mini_vllm/kernels/extension.py`: a `load_extension()` helper that JIT-compiles all of `csrc/` via
+  `torch.utils.cpp_extension.load(..., extra_cuda_cflags=["-arch=sm_120"])` and caches the module. Resolve `csrc/`
+  relative to the repo root (`Path(__file__).resolve().parents[2]`), never the working directory. This is where the
   version-mismatch fix from [Environment](#environment) lands (setting `CUDA_HOME` / `os.environ` before the call).
 
 **Done when:** the extension actually compiles and loads, and `hello` matches `a*x + b` from PyTorch on a GPU tensor:
 
 ```bash
-pytest tests/test_env.py -v
+make test                       # or: pytest tests/test_env.py -v
 ```
 
 `test_env.py` asserts CUDA is available, compute capability is `(12, 0)`, `torch.__version__` matches
@@ -269,13 +335,16 @@ pytest tests/test_env.py -v
 
 **Write** `tests/conftest.py` · **Test** *(itself)* `tests/test_infra.py`
 
-- The `seeded` autouse fixture (`torch.manual_seed`, `random.seed`) and a `device` fixture that skips `@gpu` tests
+- The `seeded` autouse fixture (`torch.manual_seed`, `random.seed`) and a `device` fixture that skips `@cuda` tests
   when CUDA is absent.
 - `assert_allclose(actual, expected)` that reads the dtype and applies the matching
   [tolerance](#numerical-tolerances), plus a greedy-token equality helper.
-- A `tiny_qwen3()` fixture: a randomly-initialized Qwen3 with `num_layers=2`, `E=64`, `H_q=4`, `H_k=2`, `D=16`,
+- A `tiny_qwen3()` fixture: a randomly-initialized Qwen3 with `num_layers=2`, `E=64`, `H_q=4`, `H_k=2`, `D=32`,
   small vocab — same architecture as the real model ([§3](./DESIGN.md#3-the-qwen3-model)), tiny enough to run every
-  correctness test on the GPU in milliseconds.
+  correctness test on the GPU in milliseconds. Built from HuggingFace's `Qwen3ForCausalLM`, because ours does not
+  exist until [Step 1.8](#step-18--the-full-qwen3-model) — which is the right way round, since from 1.8 on this
+  fixture *is* the oracle and needs no download. Keep `H_q · D ≠ E` and `G = 2`: those two properties are what make
+  the fixture catch the reshape and GQA-indexing bugs it exists to catch.
 
 **Done when:** `assert_allclose` passes on equal tensors and fails just outside tolerance; `tiny_qwen3()` constructs
 and does one forward pass without error:
@@ -296,7 +365,7 @@ Design reference: [§3](./DESIGN.md#3-the-qwen3-model).
 
 #### Step 1.1 — Basics: linear, SiLU, softmax
 
-**Write** `minivllm/basics.py` · **Test** `tests/test_basics.py`
+**Write** `mini_vllm/basics.py` · **Test** `tests/test_basics.py`
 
 **📚 Readings**
 
@@ -318,7 +387,7 @@ pytest tests/test_basics.py -v
 
 #### Step 1.2 — Attention and multi-head attention
 
-**Write** `minivllm/attention.py` · **Test** `tests/test_attention.py`
+**Write** `mini_vllm/attention.py` · **Test** `tests/test_attention.py`
 
 **📚 Readings**
 
@@ -349,7 +418,7 @@ pytest tests/test_attention.py -v -k "simple or mha"
 
 #### Step 1.3 — RoPE with explicit positions
 
-**Write** `minivllm/positional_encoding.py` · **Test** `tests/test_rope.py`
+**Write** `mini_vllm/positional_encoding.py` · **Test** `tests/test_rope.py`
 
 **📚 Readings**
 
@@ -377,7 +446,7 @@ pytest tests/test_rope.py -v
 
 #### Step 1.4 — Grouped-query attention and causal masking
 
-**Write** `minivllm/attention.py` (extend) · **Test** `tests/test_attention.py`
+**Write** `mini_vllm/attention.py` (extend) · **Test** `tests/test_attention.py`
 
 **📚 Readings**
 
@@ -405,7 +474,7 @@ pytest tests/test_attention.py -v -k "grouped or causal"
 
 #### Step 1.5 — RMSNorm
 
-**Write** `minivllm/layer_norm.py` · **Test** `tests/test_layer_norm.py`
+**Write** `mini_vllm/layer_norm.py` · **Test** `tests/test_layer_norm.py`
 
 - `RMSNorm(dim, weight, eps)`: `x * rsqrt(mean(x², dim=-1) + eps) * weight`, with the mean-square reduction in FP32
   even when `x` is BF16, then cast back.
@@ -427,7 +496,7 @@ pytest tests/test_layer_norm.py -v
 
 #### Step 1.6 — Embedding
 
-**Write** `minivllm/embedding.py` · **Test** `tests/test_embedding.py`
+**Write** `mini_vllm/embedding.py` · **Test** `tests/test_embedding.py`
 
 - `Embedding(vocab_size, dim, weight)`: `__call__(ids)` gathers rows; `as_linear(h)` computes `h · weightᵀ` for the
   tied LM head ([§3](./DESIGN.md#3-the-qwen3-model), `tie_word_embeddings=true`).
@@ -447,7 +516,7 @@ pytest tests/test_embedding.py -v
 
 #### Step 1.7 — Weight loader
 
-**Write** `minivllm/model/loader.py` · **Test** `tests/test_loader.py`
+**Write** `mini_vllm/model/loader.py` · **Test** `tests/test_loader.py`
 
 - Resolve `Qwen/Qwen3-0.6B` to a local snapshot (`huggingface_hub.snapshot_download`), read `config.json`,
   memory-map the safetensors shards, and yield `(name, tensor)` pairs.
@@ -467,7 +536,7 @@ pytest tests/test_loader.py -v -m oracle
 
 #### Step 1.8 — The full Qwen3 model
 
-**Write** `minivllm/model/qwen3.py` · **Test** `tests/test_qwen3.py`
+**Write** `mini_vllm/model/qwen3.py` · **Test** `tests/test_qwen3.py`
 
 - Assemble `embedding → 28 × TransformerBlock → final RMSNorm → tied LM head`, using Steps 1.1–1.6. Each block is
   pre-norm: `h = x + attn(rmsnorm(x))`, `out = h + mlp(rmsnorm(h))`.
@@ -483,21 +552,23 @@ per block:
   x = x + down(silu(gate(x')) * up(x')),  x' = rmsnorm(x)
 ```
 
-**Done when:** logits match HF within the [BF16 full-model tolerance](#numerical-tolerances) on several prompts,
-**and** greedy argmax token IDs match exactly for 32 generated tokens. The same forward on `tiny_qwen3()` runs
-without weights:
+**Done when:** FP32 logits match HF to `1e-4` relative with every argmax identical — that is the arithmetic proof —
+BF16 logits stay inside the [BF16 drift limit](#numerical-tolerances), **and** greedy argmax token IDs match exactly
+for 32 generated tokens. The same forward on `tiny_qwen3()` runs without weights:
 
 ```bash
 pytest tests/test_qwen3.py -v            # structure + tiny_qwen3 forward
 pytest tests/test_qwen3.py -v -m oracle  # logits + greedy vs HF
 ```
 
-> If this fails, diff layer by layer with a forward hook. Do not proceed on a near-miss — a 2% logits error here
-> becomes divergent text after 50 tokens.
+> If this fails, diff layer by layer with a forward hook, and read the shape of the curve rather than the final number
+> ([tolerances](#numerical-tolerances)). Check FP32 before concluding anything. Pair the drift limit with a negative
+> control — deliberately break `rope_theta` and confirm the check *fails* — otherwise a threshold that no longer
+> discriminates will keep passing forever.
 
 #### Step 1.9 — The generation loop
 
-**Write** `minivllm/generate.py` · **Test** `tests/test_generate.py`
+**Write** `mini_vllm/generate.py` · **Test** `tests/test_generate.py`
 
 - A greedy generation loop: tokenize the prompt, forward the **full sequence** each step (naive, no cache yet), take
   the last position's argmax, append, repeat until EOS or `max_tokens`. Detokenize.
@@ -512,15 +583,24 @@ step: logits = model(tokens)[:, -1, :]  -> next = argmax(logits)  -> tokens.appe
 
 ```bash
 pytest tests/test_generate.py -v -m oracle
-python -m minivllm.generate --prompt "The capital of France is"   # watch it talk
+python -m mini_vllm.generate --prompt "The capital of France is"   # watch it talk
 ```
 
-> **Learn:** notice how slow this is — every token reruns all 28 layers over the whole growing prefix. That waste is
-> exactly what Phase 2's KV cache removes, and you will *feel* the difference in the benchmark.
+> **Learn:** notice how slow this is — every token reruns all 28 layers over the whole growing prefix. On a 5070
+> Laptop that is **1.0 tokens/s** for Qwen3-0.6B. That waste is exactly what Phase 2's KV cache removes, and you will
+> *feel* the difference in the benchmark.
+
+> **The one legitimate exception to token identity.** In BF16 the top two candidates can land on *adjacent
+> representable values* — 18.0 and 17.875, exactly one ULP apart — and then which one wins the argmax is decided by
+> rounding rather than by the model. One of the three prompts tested does this at step 14, continuing "...300 people in
+> **the world**" where HuggingFace picks "...in **a town**". Both are correct. Do not chase it, and do not quietly drop
+> the prompt either: `tests/test_generate.py` asserts that any divergence has this exact shape — both models proposing
+> the *same two* candidates within a couple of ULP — which a real bug fails, because it picks a token the oracle does
+> not rank highly at all.
 
 #### Step 1.10 — Sampler
 
-**Write** `minivllm/sampler.py` · **Test** `tests/test_sampler.py`
+**Write** `mini_vllm/sampler.py` · **Test** `tests/test_sampler.py`
 
 - Greedy (`temperature == 0`), temperature scaling, top-k, top-p (nucleus). Vectorized across the batch — every
   sequence may carry different sampling parameters.
@@ -546,7 +626,7 @@ Design reference: [§3](./DESIGN.md#3-the-qwen3-model).
 
 #### Step 2.1 — Dense KV cache
 
-**Write** `minivllm/kv_cache.py` · **Test** `tests/test_kv_cache.py`
+**Write** `mini_vllm/kv_cache.py` · **Test** `tests/test_kv_cache.py`
 
 **📚 Readings**
 
@@ -573,7 +653,7 @@ pytest tests/test_kv_cache.py -v
 
 #### Step 2.2 — Cached model and serving loop
 
-**Write** `minivllm/model/qwen3_cached.py` · **Test** `tests/test_qwen3_cached.py`
+**Write** `mini_vllm/model/qwen3_cached.py` · **Test** `tests/test_qwen3_cached.py`
 
 - **Fork** Step 1.8's model — do not mutate it. The cached model takes a per-layer cache list and an `offset`, and
   passes only the new tokens each step. RoPE positions become `arange(offset, offset + L)`; the causal mask uses
@@ -582,7 +662,7 @@ pytest tests/test_kv_cache.py -v
 - Extend `generate.py` with a cached path: prefill the whole prompt once, then feed one token per step with the
   running offset.
 - Design the layer's ops (`rmsnorm`, `rope`, `swiglu`, `attention`) so they dispatch through
-  `minivllm/kernels/ops.py` behind a `use_cuda` flag — the readable functions are the default, and Phase 3 flips
+  `mini_vllm/kernels/ops.py` behind a `use_cuda` flag — the readable functions are the default, and Phase 3 flips
   each one to a kernel without a new model file.
 
 ```text
@@ -590,19 +670,29 @@ prefill: step(model, prompt_ids, offset=0)     -> first token, cache filled to l
 decode:  step(model, [tok], offset=prev_len)   -> next token, cache grows by 1
 ```
 
-**Done when:** cached greedy generation is **token-identical** to Step 1.9's naive loop and to
-`transformers.generate`, for single sequences and a batch of three different prompts:
+**Done when:** in **FP32**, cached greedy generation is **token-identical** to Step 1.9's naive loop and to
+`transformers.generate`, for single sequences and a batch of three different prompts. In BF16, prefill is bitwise equal
+to the uncached forward, a decode step stays inside the [drift limit](#numerical-tolerances) with a matching argmax, and
+any greedy divergence is a demonstrable near-tie:
 
 ```bash
 pytest tests/test_qwen3_cached.py -v -m oracle
 ```
 
+> Do not spend a day hunting the BF16 divergence — read
+> [shape changes arithmetic](#numerical-tolerances) first. A decode step *cannot* be bitwise equal to a full recompute
+> in BF16, because `1 x D` and `S x D` matmuls reduce in different orders. FP32 is where this step's exact claim lives.
+
 > **Learn:** the `offset`/`arange` positioning here is the same machinery chunked prefill reuses in Phase 4.
 > Modeling it now means Step 4.4 is a scheduler change, not a model rewrite.
 
+> **Learn:** feeding the prompt one token at a time must equal prefilling it in one pass. The arithmetic is identical
+> either way, so the only things that can differ are `offset` and the mask — which makes it the sharpest available test
+> of position bookkeeping, and it costs one line to write.
+
 #### Step 2.3 — Benchmark and profile harness
 
-**Write** `minivllm/bench.py` · **Test** `tests/test_bench_smoke.py`
+**Write** `mini_vllm/bench.py` · **Test** `tests/test_bench.py`
 
 **📚 Readings**
 
@@ -611,18 +701,37 @@ pytest tests/test_qwen3_cached.py -v -m oracle
 - A harness that measures the cached model with correct GPU timing: `torch.cuda.synchronize()` around timed
   regions, a warmup, and separate **TTFT** (prefill) and **decode tokens/sec** numbers.
 - A `--compare hf` mode that runs the same prompts through `transformers.generate` for a baseline.
+- **A check that the GPU was awake.** Sample `nvidia-smi` clocks in a background thread *during* the run — a reading
+  taken afterwards always looks idle — keep the peak, and print a loud warning when it is below half of maximum.
+  Print which ops ran as kernels too, since "my kernel made no difference" is usually "my kernel never ran".
+- Structure it as `--mode single` from the start. This is the one benchmark module for the whole project;
+  [Steps 5.1](#step-51--throughput-benchmark) and [5.2](#step-52--scheduler-stress-test) add `--mode throughput` and
+  `--mode scheduler` to it rather than starting new files, so the timing and warmup code has exactly one home.
 
 **Done when:** the harness prints TTFT and decode tok/s for the cached model and the HF baseline on identical
 inputs, and the smoke test confirms it runs end to end on `tiny_qwen3()`:
 
 ```bash
-pytest tests/test_bench_smoke.py -v
-python -m minivllm.bench --model qwen3-0.6b --input-len 128 --output-len 128 --warmup 2
+pytest tests/test_bench.py -v
+python -m mini_vllm.bench --mode single --input-len 128 --output-len 128 --warmup 2
 ```
 
 > **Learn:** this harness is the instrument for all of Phase 3. The loop is always
 > *measure → name the largest cost → optimize one thing → verify correctness → benchmark → measure again.* A kernel
 > is never written because it sounds useful; it is written because the profile pointed at it.
+
+> **Check the machine before believing any measurement.** The first run of this harness reported 1.2 tok/s, and the
+> instinct is to go looking for the bug in the decode loop. There wasn't one: `transformers` scored 1.3 tok/s on the
+> same box, and a bare `tensor.copy_()` of 256 MB ran at **7 GB/s** on a card rated near 380. The GPU was pinned in P8
+> at 180 of 3090 MHz core and 405 of 12001 MHz memory, because a vendor utility had set
+> `enforced.power.limit` to **10 W** out of a 115 W maximum. Every number was ~30x low, uniformly, so nothing looked
+> anomalous — which is exactly what makes it dangerous.
+>
+> The tell is a *ratio*, not a timing. Divide bytes moved by seconds and compare against the card's rated bandwidth;
+> if a memory-bound op is an order of magnitude off spec, stop and check `nvidia-smi -q -d PERFORMANCE` for
+> `SW Power Cap` and `enforced.power.limit` before touching the code. Note also that under a throttle the memory clock
+> falls further than the core, so the machine looks *more* memory-bound than it is — which would push Phase 3 toward
+> the wrong kernels for reasons that have nothing to do with the model.
 
 ---
 
@@ -631,7 +740,12 @@ python -m minivllm.bench --model qwen3-0.6b --input-len 128 --output-len 128 --w
 Now you write GPU code by hand. Each `.cu` replaces a readable PyTorch op from Phase 1 and is checked against it,
 then wired into `qwen3_cached` behind the `use_cuda` flag from [Step 2.2](#step-22--cached-model-and-serving-loop)
 so it is also verified end to end. Every step adds a `csrc/*.cu`, a binding in `csrc/bindings.cpp`, and a wrapper in
-`minivllm/kernels/ops.py`; the source file *of record* for the step is the `.cu`.
+`mini_vllm/kernels/ops.py`; the source file *of record* for the step is the `.cu`.
+
+Each step also adds a case to `bench.py --mode kernels`, added in [Step 3.1](#step-31--rmsnorm-kernel), which times
+every kernel beside the PyTorch expression it replaced and converts both to achieved memory bandwidth. Keeping the
+pair in the report is the point: a speedup is only meaningful next to the thing it sped up, and a kernel with no
+benchmark case is a kernel nobody checked.
 
 Design reference: [§5](./DESIGN.md#5-cuda-kernels).
 
@@ -657,12 +771,46 @@ output: (B·L) x E            one block per row
 (the real score for a memory-bound op):
 
 ```bash
-pytest tests/test_rmsnorm_cuda.py -v -m gpu
+pytest tests/test_rmsnorm_cuda.py -v -m cuda
+pytest tests/test_rmsnorm_cuda.py -v -m oracle      # token-identical on the real 0.6B
+python -m mini_vllm.bench --mode kernels
+python -m mini_vllm.bench --mode single --use-cuda-kernels
 ```
 
 > **Learn:** your first real kernel. Get the block-per-row layout and the warp reduction right here; every later
 > kernel reuses this shape. Because the op is memory-bound, a correct kernel that hits ~80% of peak bandwidth is
 > already near the ceiling — chasing more is chasing noise.
+
+**What it measured** (Step 3.1, now done). On the DRAM-bound shape the kernel sustains **294–316 GB/s** across runs,
+which is 77–82% of this card's 384 GB/s theoretical peak and level with a bare `copy_` of the same bytes (292–297
+GB/s) — so it is at the roofline and there is nothing left to win here. It beats the PyTorch expression by **~9x**,
+and end to end the single kernel takes decode from **34 to 49 tok/s** (1.45x, reproducible to ±1 tok/s over three
+runs) with TTFT falling from ~37 ms to ~25 ms. That
+is a suspiciously large return for one elementwise op, and the reason is arithmetic: Qwen3-0.6B calls RMSNorm **113
+times per forward pass** (`attn_norm`, `mlp_norm`, `q_norm`, `k_norm` in each of 28 layers, plus the final norm), and
+each call was six PyTorch kernels and a Python round trip.
+
+Three things were worth more than the speedup:
+
+1. **A working set that fits in L2 reports a bandwidth above the card's peak.** The L2 here is **32 MB**, larger than
+   most tensors a 0.6B model touches, and the first version of the benchmark used 4096 rows — a 16 MB working set —
+   and printed **670 GB/s, or 174% of peak**. The impossible percentage is the only thing that gave it away; had the
+   number landed at 350 GB/s it would have been believed. `--mode kernels` now sizes one case to 8x L2 and says which
+   case is the honest one. Cache, not DRAM, is the default thing you measure on a small model.
+2. **At `L = 1` the op is launch-bound, not memory-bound.** One row of 1024 takes 10.8 µs, and a do-nothing kernel on
+   a *single element* takes 11.4 µs — indistinguishable, so the decode-shape cost is the pybind call plus the launch,
+   not the work. This is why the end-to-end win came from *removing 5 launches per call* rather than from bandwidth,
+   and it is the concrete argument for CUDA graph capture that [§11](./DESIGN.md#11-future-work) defers.
+3. **Round to the input dtype *before* the weight multiply.** The oracle computes `weight * normalized.to(dtype)`,
+   so a kernel that keeps the normalized value in fp32 through the weight multiply is slightly *more* accurate than
+   the reference — and a differential test cannot tell "better" from "different". Matching the rounding is what makes
+   bf16 come out bitwise identical to PyTorch for most shapes, which is a far sharper signal than a tolerance.
+
+> **On refusing work.** The kernel rejects fp64 rather than accumulating it in fp32 like everything else. The rule
+> from [§5.3](./DESIGN.md#53-occupancy-and-correctness-notes) is that reductions accumulate in fp32 *because storage
+> is bf16* — applying it to a tensor that explicitly asked for double would halve its precision silently, which is a
+> worse outcome than not running. Mixed input/weight dtypes are declined for the same reason and fall back to the
+> PyTorch path, which promotes them correctly.
 
 #### Step 3.2 — RoPE kernel
 
@@ -680,7 +828,7 @@ cos/sin: max_seq_len x (D/2)
 non-contiguous positions; end-to-end greedy output unchanged:
 
 ```bash
-pytest tests/test_rope_cuda.py -v -m gpu
+pytest tests/test_rope_cuda.py -v -m cuda
 ```
 
 #### Step 3.3 — SwiGLU kernel
@@ -698,7 +846,7 @@ gate, up: (B·L) x intermediate    ->    out: (B·L) x intermediate
 the benchmark shows the saved round trip to global memory:
 
 ```bash
-pytest tests/test_swiglu_cuda.py -v -m gpu
+pytest tests/test_swiglu_cuda.py -v -m cuda
 ```
 
 #### Step 3.4 — Decode attention (online softmax)
@@ -724,7 +872,7 @@ tolerance across context lengths that are exact tile multiples and lengths with 
 case that breaks naive kernels); end-to-end decode output unchanged:
 
 ```bash
-pytest tests/test_decode_attention_cuda.py -v -m gpu
+pytest tests/test_decode_attention_cuda.py -v -m cuda
 ```
 
 > **Learn:** write out the online-softmax rescaling by hand for two tiles before you code it. Understanding why `O`
@@ -748,7 +896,7 @@ shared memory stages one K tile and one V tile at a time; __syncthreads() after 
 and are not multiples of the tile size; end-to-end prefill (and therefore full generation) output unchanged:
 
 ```bash
-pytest tests/test_flash_prefill_cuda.py -v -m gpu
+pytest tests/test_flash_prefill_cuda.py -v -m cuda
 ```
 
 > **Learn:** skipping the above-diagonal tiles is a real speedup and a classic off-by-one trap. Test a prompt length
@@ -767,7 +915,7 @@ benchmark shows a prefill speedup at Qwen projection shapes. **This step is opti
 engine is complete and correct; everything after Phase 3 depends only on Step 3.5:
 
 ```bash
-pytest tests/test_flash_prefill_cuda.py -v -m gpu -k tensor_core
+pytest tests/test_flash_prefill_cuda.py -v -m cuda -k tensor_core
 ```
 
 ---
@@ -782,7 +930,7 @@ Design reference: [§6](./DESIGN.md#6-paged-kv-cache), [§7](./DESIGN.md#7-conti
 
 #### Step 4.1 — Sequence state
 
-**Write** `minivllm/sequence.py` · **Test** `tests/test_sequence.py`
+**Write** `mini_vllm/serve/sequence.py` · **Test** `tests/test_sequence.py`
 
 - `Sequence`: `seq_id`, `prompt_token_ids`, `output_token_ids`, `status`, `num_computed_tokens` (how far chunked
   prefill has progressed), and a handle for its cache / block table.
@@ -801,7 +949,7 @@ pytest tests/test_sequence.py -v
 
 #### Step 4.2 — Forward batch metadata
 
-**Write** `minivllm/runner/batch.py` · **Test** `tests/test_batch.py`
+**Write** `mini_vllm/serve/batch.py` · **Test** `tests/test_batch.py`
 
 - A `ForwardBatch` dataclass holding exactly what the model and kernels need for a **ragged** batch: flattened
   `input_ids`, `positions`, `cu_seqlens_q` (query offsets), `seq_lens`, `context_lens`, and the per-sequence
@@ -828,7 +976,7 @@ pytest tests/test_batch.py -v
 
 #### Step 4.3 — Continuous batching scheduler
 
-**Write** `minivllm/scheduler/scheduler.py` · **Test** `tests/test_scheduler.py`
+**Write** `mini_vllm/serve/scheduler.py` · **Test** `tests/test_scheduler.py`
 
 **📚 Readings**
 
@@ -844,12 +992,12 @@ the boundary, not after a drain); output for every sequence in a continuously-ba
 running each alone:
 
 ```bash
-pytest tests/test_scheduler.py -v -m gpu
+pytest tests/test_scheduler.py -v -m cuda
 ```
 
 #### Step 4.4 — Chunked prefill and piggyback
 
-**Write** `minivllm/scheduler/scheduler.py` (extend) · **Test** `tests/test_chunked_prefill.py`
+**Write** `mini_vllm/serve/scheduler.py` (extend) · **Test** `tests/test_chunked_prefill.py`
 
 - Split prompts longer than the chunk size, advancing `num_computed_tokens` per iteration
   ([§7.2](./DESIGN.md#72-chunked-prefill)). Fill the leftover token budget after a prefill chunk with pending decode
@@ -861,7 +1009,7 @@ one pass (this catches position/mask errors at chunk boundaries); a mixed prefil
 sequence, exactly what it produces run alone:
 
 ```bash
-pytest tests/test_chunked_prefill.py -v -m gpu
+pytest tests/test_chunked_prefill.py -v -m cuda
 ```
 
 > **Learn:** if this fails only at a chunk boundary, suspect the position tensor or the causal-mask offset — the two
@@ -869,7 +1017,7 @@ pytest tests/test_chunked_prefill.py -v -m gpu
 
 #### Step 4.5 — Block pool
 
-**Write** `minivllm/block/block_pool.py` · **Test** `tests/test_block_pool.py`
+**Write** `mini_vllm/block/block_pool.py` · **Test** `tests/test_block_pool.py`
 
 This is where paging begins. Everything from here to [Step 4.7](#step-47--block-manager--copy-on-write) is pure
 Python over integers — no GPU, no floats — so tests run in milliseconds and the subtle refcount bugs are cheap to
@@ -889,7 +1037,7 @@ pytest tests/test_block_pool.py -v
 
 #### Step 4.6 — Block table
 
-**Write** `minivllm/block/block_table.py` · **Test** `tests/test_block_table.py`
+**Write** `mini_vllm/block/block_table.py` · **Test** `tests/test_block_table.py`
 
 - Holds the physical block ids for one sequence. `append_block`, `physical_slot(pos)` returning
   `block_id · P + pos % P`, and `slot_mapping(positions)` producing the flat `int32` tensor the write path consumes.
@@ -913,7 +1061,7 @@ pytest tests/test_block_table.py -v
 
 #### Step 4.7 — Block manager & copy-on-write
 
-**Write** `minivllm/block/block_manager.py` · **Test** `tests/test_block_manager.py`
+**Write** `mini_vllm/block/block_manager.py` · **Test** `tests/test_block_manager.py`
 
 - Owns the block pool, per-sequence block tables, and the paged K/V pool tensors
   (`[num_blocks, P, H_k, D]` per layer). Implements the [§6.4](./DESIGN.md#64-block-manager-api) API: `can_allocate`,
@@ -932,7 +1080,7 @@ blocks. Paged dense-gather attention equals dense-cache attention even when the 
 shuffled** so physical order differs from logical order (the leak-check fixture confirms no blocks leak):
 
 ```bash
-pytest tests/test_block_manager.py -v -m gpu
+pytest tests/test_block_manager.py -v -m cuda
 ```
 
 #### Step 4.8 — Paged attention kernels
@@ -951,7 +1099,7 @@ to BF16 tolerance, including the shuffled block table and a mixed batch of
 `[prefill(300), decode(1), decode(1), prefill(50)]` where every sequence produces exactly what it produces alone:
 
 ```bash
-pytest tests/test_paged_attention_cuda.py -v -m gpu
+pytest tests/test_paged_attention_cuda.py -v -m cuda
 ```
 
 > **Learn:** the shuffled-block-table test is the real test of the indirection. If it passes only when physical
@@ -959,18 +1107,20 @@ pytest tests/test_paged_attention_cuda.py -v -m gpu
 
 #### Step 4.9 — Engine API
 
-**Write** `minivllm/engine.py` · **Test** `tests/test_engine.py`
+**Write** `mini_vllm/serve/engine.py` · **Test** `tests/test_engine.py`
 
 - The public surface: `LLM(model, **config)` and `generate(prompts, sampling_params)`, plus a streaming generator
   variant. Wires the scheduler, block manager, paged model (paged kernels behind the block manager), and sampler.
   Tokenizer in, detokenized text out.
+- Re-export it from `mini_vllm/__init__.py` so the public entry point is `from mini_vllm import LLM`. The
+  `serve.engine` path is where it lives, not how callers should spell it — this is the one import the README shows.
 
 **Done when:** greedy output for a batch of 16 varied-length prompts matches `transformers.generate` token for
 token. **This is the milestone — the engine now works end to end.** Everything after is measurement:
 
 ```bash
 pytest tests/test_engine.py -v -m oracle
-python -c "from minivllm.engine import LLM; print(LLM('qwen3-0.6b').generate(['Hello, my name is']))"
+python -c "from mini_vllm import LLM; print(LLM('qwen3-0.6b').generate(['Hello, my name is']))"
 ```
 
 ---
@@ -981,33 +1131,34 @@ Turn the [§10](./DESIGN.md#10-performance-targets) targets into numbers you can
 
 #### Step 5.1 — Throughput benchmark
 
-**Write** `benchmarks/bench_throughput.py` · **Test** `tests/test_bench_throughput_smoke.py`
+**Write** `mini_vllm/bench.py` (extend) · **Test** `tests/test_bench.py` (extend)
 
-- A fixed prompt set; measure output tokens/sec for the engine against `transformers.generate` as the baseline.
-  Report batch-size scaling. Include a warmup; exclude model-load time.
+- Add `--mode throughput`: a fixed prompt set; measure output tokens/sec for the engine against
+  `transformers.generate` as the baseline. Report batch-size scaling. Reuse the warmup and `synchronize()` timing
+  from [Step 2.3](#step-23--benchmark-and-profile-harness); exclude model-load time.
 
 **Done when:** the harness runs both engines on identical inputs and prints a comparison table. Expect a large win
 over HF at batch sizes above 1 — that gap is continuous batching plus paging:
 
 ```bash
-pytest tests/test_bench_throughput_smoke.py -v
-python benchmarks/bench_throughput.py --model qwen3-0.6b --batch-sizes 1,4,16
+pytest tests/test_bench.py -v
+python -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16
 ```
 
 #### Step 5.2 — Scheduler stress test
 
-**Write** `benchmarks/bench_scheduler.py` · **Test** `tests/test_stress.py`
+**Write** `mini_vllm/bench.py` (extend) · **Test** `tests/test_stress.py`
 
-- An adversarial mix: many short sequences alongside a few very long ones, arriving on a Poisson schedule. Compare
-  chunked prefill against a prefill-prioritized baseline.
+- Add `--mode scheduler`: an adversarial mix of many short sequences alongside a few very long ones, arriving on a
+  Poisson schedule. Compare chunked prefill against a prefill-prioritized baseline.
 
 **Done when:** P99 decode latency is measurably lower with chunked prefill (quantifying the head-of-line claim in
 [§7.2](./DESIGN.md#72-chunked-prefill)); a multi-thousand-request run finishes with **zero leaked blocks** and no
 OOM:
 
 ```bash
-pytest tests/test_stress.py -v -m "gpu and slow"
-python benchmarks/bench_scheduler.py --num-requests 2000
+pytest tests/test_stress.py -v -m "cuda and slow"
+python -m mini_vllm.bench --mode scheduler --num-requests 2000
 ```
 
 #### Step 5.3 — README with results
@@ -1018,8 +1169,8 @@ python benchmarks/bench_scheduler.py --num-requests 2000
   [`DESIGN.md`](./DESIGN.md), a "build it yourself" pointer to [`PLAN.md`](./PLAN.md), the benchmark table, what you
   learned, and the known limitations (the [Non-Goals](./DESIGN.md#1-goals--non-goals)).
 
-**Done when:** someone can clone, install from `requirements.txt`, download the model, and reproduce your headline
-benchmark from the README alone.
+**Done when:** someone can clone, run `make setup`, download the model, and reproduce your headline benchmark with
+one `make bench` from the README alone.
 
 ---
 

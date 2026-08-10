@@ -1,0 +1,38 @@
+# Mini-vLLM pinned dependencies (Step 0.1).
+#
+# torch is a CUDA 13.0 build and is NOT on the default PyPI index. Install with:
+#
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+#
+# The CUDA major version of torch (13) must match the nvcc that compiles csrc/.
+# The system nvcc on this machine is 12.8, which torch.utils.cpp_extension
+# rejects, so the wheels below supply a CUDA 13 toolchain instead, and
+# mini_vllm/kernels/extension.py assembles them into a CUDA_HOME that torch
+# accepts.
+#
+# Pin all four to the same 13.0 minor and keep them there. They are separate
+# wheels but one compiler, and pip will happily mix minors because the nvcc
+# wheel's own dependency bounds are loose. Two failures come from that:
+#
+#   nvvm/crt newer than nvcc  -> ptxas: "Unsupported .version 9.3"
+#                                (the front end emits PTX ptxas cannot read)
+#   cccl not matching nvcc    -> "CUDA compiler and CUDA toolkit headers are
+#                                incompatible, please check your include paths"
+#
+# 13.0 is chosen over a newer minor to line up with torch's cu130 runtime.
+# nvidia-cuda-cccl is not optional: it provides the <nv/target> header that
+# cuda_fp16.h includes, which the nvcc wheel omits.
+
+torch==2.11.0
+nvidia-cuda-nvcc==13.0.88
+nvidia-nvvm==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-cuda-cccl==13.0.85
+
+transformers==5.14.1
+safetensors==0.8.0
+huggingface-hub==1.26.0
+numpy==2.4.2
+
+pytest==9.0.3
+hypothesis==6.152.9
