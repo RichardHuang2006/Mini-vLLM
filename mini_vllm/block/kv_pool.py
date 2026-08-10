@@ -132,6 +132,14 @@ class PagedKvPool:
         decode steps' single tokens in one call — because the slots are already
         absolute. Nothing here needs to know which sequence a token belonged to,
         which is exactly the property that makes one launch enough.
+
+        The slot *values* are not checked here, and that is a deliberate reversal of
+        this file's usual habit. This is the innermost call in the engine — 28 layers
+        per iteration, every iteration — and `slot_mapping.max()` on a CUDA tensor is a
+        device-to-host read, which waits for everything queued behind it. Two of them per
+        layer measured 7 ms per iteration, a third of the model's time, to re-check
+        integers that `BlockManager.slots` already bounds-checked on the host while they
+        were still integers. Shapes are checked because that costs nothing.
         """
         self._check_layer(layer)
         if key.shape != value.shape:
@@ -141,12 +149,6 @@ class PagedKvPool:
         expected = (slot_mapping.shape[0], self.num_kv_heads, self.head_dim)
         if tuple(key.shape) != expected:
             raise ValueError(f"expected keys shaped {expected}, got {tuple(key.shape)}")
-        if slot_mapping.numel() and int(slot_mapping.max()) >= self.num_slots:
-            raise ValueError(
-                f"slot {int(slot_mapping.max())} is outside a pool of {self.num_slots} slots"
-            )
-        if slot_mapping.numel() and int(slot_mapping.min()) < 0:
-            raise ValueError(f"negative slot {int(slot_mapping.min())} in the mapping")
 
         flat_keys, flat_values = self.flat(layer)
         index = slot_mapping.to(device=flat_keys.device, dtype=torch.int64)

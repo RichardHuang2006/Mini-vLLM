@@ -189,6 +189,16 @@ class BlockTable:
         block_id = self._block_ids[position >> self._shift]
         return (block_id << self._shift) | (position & self._mask)
 
+    def slots(self, positions: Iterable[int]) -> list[int]:
+        """The physical slots of `positions`, as plain integers.
+
+        The form the engine wants: it concatenates several sequences' slots into one
+        vector per iteration, and a per-sequence tensor would have to be read back off
+        the device to do that — a synchronization per sequence per iteration, for numbers
+        that were Python integers a moment earlier.
+        """
+        return [self.physical_slot(position) for position in positions]
+
     def slot_mapping(
         self,
         positions: Iterable[int],
@@ -201,11 +211,7 @@ class BlockTable:
         indexes with, and a pool large enough to overflow it would not fit in any
         current GPU.
         """
-        return torch.tensor(
-            [self.physical_slot(position) for position in positions],
-            dtype=torch.int32,
-            device=device,
-        )
+        return torch.tensor(self.slots(positions), dtype=torch.int32, device=device)
 
     def _check_position(self, position: int) -> None:
         # Checked against occupancy, not capacity, and deliberately so: a slot that

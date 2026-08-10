@@ -220,8 +220,8 @@ class BlockManager:
 
     # ------------------------------------------------------------- the GPU handoff
 
-    def slot_mapping(self, sequence: Sequence, num_tokens: int) -> torch.Tensor:
-        """Where this iteration's `num_tokens` tokens are written, as int32 slots.
+    def slots(self, sequence: Sequence, num_tokens: int) -> list[int]:
+        """Where this iteration's `num_tokens` tokens are written, as integers.
 
         The last `num_tokens` positions of the sequence, because `allocate` has
         already been called for them: occupancy runs ahead of computation by exactly
@@ -234,7 +234,25 @@ class BlockManager:
                 f"sequence {sequence.seq_id} holds {table.num_tokens} tokens; "
                 f"cannot map {num_tokens}"
             )
-        return table.slot_mapping(range(start, table.num_tokens), device=self.kv.device)
+
+        slots = table.slots(range(start, table.num_tokens))
+        # Bounded here, while they are still integers. `PagedKvPool.write` used to do it
+        # and it cost a device read per layer per iteration; the arithmetic that produces
+        # a slot is the same either way, so the only question is whether it is checked on
+        # the host or on the critical path.
+        for slot in slots:
+            if not 0 <= slot < self.kv.num_slots:
+                raise ValueError(
+                    f"sequence {sequence.seq_id} maps to slot {slot}, outside a pool of "
+                    f"{self.kv.num_slots}"
+                )
+        return slots
+
+    def slot_mapping(self, sequence: Sequence, num_tokens: int) -> torch.Tensor:
+        """`slots`, as the int32 tensor the pool's write path scatters through."""
+        return torch.tensor(
+            self.slots(sequence, num_tokens), dtype=torch.int32, device=self.kv.device
+        )
 
     def check_no_leaks(self) -> None:
         """Assert every block is back in the pool. For the end of a test or a run."""

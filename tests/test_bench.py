@@ -18,18 +18,23 @@ from conftest import (
 )
 
 from mini_vllm.bench import (
+    THROUGHPUT_LENGTHS,
     BandwidthResult,
     ClockSampler,
     GpuState,
     SingleResult,
+    ThroughputResult,
     build_input_ids,
     copy_ceiling,
     gpu_state,
     kernel_cases,
     measure_bandwidth,
+    measure_engine,
+    measure_hf_throughput,
     measure_ours,
     rows_exceeding_l2,
     theoretical_bandwidth,
+    throughput_prompts,
 )
 from mini_vllm.model.qwen3_cached import Qwen3Cached
 
@@ -339,3 +344,80 @@ def test_measure_bandwidth_times_a_real_kernel(device):
 
     assert result.seconds > 0
     assert result.gigabytes_per_second > 0
+
+
+# ---------------------------------------------------------------- throughput
+
+
+def test_throughput_arithmetic():
+    """The reported rate counts *output* tokens, which is what an SLO is about."""
+    result = ThroughputResult("x", num_requests=8, prompt_tokens=800, generated_tokens=512, seconds=2.0)
+
+    assert result.tokens_per_second == pytest.approx(256.0)
+    assert result.requests_per_second == pytest.approx(4.0)
+    assert "out tok/s" in result.describe()
+
+
+def test_a_zero_length_run_does_not_divide_by_zero():
+    assert ThroughputResult("x", 0, 0, 0, 0.0).tokens_per_second == 0.0
+
+
+@pytest.mark.oracle
+def test_the_prompt_set_is_deliberately_ragged():
+    """Equal-length prompts are the one case where padding is free.
+
+    A throughput benchmark built on them would hide most of what continuous batching
+    and paging buy, so the lengths cycle and this pins that they really do.
+    """
+    from transformers import AutoTokenizer
+
+    from mini_vllm.model.loader import resolve_model_path
+
+    tokenizer = AutoTokenizer.from_pretrained(resolve_model_path())
+    prompts = throughput_prompts(tokenizer, 8)
+    lengths = [len(tokenizer(prompt).input_ids) for prompt in prompts]
+
+    assert len(prompts) == 8
+    assert max(lengths) >= 8 * min(lengths), f"lengths {lengths} are not ragged enough to matter"
+    for length, wanted in zip(lengths, THROUGHPUT_LENGTHS, strict=False):
+        # Detokenizing and retokenizing is not the identity, so this is approximate on
+        # purpose — what matters is the spread, not the exact figure.
+        assert abs(length - wanted) <= wanted // 8 + 2
+
+
+@pytest.mark.oracle
+def test_the_engine_beats_transformers_on_a_batch():
+    """The Step 5.1 claim, run small: a batch of 8 is faster through the engine.
+
+    Eight requests rather than the README's thirty-two, and eight output tokens rather
+    than sixty-four, because this is a regression test and not the benchmark. It checks
+    the harness measures both sides on the same work and that the engine is ahead — a
+    build where it is *behind* on a ragged batch has lost the point of Phase 4.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from mini_vllm import LLM
+    from mini_vllm.model.loader import resolve_model_path
+
+    path = resolve_model_path()
+    if not (path / "model.safetensors").is_file() or not torch.cuda.is_available():
+        pytest.skip("needs the real weights on a GPU")
+
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    prompts = throughput_prompts(tokenizer, 8)
+
+    theirs = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to("cuda").eval()
+    try:
+        llm = LLM(num_blocks=1024, max_sequences=8)
+        ours = measure_engine(llm, prompts, output_len=8, warmup=1)
+        baseline = measure_hf_throughput(theirs, tokenizer, prompts, output_len=8, warmup=1)
+    finally:
+        del theirs
+        torch.cuda.empty_cache()
+
+    assert ours.generated_tokens == baseline.generated_tokens == 8 * 8, (
+        "the two sides must be credited with the same work"
+    )
+    assert ours.tokens_per_second > baseline.tokens_per_second, (
+        f"{ours.describe()}\n{baseline.describe()}"
+    )
