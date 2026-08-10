@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import torch
 
-from mini_vllm.attention import causal_mask
 from mini_vllm.basics import linear
 from mini_vllm.embedding import Embedding
 from mini_vllm.kernels import ops
@@ -82,16 +81,19 @@ class Qwen3CachedAttention:
         k = ops.rope(k, positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda)
 
         # B x L x H x D -> B x H x L x D, which is also the cache's layout.
-        keys, values, offset = cache.update_and_fetch(k.transpose(1, 2), v.transpose(1, 2))
-        source_len = offset + length
+        keys, values, _offset = cache.update_and_fetch(k.transpose(1, 2), v.transpose(1, 2))
 
         # A single decode token may attend to everything cached, so its mask is
         # all-zeros and worth skipping entirely — that is the common case by far.
-        mask = None if length == 1 else causal_mask(length, source_len, x.dtype, x.device)
+        #
+        # For prefill, the shorthand rather than the tensor: the mask is a pure
+        # function of `(L, S)`, both of which the callee already knows, and naming
+        # it lets the Step 3.5 kernel apply it as an index comparison instead of
+        # reading back an `L x S` tensor. The oracle builds exactly the same tensor
+        # from the same shorthand, so nothing about the reference path changes.
+        mask = None if length == 1 else "causal"
 
-        attended = ops.attention(
-            q.transpose(1, 2), keys, values, mask=mask, use_cuda=use_cuda
-        )
+        attended = ops.attention(q.transpose(1, 2), keys, values, mask=mask, use_cuda=use_cuda)
 
         merged = attended.transpose(1, 2).reshape(batch, length, config.q_projection_size)
         return linear(merged, self.wo)

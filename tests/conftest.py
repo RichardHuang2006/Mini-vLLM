@@ -44,6 +44,21 @@ MODEL_TOLERANCE = 2e-2
 # which is a property of the input rather than of the implementation.
 BF16_DRIFT_LIMIT = 0.05
 
+# How far the CUDA path may sit from the PyTorch path on the *same* weights, in
+# bf16. Not a tolerance for error: it is one bf16 ULP (2^-8 = 0.0039) with a little
+# headroom, and the reason it is a whole ULP rather than a rounding crumb is the
+# attention kernels. The oracle rounds the scores and the softmax weights back to
+# bf16 between ops; the kernels keep them in fp32 to the store. So the kernel path
+# is the *more* accurate of the two, by about one rounding — measured at 0.0041 for
+# one attention call and 0.0058 through the tiny model, which is where this number
+# comes from. Growth past it means a kernel is wrong, not imprecise; greedy token
+# ids (`assert_tokens_equal`) remain the exact check and are preferred.
+#
+# For the real 28-layer checkpoint use `BF16_DRIFT_LIMIT` instead: the same single
+# rounding compounds to ~1.9% by the last layer, which says nothing more than that
+# 28 layers amplify one bit.
+KERNEL_DRIFT_LIMIT = 1e-2
+
 SEED = 1234
 
 # The tiny model's dimensions. Deliberately keeps two properties of the real

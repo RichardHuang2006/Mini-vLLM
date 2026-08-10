@@ -16,6 +16,10 @@ torch::Tensor decode_attention(const torch::Tensor& q,
                                const torch::Tensor& k,
                                const torch::Tensor& v,
                                double scale);
+torch::Tensor flash_prefill(const torch::Tensor& q,
+                            const torch::Tensor& k,
+                            const torch::Tensor& v,
+                            double scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -51,6 +55,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode_attention",
         &decode_attention,
         "grouped attention for a single query token, via online softmax (Step 3.4)",
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("scale"));
+
+  m.def("flash_prefill",
+        &flash_prefill,
+        "tiled causal grouped attention for many query tokens (Step 3.5)",
         py::arg("q"),
         py::arg("k"),
         py::arg("v"),

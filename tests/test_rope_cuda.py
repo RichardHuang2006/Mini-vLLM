@@ -18,6 +18,7 @@ from __future__ import annotations
 import pytest
 import torch
 from conftest import (
+    KERNEL_DRIFT_LIMIT,
     TINY_QWEN3_DIMS,
     assert_allclose,
     assert_relative_error_below,
@@ -374,7 +375,7 @@ def test_model_logits_are_unchanged_in_bf16(tiny_pair):
     assert_relative_error_below(
         cuda_path(ids, cuda_path.create_kv_cache()),
         torch_path(ids, torch_path.create_kv_cache()),
-        limit=1e-3,
+        limit=KERNEL_DRIFT_LIMIT,
     )
 
 

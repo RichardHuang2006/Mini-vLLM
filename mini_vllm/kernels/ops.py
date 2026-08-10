@@ -42,13 +42,35 @@ __all__ = [
 
 # Which ops have a hand-written kernel, and which step introduces it. Flipped to
 # True by the Phase 3 step named beside it, one at a time.
+#
+# The keys are the names the extension exports, not prettier synonyms for them:
+# `test_every_claimed_kernel_is_callable` looks each one up in the compiled module,
+# so a kernel cannot be claimed here and be missing, misspelled, or renamed.
 CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "rmsnorm": (True, "Step 3.1"),
     "rope": (True, "Step 3.2"),
     "swiglu": (True, "Step 3.3"),
     "decode_attention": (True, "Step 3.4"),
-    "prefill_attention": (False, "Step 3.5"),
+    "flash_prefill": (True, "Step 3.5"),
 }
+
+# Kernels that are correct, tested, and deliberately *not* the default, with the
+# reason the benchmark gives. A kernel earns the dispatch by being faster; shipping
+# one that is not would be a regression dressed up as progress, and hiding that
+# behind `use_cuda=True` is exactly what `dispatch_report` exists to prevent.
+#
+# Prefill is here because its inner loop is scalar FMA against cuBLAS on tensor
+# cores, and no amount of tuning closes that gap — Step 3.6 replaces the loop with
+# `mma.sync` and is what flips this entry. Everything that tests the kernel calls it
+# directly through the extension, so nothing about its coverage depends on routing.
+NOT_YET_FASTER: dict[str, str] = {
+    "flash_prefill": "0.4x cuBLAS at L=512 until Step 3.6",
+}
+
+# The prefill kernel stages a query, key and value tile in shared memory at once,
+# which bounds the head dimension it can serve. Qwen3-0.6B uses 128; anything
+# wider goes to the oracle rather than to a kernel that would refuse it.
+MAX_KERNEL_HEAD_DIM = 192
 
 
 def _use_kernel(name: str, use_cuda: bool, x: torch.Tensor) -> bool:
@@ -58,7 +80,7 @@ def _use_kernel(name: str, use_cuda: bool, x: torch.Tensor) -> bool:
     same model object is used for CPU tests and GPU serving.
     """
     implemented, _step = CUDA_KERNELS[name]
-    return use_cuda and implemented and x.is_cuda
+    return use_cuda and implemented and name not in NOT_YET_FASTER and x.is_cuda
 
 
 def cuda_kernel_names() -> list[str]:
@@ -70,12 +92,16 @@ def dispatch_report(use_cuda: bool) -> str:
     """One line per op saying which implementation a run would use."""
     lines = []
     for name, (implemented, step) in CUDA_KERNELS.items():
-        if implemented and use_cuda:
-            lines.append(f"  {name:<18} cuda    (kernel from {step})")
-        elif implemented:
-            lines.append(f"  {name:<18} torch   (kernel exists from {step}; use_cuda is off)")
+        if not implemented:
+            note = f"no kernel yet — {step}"
+        elif name in NOT_YET_FASTER:
+            note = f"kernel from {step} is slower: {NOT_YET_FASTER[name]}"
+        elif not use_cuda:
+            note = f"kernel exists from {step}; use_cuda is off"
         else:
-            lines.append(f"  {name:<18} torch   (no kernel yet — {step})")
+            lines.append(f"  {name:<18} cuda    (kernel from {step})")
+            continue
+        lines.append(f"  {name:<18} torch   ({note})")
     return "\n".join(lines)
 
 
@@ -152,12 +178,13 @@ def attention(
     the routing lives here so the model does not have to care.
     """
     is_decode = q.shape[-2] == 1
-    name = "decode_attention" if is_decode else "prefill_attention"
+    name = "decode_attention" if is_decode else "flash_prefill"
 
     if _use_kernel(name, use_cuda, q) and _kernel_can_attend(q, k, v, mask, is_decode):
         scale = 1.0 / math.sqrt(q.shape[-1])
         if is_decode:
             return load_extension().decode_attention(q, k, v, scale)
+        return load_extension().flash_prefill(q, k, v, scale)
 
     return reference_attention.scaled_dot_product_attention_grouped(q, k, v, mask=mask)
 
@@ -171,17 +198,24 @@ def _kernel_can_attend(
 ) -> bool:
     """Whether the attention kernels can serve this exact call.
 
-    Both kernels bake in the causal structure rather than reading a mask tensor —
-    decode attends to the whole cache, prefill masks arithmetically against the
-    diagonal — so an explicit mask is the one thing they cannot honour. Falling
-    back is right; silently ignoring it would not be.
+    Both kernels bake the causal structure into arithmetic rather than reading a
+    mask tensor — decode attends to the whole cache, prefill compares each index
+    against the diagonal — so `mask="causal"` is the only mask they can honour. An
+    explicit tensor could say anything, and falling back to the oracle is the
+    honest response to it; silently ignoring it would not be.
     """
-    # A single query token may attend to every cached position, so the causal
-    # shorthand is not a restriction on it and the kernel's unmasked pass is
-    # already correct. An explicit tensor could say anything, so it is not.
     is_causal_shorthand = isinstance(mask, str) and mask == "causal"
-    if mask is not None and not (is_decode and is_causal_shorthand):
+    if is_decode:
+        # A single query token may attend to every position cached before it, so
+        # the causal mask forbids it nothing and `None` asks for the same thing.
+        if mask is not None and not is_causal_shorthand:
+            return False
+    elif not is_causal_shorthand:
+        # Prefill is the other way round: the kernel *always* masks causally, so
+        # an unmasked multi-token call is one it cannot serve either.
         return False
     if q.dim() != 4 or q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float64:
+        return False
+    if q.shape[-1] > MAX_KERNEL_HEAD_DIM or k.shape[-2] < q.shape[-2]:
         return False
     return k.shape[-2] > 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
