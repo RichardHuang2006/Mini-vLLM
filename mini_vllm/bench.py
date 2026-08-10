@@ -565,6 +565,26 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 )
             )
 
+    if "flash_prefill" in implemented:
+        # Prefill is the one compute-bound case in this table, so its GB/s column
+        # is close to meaningless and the speedup column is the whole point: the
+        # oracle materializes an L x S score matrix that this kernel never writes.
+        query_heads, kv_heads, head_dim = 16, 8, 128
+        scale = 1.0 / math.sqrt(head_dim)
+        for query_len in (128, 512, 2048):
+            q = torch.randn(1, query_heads, query_len, head_dim, device="cuda", dtype=dtype)
+            k = torch.randn(1, kv_heads, query_len, head_dim, device="cuda", dtype=dtype)
+            v = torch.randn_like(k)
+            moved = (q.numel() + k.numel() + v.numel()) * q.element_size()
+            cases.append(
+                KernelCase(
+                    label=f"flash_prefill L=S={query_len}",
+                    kernel=lambda q=q, k=k, v=v: module.flash_prefill(q, k, v, scale),
+                    reference=lambda q=q, k=k, v=v: ops.attention(q, k, v, mask="causal"),
+                    bytes_moved=moved,
+                )
+            )
+
     return cases
 
 

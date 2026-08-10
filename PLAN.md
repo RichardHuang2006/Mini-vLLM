@@ -985,6 +985,44 @@ pytest tests/test_flash_prefill_cuda.py -v -m cuda
 > **Learn:** skipping the above-diagonal tiles is a real speedup and a classic off-by-one trap. Test a prompt length
 > that is one token past a tile boundary — that is where the diagonal-tile masking either works or does not.
 
+**What it measured** (Step 3.5, now done — and **the kernel is correct and is not the default**). It is **0.4x**
+cuBLAS at L=512. That is not a bug to be found, it is the arithmetic:
+
+| L = S | kernel   | the oracle it replaces | ratio |
+| ----- | -------- | ---------------------- | ----- |
+| 128   | 155 µs   | 280 µs                 | 1.8x  |
+| 512   | 1319 µs  | 566 µs                 | 0.4x  |
+| 2048  | 19.1 ms  | 13.4 ms                | 0.7x  |
+
+Prefill is the only **compute-bound** kernel in the project, and a scalar inner loop cannot win a matrix multiply
+against cuBLAS on tensor cores. Counting shared-memory transactions says exactly how far off it is: one thread owning
+one `(query, key)` dot product issues two shared loads per multiply-add, and an SM can do 128 multiply-adds per cycle
+against roughly one 128-byte shared transaction per cycle. That budget allows **one** load per ~128 FMAs; this kernel
+wants ~11. The measured 1.4 TFLOP/s against ~15 TFLOP/s of scalar peak is that ratio, and it is why the fix is
+[Step 3.6](#step-36--tensor-core-prefill-inner-loop-optional) rather than tuning.
+
+So the dispatch keeps prefill on cuBLAS and says so out loud — `ops.NOT_YET_FASTER` carries the reason, and
+`dispatch_report` prints it beside the op:
+
+```text
+decode_attention   cuda    (kernel from Step 3.4)
+flash_prefill      torch   (kernel from Step 3.5 is slower: 0.4x cuBLAS at L=512 until Step 3.6)
+```
+
+Routing to it instead would have cost 20 ms of TTFT at a 512-token prompt (56 ms against 36 ms) to no end. **A
+correct kernel is not automatically an improvement, and `use_cuda=True` must not be able to quietly mean "slower".**
+The kernel keeps its full differential test suite — every test calls the extension directly — plus a
+`prefill_preferred` fixture that flips the routing so the end-to-end token-identity tests cover the path Step 3.6 will
+turn on.
+
+> **Learn:** the two things worth taking from writing it anyway. First, `S > L` is a *different* kernel from `S == L`
+> and the plan's tile-boundary tests do not catch the difference: with a prefix already cached the diagonal shifts
+> right by `S - L`, which is chunked prefill's shape in [Step 4.4](#step-44--chunked-prefill-and-piggyback) and the
+> paged shape in [Step 4.8](#step-48--paged-attention-kernels). Second, `head_dim` is a *runtime* value, so
+> `index / head_dim` compiles to a real integer division of ~20 instructions; leaving one in an inner loop whose body
+> is a single multiply-add made the kernel 2x slower, and hoisting the index arithmetic out of the tile loop got it
+> back. Neither of those is visible from the algorithm.
+
 #### Step 3.6 — Tensor-core prefill inner loop (optional)
 
 **Write** `csrc/flash_prefill.cu` (extend) · **Test** `tests/test_flash_prefill_cuda.py`
@@ -1000,6 +1038,19 @@ engine is complete and correct; everything after Phase 3 depends only on Step 3.
 ```bash
 pytest tests/test_flash_prefill_cuda.py -v -m cuda -k tensor_core
 ```
+
+**Status: deliberately not done**, and [Step 3.5](#step-35--flash-prefill)'s measurements are the reason it is worth
+being explicit about rather than silent. Prefill currently runs on cuBLAS, which *is* tensor cores — just someone
+else's. Writing `mma.sync` by hand would replace a fast path with a slower one until it was tuned, while the actual
+milestone ([Step 4.9](#step-49--engine-api), the serving engine) was still unwritten. The honest ordering is: finish
+the engine, then come back and earn the dispatch entry.
+
+What it would take, recorded while the shapes are fresh: `mma.sync.m16n8k16` needs BF16 operands in a specific
+per-lane fragment layout, which is a different shared-memory layout from the one Step 3.5 chose for bank behaviour
+(`k_shared[d][j]`, padded), and both `QKᵀ` and `P·V` need it — the second with `P` coming out of the softmax in
+registers rather than from shared. The differential tests already written are the whole safety net for that work, and
+they pass through `ops.NOT_YET_FASTER`, so the finish line is unambiguous: delete one dictionary entry and the
+existing end-to-end token-identity tests either hold or they do not.
 
 ---
 
