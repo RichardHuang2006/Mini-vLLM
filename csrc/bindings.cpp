@@ -12,6 +12,10 @@ torch::Tensor rope(const torch::Tensor& x,
                    const torch::Tensor& cos,
                    const torch::Tensor& sin);
 torch::Tensor swiglu(const torch::Tensor& gate, const torch::Tensor& up);
+torch::Tensor decode_attention(const torch::Tensor& q,
+                               const torch::Tensor& k,
+                               const torch::Tensor& v,
+                               double scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -43,4 +47,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "silu(gate) * up, the elementwise half of the MLP (Step 3.3)",
         py::arg("gate"),
         py::arg("up"));
+
+  m.def("decode_attention",
+        &decode_attention,
+        "grouped attention for a single query token, via online softmax (Step 3.4)",
+        py::arg("q"),
+        py::arg("k"),
+        py::arg("v"),
+        py::arg("scale"));
 }

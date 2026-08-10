@@ -20,6 +20,8 @@ says out loud which path each op would take, and the benchmark prints it.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from mini_vllm import attention as reference_attention
@@ -44,7 +46,7 @@ CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "rmsnorm": (True, "Step 3.1"),
     "rope": (True, "Step 3.2"),
     "swiglu": (True, "Step 3.3"),
-    "decode_attention": (False, "Step 3.4"),
+    "decode_attention": (True, "Step 3.4"),
     "prefill_attention": (False, "Step 3.5"),
 }
 
@@ -152,7 +154,34 @@ def attention(
     is_decode = q.shape[-2] == 1
     name = "decode_attention" if is_decode else "prefill_attention"
 
-    if _use_kernel(name, use_cuda, q):
-        raise NotImplementedError(f"{name} kernel is marked available but not wired up")
+    if _use_kernel(name, use_cuda, q) and _kernel_can_attend(q, k, v, mask, is_decode):
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        if is_decode:
+            return load_extension().decode_attention(q, k, v, scale)
 
     return reference_attention.scaled_dot_product_attention_grouped(q, k, v, mask=mask)
+
+
+def _kernel_can_attend(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor | str | None,
+    is_decode: bool,
+) -> bool:
+    """Whether the attention kernels can serve this exact call.
+
+    Both kernels bake in the causal structure rather than reading a mask tensor —
+    decode attends to the whole cache, prefill masks arithmetically against the
+    diagonal — so an explicit mask is the one thing they cannot honour. Falling
+    back is right; silently ignoring it would not be.
+    """
+    # A single query token may attend to every cached position, so the causal
+    # shorthand is not a restriction on it and the kernel's unmasked pass is
+    # already correct. An explicit tensor could say anything, so it is not.
+    is_causal_shorthand = isinstance(mask, str) and mask == "causal"
+    if mask is not None and not (is_decode and is_causal_shorthand):
+        return False
+    if q.dim() != 4 or q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float64:
+        return False
+    return k.shape[-2] > 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
