@@ -85,6 +85,9 @@ class Sequence:
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     max_tokens: int = 16
     eos_token_id: int | None = None
+    # Qwen3 ends a turn with either `<|im_end|>` or `<|endoftext|>`, so one id is not
+    # enough: honouring only `tokenizer.eos_token_id` generates past the end of a turn.
+    stop_token_ids: tuple[int, ...] = ()
     seq_id: int = field(default_factory=lambda: next(_next_seq_id))
 
     output_token_ids: list[int] = field(default_factory=list)
@@ -139,10 +142,23 @@ class Sequence:
         return self.num_computed_tokens < self.num_prompt_tokens
 
     def is_done(self) -> bool:
-        """EOS emitted, or the output length reached."""
+        """A stop token emitted, or the output length reached."""
         if self.num_output_tokens >= self.max_tokens:
             return True
-        return self.eos_token_id is not None and self.output_token_ids[-1:] == [self.eos_token_id]
+        return bool(self.output_token_ids) and self.output_token_ids[-1] in self.stop_ids
+
+    @property
+    def stop_ids(self) -> frozenset[int]:
+        """Every token that ends this sequence."""
+        extra = () if self.eos_token_id is None else (self.eos_token_id,)
+        return frozenset(self.stop_token_ids + extra)
+
+    @property
+    def finish_reason(self) -> str | None:
+        """Why generation stopped: `"stop"`, `"length"`, or None if it has not."""
+        if self.output_token_ids and self.output_token_ids[-1] in self.stop_ids:
+            return "stop"
+        return "length" if self.num_output_tokens >= self.max_tokens else None
 
     # ------------------------------------------------------------------ mutation
 
@@ -186,10 +202,19 @@ class Sequence:
         blocks go back to the pool and the sequence starts its prefill again, over
         prompt *and* output this time. It costs the compute already spent, and it
         keeps the engine free of a swap path — the trade [Step 4.3] makes explicit.
+
+        Dropping the table is *not* the same as releasing the blocks, and this refuses
+        to do the first without the second. Forgetting the pointer to pages the pool
+        still believes are held is a leak that shows up much later, as an engine that
+        runs a few hundred requests and then cannot admit anything.
         """
+        if self.block_table is not None:
+            raise ValueError(
+                f"sequence {self.seq_id} still holds {self.block_table.num_blocks} blocks; "
+                "free them through the block manager before resetting it"
+            )
         self.set_status(SequenceStatus.PREEMPTED)
         self.num_computed_tokens = 0
-        self.block_table = None
 
     def __repr__(self) -> str:
         return (

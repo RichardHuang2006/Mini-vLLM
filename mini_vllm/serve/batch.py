@@ -161,7 +161,35 @@ class ForwardBatch:
             if empty:
                 raise ValueError(f"sequences {empty} attend over cached tokens with no blocks")
 
+        # Computed once, here, because every layer of the model needs them and each is
+        # a reduction over a device tensor: 28 layers asking `seq_lens.max()` on the
+        # critical path is 28 synchronizations to learn a number the scheduler knew in
+        # Python before the tensors existed.
+        object.__setattr__(self, "_max_query_len", int(self.seq_lens.max()))
+        object.__setattr__(self, "_max_context_len", int(self.context_lens.max()))
+        object.__setattr__(self, "_last_row_indices", self.cu_seqlens_q[1:].to(torch.int64) - 1)
+
     # ---------------------------------------------------------------- properties
+
+    @property
+    def max_query_len(self) -> int:
+        """The longest `L` in the batch. Sizes the prefill kernel's grid."""
+        return self._max_query_len  # type: ignore[attr-defined]
+
+    @property
+    def max_context_len(self) -> int:
+        """The longest `S` in the batch. Decides the decode kernel's split count."""
+        return self._max_context_len  # type: ignore[attr-defined]
+
+    @property
+    def last_row_indices(self) -> torch.Tensor:
+        """Row of each sequence's last computed token, in the flattened token axis.
+
+        Where the LM head is applied, and where a sampled token comes from. For a
+        decode step it is the sequence's only row; for a prefill chunk, the end of the
+        chunk — which is why a mid-prompt chunk's logits are computed and discarded.
+        """
+        return self._last_row_indices  # type: ignore[attr-defined]
 
     @property
     def num_sequences(self) -> int:

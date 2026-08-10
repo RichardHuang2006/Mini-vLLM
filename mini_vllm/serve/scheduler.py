@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mini_vllm.block.block_pool import OutOfBlocks
 from mini_vllm.kv_cache import KvCache
 from mini_vllm.sampler import sample
 from mini_vllm.serve.batch import ForwardBatch
@@ -130,8 +131,17 @@ class Scheduler:
     iteration, preemption — testable in milliseconds.
     """
 
-    def __init__(self, config: SchedulerConfig | None = None) -> None:
+    def __init__(self, config: SchedulerConfig | None = None, manager=None) -> None:
+        """`manager` is a `BlockManager`, or None for a scheduler with no memory limit.
+
+        Optional because the interesting scheduling questions — fairness, chunking,
+        the budget — are answerable without a pool, and a test that has to build one
+        to ask them is a test that needs a GPU to ask them. With a manager, the same
+        policy runs under a second constraint: a decode step needs a slot, and a slot
+        can be unavailable ([§7.4](./DESIGN.md#74-admission-control)).
+        """
         self.config = config or SchedulerConfig()
+        self.manager = manager
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self.finished: list[Sequence] = []
@@ -181,9 +191,23 @@ class Scheduler:
         prefill while `max_sequences` sequences are decoding, each of which is
         finishing at one token per iteration; and when nothing is running the budget
         is untouched, so the chunk is never zero-sized and the queue cannot deadlock.
+
+        With a block manager attached there is a second budget, and it behaves
+        differently from the token one: running out of *tokens* postpones a sequence,
+        running out of *blocks* means somebody has to give theirs back. A decode that
+        cannot get its next slot preempts the newest running sequence and tries again,
+        which keeps the oldest requests — the ones a caller has been waiting on
+        longest — making progress under pressure.
         """
         output = SchedulerOutput()
         budget = self.config.max_batched_tokens
+
+        # Blocks this iteration has already promised, per sequence. The pages are not
+        # taken until the runner reserves them, so without this every sequence in the
+        # pass would be checked against the same free count: two sequences needing three
+        # pages each would both be admitted against four free, and the second would fail
+        # inside the forward pass with the first already committed.
+        promised: dict[int, int] = {}
 
         decoding, prefilling = [], []
         for sequence in self.running:
@@ -204,15 +228,21 @@ class Scheduler:
                 # The budget ran out mid-batch. The sequence keeps its cache and its
                 # place; it simply does not advance this iteration.
                 continue
-            output.scheduled.append((sequence, count))
-            budget -= count
+            refund = self._make_room_for(sequence, count, output, promised)
+            if refund is None:
+                continue
+            self._schedule(output, sequence, count, promised)
+            budget += refund - count
 
         for sequence in prefilling:
             count = self._tokens_for(sequence, budget)
             if count == 0:
                 continue
-            output.scheduled.append((sequence, count))
-            budget -= count
+            refund = self._make_room_for(sequence, count, output, promised)
+            if refund is None:
+                continue
+            self._schedule(output, sequence, count, promised)
+            budget += refund - count
 
         while self.waiting and len(self.running) < self.config.max_sequences:
             candidate = self.waiting[0]
@@ -227,13 +257,77 @@ class Scheduler:
                 # exists to remove, kept reachable so the tests can show it.
                 count = candidate.num_uncomputed_tokens
 
+            # Admission is where memory pressure is *declined* rather than resolved:
+            # a request that has not started yet holds nothing and costs nothing to
+            # leave in the queue, so preempting a running sequence to make room for it
+            # would be trading finished work for none.
+            if not self._fits(candidate, count, promised):
+                break
+
             self.waiting.popleft()
             candidate.set_status(SequenceStatus.RUNNING)
             self.running.append(candidate)
-            output.scheduled.append((candidate, count))
+            self._schedule(output, candidate, count, promised)
             budget -= count
 
+        if not output.scheduled and self.has_work and self.manager is not None:
+            # Every other empty iteration is impossible: the token budget is at least 1
+            # and both queues are non-empty, so something would have been scheduled.
+            # This one means the pool cannot back a single sequence of this length, and
+            # returning an empty batch would leave the engine spinning on it forever.
+            raise OutOfBlocks(
+                f"nothing can run: {len(self.running)} running and {len(self.waiting)} waiting "
+                f"sequences with {self.manager.num_free_blocks} of "
+                f"{self.manager.num_blocks} blocks free. The pool is too small for even one "
+                "sequence at this length — raise num_blocks or shorten the request."
+            )
         return output
+
+    # ------------------------------------------------------------ memory pressure
+
+    def _schedule(
+        self, output: SchedulerOutput, sequence: Sequence, count: int, promised: dict[int, int]
+    ) -> None:
+        """Put a sequence in the batch and record the pages it will take."""
+        output.scheduled.append((sequence, count))
+        if self.manager is not None:
+            promised[sequence.seq_id] = self.manager.blocks_needed(sequence, count)
+
+    def _fits(self, sequence: Sequence, count: int, promised: dict[int, int]) -> bool:
+        """Whether the pool can back `count` more tokens of this sequence.
+
+        Against the free count *minus* this iteration's outstanding promises, which is
+        the number the runner will actually meet when it reserves them.
+        """
+        if self.manager is None:
+            return True
+        available = self.manager.num_free_blocks - sum(promised.values())
+        return self.manager.blocks_needed(sequence, count) <= available
+
+    def _make_room_for(
+        self, sequence: Sequence, count: int, output: SchedulerOutput, promised: dict[int, int]
+    ) -> int | None:
+        """Preempt until `count` tokens of `sequence` fit, or give up on it.
+
+        Victims come from the back of the running list — the most recently admitted —
+        and each gives back every block it holds. Returns the token budget freed by
+        un-scheduling them, or None when the only sequence left to preempt is this one:
+        that means the pool cannot hold a single sequence of this length, and the
+        caller turns it into an error rather than looping on it.
+        """
+        refund = 0
+        while not self._fits(sequence, count, promised):
+            victim = next((s for s in reversed(self.running) if s is not sequence), None)
+            if victim is None:
+                return None
+            # A victim already scheduled this iteration has to come back out: it is
+            # about to lose the blocks the forward pass would have written into.
+            refund += output.tokens_for(victim)
+            promised.pop(victim.seq_id, None)
+            output.scheduled = [pair for pair in output.scheduled if pair[0] is not victim]
+            self.preempt(victim)
+            output.preempted.append(victim)
+        return refund
 
     def _tokens_for(self, sequence: Sequence, budget: int) -> int:
         """How many of this sequence's tokens fit in what is left of the budget.
@@ -292,10 +386,18 @@ class Scheduler:
         and the sequence re-prefills over its prompt *and* its output so far. It
         costs the compute already spent on it, and it keeps the engine free of a
         swap path — see [Step 4.1]'s `reset_for_recompute`.
+
+        Back to the *front* of the waiting queue, not the back. It has been served
+        before and its caller has already seen output; sending it behind requests that
+        have never run would make preemption a demotion, and under sustained pressure a
+        sequence could be preempted, requeued, and preempted again without ever
+        finishing.
         """
         if sequence not in self.running:
             raise ValueError(f"sequence {sequence.seq_id} is not running")
         self.running.remove(sequence)
+        if self.manager is not None:
+            self.manager.free(sequence)
         sequence.reset_for_recompute()
         self.waiting.appendleft(sequence)
 
