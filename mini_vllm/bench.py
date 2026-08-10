@@ -28,11 +28,20 @@ RMSNorm, RoPE and SwiGLU: they do a few flops per element, so their ceiling is h
 fast the card can move the bytes, and "80% of peak bandwidth" says something a
 millisecond figure does not.
 
+`--mode throughput` (Step 5.1) measures the engine rather than a single request, and it
+is the mode the README quotes. The unit is **output tokens per second over a whole
+request set**, submitted at once, against `transformers.generate` on the same set. That
+comparison is not quite apples to apples and the asymmetry is the finding: `generate`
+takes one padded rectangle, so sixteen prompts of 32 to 512 tokens all run for 512, while
+the engine gives each sequence its own length and admits a replacement the iteration a
+request finishes. Continuous batching and paging are what that gap is made of.
+
 Run it::
 
     python -m mini_vllm.bench --mode single --input-len 128 --output-len 128 --warmup 2
     python -m mini_vllm.bench --mode single --compare hf
     python -m mini_vllm.bench --mode kernels
+    python -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16 --compare hf
 """
 
 from __future__ import annotations
@@ -58,14 +67,18 @@ __all__ = [
     "GpuState",
     "KernelCase",
     "SingleResult",
+    "ThroughputResult",
     "build_input_ids",
     "copy_ceiling",
     "gpu_state",
     "kernel_cases",
     "measure_bandwidth",
+    "measure_engine",
     "measure_hf",
+    "measure_hf_throughput",
     "measure_ours",
     "theoretical_bandwidth",
+    "throughput_prompts",
 ]
 
 # Repeated to fill any requested prompt length. Real text rather than random ids:
@@ -670,6 +683,211 @@ def run_kernels(
     return ceiling, comparisons, sampler.peak
 
 
+# ------------------------------------------------------------------ throughput
+
+# The prompt lengths a throughput run cycles through. Varied on purpose: equal-length
+# prompts are the one case where padding costs nothing, so a benchmark that used them
+# would hide most of what continuous batching and paging buy. A 16x spread between the
+# shortest and the longest is ordinary for a chat workload.
+THROUGHPUT_LENGTHS = (32, 64, 128, 256, 512)
+
+
+@dataclass(frozen=True)
+class ThroughputResult:
+    """One implementation's rate over a whole request set."""
+
+    label: str
+    num_requests: int
+    prompt_tokens: int
+    generated_tokens: int
+    seconds: float
+
+    @property
+    def tokens_per_second(self) -> float:
+        """*Output* tokens per second — the number a serving SLO is written against."""
+        return self.generated_tokens / self.seconds if self.seconds else 0.0
+
+    @property
+    def requests_per_second(self) -> float:
+        return self.num_requests / self.seconds if self.seconds else 0.0
+
+    def describe(self) -> str:
+        return (
+            f"{self.label:<24} {self.seconds:6.2f} s   "
+            f"{self.tokens_per_second:8.1f} out tok/s   "
+            f"{self.requests_per_second:6.2f} req/s"
+        )
+
+
+def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
+    """`num_requests` prompts whose lengths cycle through `THROUGHPUT_LENGTHS`."""
+    lengths = [THROUGHPUT_LENGTHS[i % len(THROUGHPUT_LENGTHS)] for i in range(num_requests)]
+    prompts = []
+    for length in lengths:
+        repeats = -(-length // max(len(tokenizer(FILLER).input_ids), 1))
+        ids = tokenizer(FILLER * repeats).input_ids[:length]
+        prompts.append(tokenizer.decode(ids))
+    return prompts
+
+
+def measure_engine(llm, prompts: list[str], output_len: int, warmup: int = 1) -> ThroughputResult:
+    """Time the engine over the whole request set, submitted all at once.
+
+    All at once because that is the workload continuous batching is for: the engine
+    decides what shares each iteration, admits a replacement the moment a request
+    finishes, and never waits for the longest member of a fixed batch.
+
+    `ignore_eos` fixes the token count. Without it a run where three requests stop at
+    token 9 is being credited with less work than the baseline does, and the comparison
+    stops being one.
+    """
+    for _ in range(warmup):
+        llm.generate(prompts[: min(2, len(prompts))], max_tokens=4, ignore_eos=True)
+    torch.cuda.synchronize()
+
+    started = time.perf_counter()
+    completions = llm.generate(prompts, max_tokens=output_len, ignore_eos=True)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+
+    return ThroughputResult(
+        label="mini-vllm",
+        num_requests=len(prompts),
+        prompt_tokens=sum(len(llm.tokenizer(prompt).input_ids) for prompt in prompts),
+        generated_tokens=sum(completion.num_tokens for completion in completions),
+        seconds=elapsed,
+    )
+
+
+def measure_hf_throughput(
+    hf_model, tokenizer, prompts: list[str], output_len: int, warmup: int = 1
+) -> ThroughputResult:
+    """Time `transformers.generate` on the same set, as one padded batch.
+
+    One padded batch is what `generate` offers, and the padding is the baseline's real
+    cost rather than a handicap invented here: sixteen prompts of 32 to 512 tokens
+    become a `16 x 512` rectangle, every row runs for the longest row's length, and the
+    KV cache is allocated for all of it. Reporting it any other way would be measuring a
+    serving engine against something nobody serves with.
+    """
+    encoded = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
+    encoded = {key: value.to(hf_model.device) for key, value in encoded.items()}
+
+    def run(new_tokens: int):
+        return hf_model.generate(
+            **encoded,
+            max_new_tokens=new_tokens,
+            min_new_tokens=new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+
+    with torch.no_grad():
+        for _ in range(warmup):
+            run(4)
+        torch.cuda.synchronize()
+
+        started = time.perf_counter()
+        run(output_len)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+
+    return ThroughputResult(
+        label="transformers",
+        num_requests=len(prompts),
+        prompt_tokens=sum(len(tokenizer(prompt).input_ids) for prompt in prompts),
+        generated_tokens=len(prompts) * output_len,
+        seconds=elapsed,
+    )
+
+
+def run_throughput(arguments) -> tuple[list[tuple[int, ThroughputResult, ThroughputResult | None]], GpuState | None]:
+    """`--mode throughput`: output tokens/sec against `transformers`, per batch size."""
+    from transformers import AutoTokenizer
+
+    from mini_vllm import LLM
+    from mini_vllm.model.loader import resolve_model_path
+
+    path = resolve_model_path(arguments.model)
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    batch_sizes = [int(size) for size in arguments.batch_sizes.split(",")]
+
+    # The baseline is loaded *first* when there is one, because the engine sizes its KV
+    # pool from the memory that is free when it starts. Loading it second would hand it
+    # a budget it then has to give back, and on an 8 GB card that is the difference
+    # between a comparison and an out-of-memory error.
+    hf_model = None
+    if arguments.compare == "hf":
+        from transformers import AutoModelForCausalLM
+
+        print("loading the transformers baseline ...")
+        hf_model = (
+            AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16)
+            .to(arguments.device)
+            .eval()
+        )
+
+    print(f"loading {arguments.model} into the engine ...")
+    llm = LLM(
+        arguments.model,
+        device=arguments.device,
+        max_sequences=max(batch_sizes),
+        max_batched_tokens=arguments.max_batched_tokens,
+        use_cuda_kernels=arguments.use_cuda_kernels,
+        kv_fraction=arguments.kv_fraction,
+    )
+    print(f"  {llm}")
+
+    rows = []
+    with ClockSampler() as sampler:
+        for batch in batch_sizes:
+            prompts = throughput_prompts(tokenizer, batch)
+            print(f"measuring {batch} concurrent requests ...")
+            ours = measure_engine(llm, prompts, arguments.output_len, arguments.warmup)
+            theirs = (
+                measure_hf_throughput(
+                    hf_model, tokenizer, prompts, arguments.output_len, arguments.warmup
+                )
+                if hf_model is not None
+                else None
+            )
+            rows.append((batch, ours, theirs))
+
+    return rows, sampler.peak
+
+
+def report_throughput(arguments) -> None:
+    """Print the batch-size scaling table for `--mode throughput`."""
+    rows, state = run_throughput(arguments)
+
+    print(
+        f"\n{len(THROUGHPUT_LENGTHS)} prompt lengths cycling through {THROUGHPUT_LENGTHS}, "
+        f"{arguments.output_len} output tokens each, eos ignored so the work is fixed."
+    )
+    print("\nops:")
+    print(ops.dispatch_report(arguments.use_cuda_kernels))
+    print()
+
+    for batch, ours, theirs in rows:
+        print(f"batch {batch:>3} ({ours.prompt_tokens} prompt tokens in)")
+        print(f"  {ours.describe()}")
+        if theirs is not None:
+            print(f"  {theirs.describe()}")
+            print(f"  {'':24} {ours.tokens_per_second / theirs.tokens_per_second:.2f}x")
+
+    if len(rows) > 1:
+        first, last = rows[0][1], rows[-1][1]
+        scaling = last.tokens_per_second / first.tokens_per_second
+        print(
+            f"\nfrom batch {rows[0][0]} to {rows[-1][0]}: {scaling:.1f}x the output rate.\n"
+            "Decode is memory-bound on the weights, and every sequence in an iteration "
+            "reads them once between them, so the batch is nearly free until the "
+            "arithmetic runs out."
+        )
+
+    _report_gpu_state(state)
+
+
 def build_input_ids(tokenizer, input_len: int, batch: int, device) -> torch.Tensor:
     """A prompt of exactly ``input_len`` tokens, repeated across the batch."""
     repeats = -(-input_len // max(len(tokenizer(FILLER).input_ids), 1))
@@ -800,10 +1018,13 @@ def report_kernels(arguments) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Mini-vLLM.")
-    parser.add_argument("--mode", default="single", choices=["single", "kernels"])
+    parser.add_argument("--mode", default="single", choices=["single", "kernels", "throughput"])
     parser.add_argument("--input-len", type=int, default=128)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--batch-sizes", default="1,4,16", help="--mode throughput: concurrency to sweep")
+    parser.add_argument("--max-batched-tokens", type=int, default=2048)
+    parser.add_argument("--kv-fraction", type=float, default=0.4)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--model", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
@@ -818,6 +1039,9 @@ def main() -> None:
 
     if arguments.mode == "kernels":
         report_kernels(arguments)
+        return
+    if arguments.mode == "throughput":
+        report_throughput(arguments)
         return
 
     results, state = run_single(arguments)

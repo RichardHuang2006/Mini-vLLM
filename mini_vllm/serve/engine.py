@@ -230,8 +230,15 @@ class LLM:
         prompt: str | SequenceABC[int],
         sampling_params: SamplingParams | None = None,
         max_tokens: int = 16,
+        ignore_eos: bool = False,
     ) -> Sequence:
-        """Tokenize (if needed), wrap in a `Sequence`, and enqueue it."""
+        """Tokenize (if needed), wrap in a `Sequence`, and enqueue it.
+
+        `ignore_eos` is for the benchmarks and nothing else: a request that stops early
+        has done less work than the one it is being compared against, and a throughput
+        figure computed over a run where some requests quit at token 9 and others at 64
+        measures the prompts rather than the engine.
+        """
         if isinstance(prompt, str):
             token_ids = self.tokenizer(prompt).input_ids
         else:
@@ -243,7 +250,7 @@ class LLM:
             prompt_token_ids=list(token_ids),
             sampling_params=sampling_params or SamplingParams(temperature=0.0),
             max_tokens=max_tokens,
-            stop_token_ids=tuple(self.stop_token_ids),
+            stop_token_ids=() if ignore_eos else tuple(self.stop_token_ids),
         )
         self.scheduler.add(sequence)
         self.stats.prompt_tokens += len(token_ids)
@@ -284,6 +291,7 @@ class LLM:
         sampling_params: SamplingParams | SequenceABC[SamplingParams] | None = None,
         max_tokens: int = 16,
         skip_special_tokens: bool = True,
+        ignore_eos: bool = False,
     ) -> Iterator[StreamUpdate]:
         """Yield each token as it is produced, across all prompts, interleaved.
 
@@ -298,7 +306,7 @@ class LLM:
         decoding tokens independently would emit a replacement character forever.
         """
         prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
-        sequences = self._admit(prompt_list, sampling_params, max_tokens)
+        sequences = self._admit(prompt_list, sampling_params, max_tokens, ignore_eos)
         index_of = {sequence.seq_id: index for index, sequence in enumerate(sequences)}
         emitted_chars = [0] * len(sequences)
 
@@ -339,6 +347,7 @@ class LLM:
         sampling_params: SamplingParams | SequenceABC[SamplingParams] | None = None,
         max_tokens: int = 16,
         skip_special_tokens: bool = True,
+        ignore_eos: bool = False,
     ) -> list[Completion]:
         """Run every prompt to completion and return them in the order given.
 
@@ -358,7 +367,7 @@ class LLM:
         ids: list[int] = [-1] * len(prompt_list)
 
         for update in self.generate_stream(
-            prompt_list, sampling_params, max_tokens, skip_special_tokens
+            prompt_list, sampling_params, max_tokens, skip_special_tokens, ignore_eos
         ):
             texts[update.index].append(update.text)
             tokens[update.index].append(update.token_id)
@@ -384,6 +393,7 @@ class LLM:
         prompts: Iterable[str],
         sampling_params: SamplingParams | SequenceABC[SamplingParams] | None,
         max_tokens: int,
+        ignore_eos: bool = False,
     ) -> list[Sequence]:
         prompt_list = list(prompts)
         if sampling_params is None or isinstance(sampling_params, SamplingParams):
@@ -395,7 +405,7 @@ class LLM:
                     f"got {len(params)} sampling params for {len(prompt_list)} prompts"
                 )
         return [
-            self.add_request(prompt, parameter, max_tokens)
+            self.add_request(prompt, parameter, max_tokens, ignore_eos)
             for prompt, parameter in zip(prompt_list, params, strict=True)
         ]
 

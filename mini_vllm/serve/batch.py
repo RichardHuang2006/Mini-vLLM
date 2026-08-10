@@ -43,6 +43,83 @@ __all__ = ["ForwardBatch"]
 PADDING_BLOCK = -1
 
 
+def _check_metadata(
+    num_sequences: int,
+    num_params: int,
+    seq_lens: list[int],
+    context_lens: list[int],
+    offsets: list[int],
+    num_tokens: int,
+    num_positions: int,
+    num_slots: int | None,
+    num_tables: int | None,
+    empty_tables: list[int],
+) -> None:
+    """Check one batch's metadata for consistency, in plain integers.
+
+    Integers rather than tensors, and that is the whole reason this is a function.
+    Every one of these checks is a comparison against another field, so run on device
+    tensors they would each cost a device-to-host read — and a read of a CUDA tensor
+    waits for everything already queued on the stream, which is the previous iteration's
+    twenty-eight layers. That would put half a dozen pipeline drains on the critical path
+    of every iteration to re-learn numbers the scheduler had as `int` a moment earlier.
+
+    So the checks live here, the builder calls them with what it already knows, and
+    `ForwardBatch.__post_init__` calls them for a batch assembled by hand.
+    """
+    if not num_sequences:
+        raise ValueError("a forward batch needs at least one sequence")
+
+    for name, actual, expected in (
+        ("seq_lens", len(seq_lens), num_sequences),
+        ("context_lens", len(context_lens), num_sequences),
+        ("cu_seqlens_q", len(offsets), num_sequences + 1),
+    ):
+        if actual != expected:
+            raise ValueError(f"{name} has {actual} entries, expected {expected}")
+
+    if num_params != num_sequences:
+        raise ValueError(f"got {num_params} sampling params for {num_sequences} sequences")
+    if num_positions != num_tokens:
+        raise ValueError(
+            f"input_ids has {num_tokens} tokens but positions has {num_positions}; "
+            "they index the same tokens"
+        )
+
+    # The offsets must actually describe the token axis they index into. This is the
+    # invariant that catches a scheduler that admitted a sequence but forgot to extend
+    # the flattened ids, which would otherwise read whatever tokens happen to sit at the
+    # end of the batch.
+    if offsets[0] != 0:
+        raise ValueError("cu_seqlens_q must start at 0")
+    if offsets[-1] != num_tokens:
+        raise ValueError(f"cu_seqlens_q ends at {offsets[-1]} but there are {num_tokens} tokens")
+
+    lengths = [after - before for before, after in zip(offsets, offsets[1:], strict=False)]
+    if lengths != seq_lens:
+        raise ValueError(f"cu_seqlens_q differences {lengths} disagree with seq_lens {seq_lens}")
+
+    # S >= L is not a convention, it is causality: a pass cannot compute more tokens than
+    # it is allowed to attend over, and a kernel handed S < L would mask every query in
+    # the overhang down to nothing.
+    if any(context < length for context, length in zip(context_lens, seq_lens, strict=True)):
+        raise ValueError(
+            f"context_lens {context_lens} must be >= seq_lens {seq_lens} elementwise"
+        )
+    if any(length < 1 for length in seq_lens):
+        raise ValueError(f"every sequence must contribute a token, got {seq_lens}")
+
+    if num_slots is not None and num_slots != num_tokens:
+        raise ValueError(
+            f"slot_mapping has {num_slots} entries for {num_tokens} tokens; "
+            "every token written this pass needs a slot"
+        )
+    if num_tables is not None and num_tables != num_sequences:
+        raise ValueError(f"block_tables has {num_tables} rows for {num_sequences} sequences")
+    if empty_tables:
+        raise ValueError(f"sequences {empty_tables} attend over cached tokens with no blocks")
+
+
 def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> torch.Tensor:
     """Stack per-sequence block tables into one rectangle, right-padded.
 
@@ -89,97 +166,53 @@ class ForwardBatch:
     slot_mapping: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
+    # The longest `L` and `S` in the batch. They size the prefill kernel's grid and the
+    # decode kernel's split count, so they have to be host integers: reading them off
+    # `seq_lens` would synchronize, and 28 layers each asking would synchronize 28 times
+    # per iteration. `from_scheduled` fills them from the lists it built the batch out
+    # of; left unset, they are worked out once here.
+    max_query_len: int | None = None
+    max_context_len: int | None = None
+
+    # Set by `from_scheduled`, which checked the same invariants against its own Python
+    # integers. See `_check_metadata` for why that distinction is worth a field.
+    checked: bool = False
+
     def __post_init__(self) -> None:
-        count = len(self.seq_ids)
-        if not count:
-            raise ValueError("a forward batch needs at least one sequence")
-
-        for name, expected in (
-            ("seq_lens", count),
-            ("context_lens", count),
-            ("cu_seqlens_q", count + 1),
-        ):
-            actual = getattr(self, name).shape[0]
-            if actual != expected:
-                raise ValueError(f"{name} has {actual} entries, expected {expected}")
-
-        if len(self.sampling_params) != count:
-            raise ValueError(
-                f"got {len(self.sampling_params)} sampling params for {count} sequences"
-            )
-        if self.input_ids.shape != self.positions.shape:
-            raise ValueError(
-                f"input_ids is {tuple(self.input_ids.shape)} but positions is "
-                f"{tuple(self.positions.shape)}; they index the same tokens"
-            )
-
-        # The offsets must actually describe the token axis they index into. This
-        # is the invariant that catches a scheduler that admitted a sequence but
-        # forgot to extend the flattened ids, which would otherwise read whatever
-        # tokens happen to sit at the end of the batch.
-        total = int(self.cu_seqlens_q[-1].item())
-        if total != self.input_ids.shape[0]:
-            raise ValueError(
-                f"cu_seqlens_q ends at {total} but there are {self.input_ids.shape[0]} tokens"
-            )
-        if int(self.cu_seqlens_q[0].item()) != 0:
-            raise ValueError("cu_seqlens_q must start at 0")
-
-        lengths = self.cu_seqlens_q[1:] - self.cu_seqlens_q[:-1]
-        if not torch.equal(lengths.to(self.seq_lens.dtype), self.seq_lens):
-            raise ValueError(
-                f"cu_seqlens_q differences {lengths.tolist()} disagree with "
-                f"seq_lens {self.seq_lens.tolist()}"
-            )
-
-        # S >= L is not a convention, it is causality: a pass cannot compute more
-        # tokens than it is allowed to attend over, and a kernel handed S < L would
-        # mask every query in the overhang down to nothing.
-        if bool((self.context_lens < self.seq_lens).any()):
-            raise ValueError(
-                f"context_lens {self.context_lens.tolist()} must be >= "
-                f"seq_lens {self.seq_lens.tolist()} elementwise"
-            )
-        if bool((self.seq_lens < 1).any()):
-            raise ValueError(f"every sequence must contribute a token, got {self.seq_lens.tolist()}")
-
-        if self.slot_mapping is not None and self.slot_mapping.shape[0] != total:
-            raise ValueError(
-                f"slot_mapping has {self.slot_mapping.shape[0]} entries for {total} tokens; "
-                "every token written this pass needs a slot"
-            )
-        if self.block_tables is not None:
-            if self.block_tables.shape[0] != count:
-                raise ValueError(
-                    f"block_tables has {self.block_tables.shape[0]} rows for {count} sequences"
-                )
+        if not self.checked:
+            count = len(self.seq_ids)
+            offsets = self.cu_seqlens_q.tolist()
             # Whether each row holds *enough* blocks for its context is not checkable
             # here — that needs the block size, which belongs to the manager — and the
             # attention path checks it against the pool it is about to read. What is
             # checkable is that a sequence with a context has any pages at all.
-            empty = [i for i in range(count) if not bool((self.block_tables[i] >= 0).any())]
-            if empty:
-                raise ValueError(f"sequences {empty} attend over cached tokens with no blocks")
+            tables = [] if self.block_tables is None else self.block_tables.tolist()
+            _check_metadata(
+                num_sequences=count,
+                num_params=len(self.sampling_params),
+                seq_lens=self.seq_lens.tolist(),
+                context_lens=self.context_lens.tolist(),
+                offsets=offsets,
+                num_tokens=int(self.input_ids.shape[0]),
+                num_positions=int(self.positions.shape[0]),
+                num_slots=None if self.slot_mapping is None else int(self.slot_mapping.shape[0]),
+                num_tables=None if self.block_tables is None else len(tables),
+                empty_tables=[
+                    index
+                    for index, row in enumerate(tables)
+                    if not any(block >= 0 for block in row)
+                ],
+            )
 
-        # Computed once, here, because every layer of the model needs them and each is
-        # a reduction over a device tensor: 28 layers asking `seq_lens.max()` on the
-        # critical path is 28 synchronizations to learn a number the scheduler knew in
-        # Python before the tensors existed.
-        object.__setattr__(self, "_max_query_len", int(self.seq_lens.max()))
-        object.__setattr__(self, "_max_context_len", int(self.context_lens.max()))
+        if self.max_query_len is None:
+            object.__setattr__(self, "max_query_len", int(self.seq_lens.max()))
+        if self.max_context_len is None:
+            object.__setattr__(self, "max_context_len", int(self.context_lens.max()))
+        # Arithmetic on the device, so no synchronization: the row indices stay on the
+        # GPU, which is where `index_select` wants them anyway.
         object.__setattr__(self, "_last_row_indices", self.cu_seqlens_q[1:].to(torch.int64) - 1)
 
     # ---------------------------------------------------------------- properties
-
-    @property
-    def max_query_len(self) -> int:
-        """The longest `L` in the batch. Sizes the prefill kernel's grid."""
-        return self._max_query_len  # type: ignore[attr-defined]
-
-    @property
-    def max_context_len(self) -> int:
-        """The longest `S` in the batch. Decides the decode kernel's split count."""
-        return self._max_context_len  # type: ignore[attr-defined]
 
     @property
     def last_row_indices(self) -> torch.Tensor:
@@ -281,9 +314,21 @@ class ForwardBatch:
             params.append(sequence.sampling_params)
 
             if manager is not None:
-                table = manager.table(sequence)
-                slots.extend(int(slot) for slot in manager.slot_mapping(sequence, count))
-                tables.append(table.block_ids)
+                slots.extend(manager.slots(sequence, count))
+                tables.append(manager.table(sequence).block_ids)
+
+        _check_metadata(
+            num_sequences=len(seq_ids),
+            num_params=len(params),
+            seq_lens=seq_lens,
+            context_lens=context_lens,
+            offsets=offsets,
+            num_tokens=len(input_ids),
+            num_positions=len(positions),
+            num_slots=None if manager is None else len(slots),
+            num_tables=None if manager is None else len(tables),
+            empty_tables=[index for index, table in enumerate(tables) if not table],
+        )
 
         as_int64 = {"dtype": torch.int64, "device": device}
         as_int32 = {"dtype": torch.int32, "device": device}
@@ -297,6 +342,9 @@ class ForwardBatch:
             sampling_params=tuple(params),
             slot_mapping=None if manager is None else torch.tensor(slots, **as_int32),
             block_tables=None if manager is None else _pad_tables(tables, device),
+            max_query_len=max(seq_lens),
+            max_context_len=max(context_lens),
+            checked=True,
         )
 
     @classmethod
