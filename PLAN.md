@@ -173,6 +173,7 @@ Mini-vLLM/
 │       └── engine.py             4.9
 ├── csrc/
 │   ├── bindings.cpp              0.1   extended by each kernel step
+│   ├── kernel_utils.cuh          3.3   vector loads + warp reductions, shared by the kernels
 │   ├── hello.cu                  0.1
 │   ├── rmsnorm.cu                3.1
 │   ├── rope.cu                   3.2
@@ -877,6 +878,25 @@ the benchmark shows the saved round trip to global memory:
 ```bash
 pytest tests/test_swiglu_cuda.py -v -m cuda
 ```
+
+**What it measured** (Step 3.3, now done). **306 GB/s**, 80% of peak and at the `copy_` ceiling, for **2.7x** the
+PyTorch expression. The multiplier is much smaller than [Step 3.1](#step-31--rmsnorm-kernel)'s 9x and that is the
+useful part: PyTorch already runs this as only three kernels reaching 114 GB/s, so there were three launches to save
+rather than six and no gather to fuse. End to end it moves decode from 71 to ~73 tok/s. **Diminishing returns arrive
+exactly where the profile said they would**, which is the argument for measuring before writing each kernel rather
+than writing all of them and measuring once.
+
+> **Learn:** this is the one kernel in the project that is **bitwise identical** to its oracle, in every dtype, and
+> the reason is instructive: it has no reduction. Nothing is summed, so there is no summation order to reassociate —
+> the only requirement is to round in the same three places PyTorch does (after the sigmoid, after the silu multiply,
+> and on the store). Carrying fp32 through to the store instead would make the kernel *more* accurate than its own
+> reference, and a differential test cannot tell "better" from "wrong". Every kernel after this one gives up bitwise
+> equality, so it is worth seeing once what is being given up and why.
+
+**On `csrc/kernel_utils.cuh`.** The 16-byte `Vector`, the alignment check, and the warp reductions moved into a header
+at this step, when the second kernel needed them. The sharing rule from [Repo layout](#repo-layout) is about
+`model/` versus `kernels/` — the *oracle* may not share code with the thing it validates — and says nothing about
+kernels sharing with each other, where duplication would just be three copies of a shuffle loop to keep in sync.
 
 #### Step 3.4 — Decode attention (online softmax)
 

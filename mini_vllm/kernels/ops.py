@@ -43,7 +43,7 @@ __all__ = [
 CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "rmsnorm": (True, "Step 3.1"),
     "rope": (True, "Step 3.2"),
-    "swiglu": (False, "Step 3.3"),
+    "swiglu": (True, "Step 3.3"),
     "decode_attention": (False, "Step 3.4"),
     "prefill_attention": (False, "Step 3.5"),
 }
@@ -123,8 +123,8 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor, use_cuda: bool = False) -> torc
     fusing is this part: two full passes over a `B x L x intermediate` tensor to
     do a few flops per element, which is pure memory traffic.
     """
-    if _use_kernel("swiglu", use_cuda, gate):
-        raise NotImplementedError("swiglu kernel is marked available but not wired up")
+    if _use_kernel("swiglu", use_cuda, gate) and gate.dtype == up.dtype:
+        return load_extension().swiglu(gate, up)
     return silu(gate) * up
 
 

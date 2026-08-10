@@ -11,6 +11,7 @@ torch::Tensor rope(const torch::Tensor& x,
                    const torch::Tensor& positions,
                    const torch::Tensor& cos,
                    const torch::Tensor& sin);
+torch::Tensor swiglu(const torch::Tensor& gate, const torch::Tensor& up);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -36,4 +37,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("positions"),
         py::arg("cos"),
         py::arg("sin"));
+
+  m.def("swiglu",
+        &swiglu,
+        "silu(gate) * up, the elementwise half of the MLP (Step 3.3)",
+        py::arg("gate"),
+        py::arg("up"));
 }

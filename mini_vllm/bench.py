@@ -503,6 +503,22 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 )
             )
 
+    if "swiglu" in implemented:
+        intermediate = 3072  # Qwen3-0.6B's MLP width
+        for rows, note in token_counts(2 * intermediate):
+            gate = torch.randn(rows, intermediate, device="cuda", dtype=dtype)
+            up = torch.randn_like(gate)
+            # Two reads and one write, so the traffic is 3x the tensor, not 2x.
+            moved = 3 * gate.numel() * gate.element_size()
+            cases.append(
+                KernelCase(
+                    label=f"swiglu I={intermediate} ({note})",
+                    kernel=lambda gate=gate, up=up: module.swiglu(gate, up),
+                    reference=lambda gate=gate, up=up: ops.swiglu(gate, up),
+                    bytes_moved=moved,
+                )
+            )
+
     if "rope" in implemented:
         from mini_vllm.positional_encoding import RoPE
 
