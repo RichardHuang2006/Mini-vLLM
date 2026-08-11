@@ -135,10 +135,10 @@ iteration cannot exceed the token budget with chunking on, so the longest a deco
 configuration rather than by whichever prompt happens to arrive.
 
 Which means whether the win shows up in *P99* depends on load, and the benchmark reports both tails instead
-of asserting a direction. Repeat the same run at `--rate 10`, comfortably below capacity, and a long prompt
-catches only one or two decodes: 99% of gaps never see it, and the baseline's P99 comes out *better*
-(24 ms against 176) while its worst case stays 2.3x worse. The bound is the claim that survives the
-arrival rate.
+of asserting a direction. Run it at `--rate 4 --num-requests 300`, where the engine keeps up with arrivals
+and few decodes are ever in flight, and a long prompt catches only a handful of them: P99 becomes a tie
+(25 ms against 28), because 99% of decode gaps never coincide with a prompt at all, while the worst gap
+stays 2.4x apart. The bound is the claim that survives the arrival rate; P99 is a claim about the queue.
 
 ---
 
