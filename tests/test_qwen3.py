@@ -1,10 +1,10 @@
-"""Step 1.8 — the full model against HuggingFace.
+"""The full model against HuggingFace.
 
 Structured so a failure localizes itself. The tiny-model tests walk outwards from
 the embedding, through each block, to the logits, so the first failing test names
-the layer that broke rather than reporting "the logits are wrong". That is the
-forward-hook debugging advice from the plan, written down as tests instead of
-something to remember to do under pressure.
+the layer that broke rather than reporting "the logits are wrong". That is
+forward-hook debugging written down as tests instead of as something to remember to
+do under pressure.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ PROMPT_SHAPES = [(1, 1), (1, 8), (2, 8), (3, 17)]
 
 @pytest.fixture
 def pair(tiny_qwen3):
-    """Our model and HF's, sharing one set of random weights."""
+    """The `mini_vllm` model and HF's, sharing one set of random weights."""
     return qwen3_from_hf(tiny_qwen3), tiny_qwen3
 
 
@@ -208,9 +208,9 @@ def real_models():
 
     Two dtypes because they prove different things, and neither alone is enough:
 
-    * **fp32** isolates *arithmetic*. With rounding out of the way our logits and
-      HF's agree to ~1e-6 relative, so a tight assertion there is a real proof
-      that the forward pass is the same function.
+    * **fp32** isolates *arithmetic*. With rounding out of the way the `mini_vllm`
+      logits and HF's agree to ~1e-6 relative, so a tight assertion there is a real
+      proof that the forward pass is the same function.
     * **bf16** is what the model actually runs in, so it is what has to work —
       but 28 layers of it drift a few percent from HF purely by rounding, and no
       elementwise tolerance can tell that apart from a bug.
@@ -279,10 +279,10 @@ def test_real_model_config_is_the_design_table(real_models):
 @pytest.mark.oracle
 @pytest.mark.parametrize(("batch", "length"), [(1, 1), (1, 32), (3, 12)])
 def test_real_logits_match_hf_in_fp32(real_models, batch, length):
-    """The correctness proof for this step.
+    """The correctness proof for the model.
 
-    In fp32 there is nowhere for a mistake to hide: our forward pass and HF's
-    agree to roughly 1e-6 relative, and every greedy token is identical. Any real
+    In fp32 there is nowhere for a mistake to hide: the `mini_vllm` forward pass and
+    HF's agree to roughly 1e-6 relative, and every greedy token is identical. Any real
     error — a missing QK-norm, a transposed projection, the wrong RoPE base —
     moves this by orders of magnitude.
     """
@@ -347,10 +347,10 @@ def test_the_bf16_drift_limit_still_catches_a_broken_model(real_models, real_tex
 
 @pytest.mark.oracle
 def test_real_greedy_argmax_matches_hf_for_32_tokens(real_models, real_prompt_ids):
-    """The plan's acceptance criterion for this step, and the sharpest test here.
+    """The sharpest test here.
 
-    Greedy decoding by re-running the whole prefix each step (no cache yet — that
-    is Step 2.1). Token-identical output over 32 steps in bf16 is a much stronger
+    Greedy decoding by re-running the whole prefix each step, since this model has no
+    KV cache. Token-identical output over 32 steps in bf16 is a much stronger
     statement than any logits tolerance: the comparison is exact, and a single
     wrong argmax sends the two sequences apart permanently.
     """

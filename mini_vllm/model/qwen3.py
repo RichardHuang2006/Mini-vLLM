@@ -1,14 +1,14 @@
-"""Step 1.8 — the whole Qwen3 model, assembled from Steps 1.1-1.6.
+"""The whole Qwen3 model, assembled from the primitives in `mini_vllm`.
 
 No cache and no custom kernels: one forward pass over a whole sequence. This is
-the readable reference, and **it is never modified again**. Step 2.2 forks it to
-add a KV cache, Phase 3 diffs its kernels against it, and Phase 4 diffs paged
-attention against that. Every fast path in the project is ultimately justified by
-agreeing with this file, so it stays pure PyTorch and imports nothing from
-`mini_vllm.kernels`.
+the readable reference implementation, and **it is never modified again**.
+`model/qwen3_cached.py` forks it to add a KV cache, the CUDA kernels are diffed
+against it, and paged attention is diffed against that. Every fast path in the
+project is ultimately justified by agreeing with this file, so it stays pure
+PyTorch and imports nothing from `mini_vllm.kernels`.
 
 Two Qwen3-specific details that Qwen2.5 does not have, and that produce fluent
-nonsense rather than errors when omitted (DESIGN.md §3):
+nonsense rather than errors when omitted:
 
 * **QK-norm** — an RMSNorm over the head dimension of `q` and `k`, before RoPE.
 * **GQA** — 8 key/value heads serving 16 query heads.
@@ -83,8 +83,8 @@ class Qwen3MLP:
     """SwiGLU: ``down(silu(gate(x)) * up(x))``.
 
     Two parallel projections up to `intermediate`, gated against each other, then
-    one back down. The elementwise product is what Step 3.3 fuses into a single
-    kernel to avoid a second pass over the wide activation.
+    one back down. The elementwise product is what the fused SwiGLU kernel takes
+    over, to avoid a second pass over the wide activation.
     """
 
     def __init__(self, weights: dict[str, torch.Tensor]) -> None:
@@ -179,8 +179,8 @@ class Qwen3:
 
         ``positions`` defaults to ``arange(L)``, which is correct here precisely
         because there is no cache: the tokens fed in *are* the whole sequence. It
-        stays an argument because from Step 2.2 on that stops being true, and the
-        positions have to come from the caller.
+        stays an argument because that is not true of the cached and paged models,
+        where the positions have to come from the caller.
         """
         _batch, length = input_ids.shape
         if positions is None:

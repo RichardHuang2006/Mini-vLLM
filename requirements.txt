@@ -1,4 +1,4 @@
-# Mini-vLLM pinned dependencies (Step 0.1).
+# Mini-vLLM pinned dependencies.
 #
 # torch is a CUDA 13.0 build and is NOT on the default PyPI index. Install with:
 #

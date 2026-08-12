@@ -1,4 +1,4 @@
-"""Step 4.3 — continuous batching.
+"""Continuous batching.
 
 Two kinds of test, and the split matters:
 
@@ -101,7 +101,7 @@ def test_a_prompt_larger_than_the_budget_runs_alone_and_overruns_it():
     This is the head-of-line stall in its purest form: a 2000-token prompt takes a
     whole iteration to itself and every decode-phase request waits for it. It is
     reachable only with chunking off, and it is kept reachable because it is the
-    behaviour Step 4.4 exists to remove — `test_chunked_prefill.py` runs the same
+    behaviour chunked prefill removes — `test_chunked_prefill.py` runs the same
     prompt with chunking on and gets four bounded iterations instead.
     """
     scheduler = Scheduler(SchedulerConfig(max_batched_tokens=512, **WHOLE))
@@ -142,7 +142,7 @@ def test_a_decode_step_costs_one_token():
 
 
 def test_a_finished_sequence_is_replaced_in_the_same_iteration():
-    """The point of the whole step: no drain between one request and the next.
+    """The point of continuous batching: no drain between one request and the next.
 
     With `max_sequences=1`, sequence A finishes on some iteration and B has to be
     running on the *next* one — not after an idle iteration, and not after the queue
@@ -314,7 +314,7 @@ def tiny_model(tiny_qwen3, device):
 
 
 def run_to_completion(scheduler: Scheduler, runner: DenseModelRunner) -> dict[int, list[int]]:
-    """Drive the engine loop until every request is done. This is Step 4.9 in miniature."""
+    """Drive the engine loop until every request is done, as the engine itself does."""
     while scheduler.has_work:
         output = scheduler.schedule()
         assert not output.is_empty, "the scheduler stalled with work outstanding"
@@ -338,7 +338,7 @@ def alone(model, prompt: list[int], max_tokens: int) -> list[int]:
 
 @pytest.mark.cuda
 def test_one_sequence_matches_the_generate_loop(tiny_model, device):
-    """First, agree with Phase 1's generator, so the harness itself is trusted."""
+    """Agree with `generate_ids_cached`, so the harness itself is trusted."""
     from mini_vllm.generate import generate_ids_cached
 
     prompt = [3, 9, 4, 1, 7]
@@ -420,8 +420,8 @@ def test_the_dense_cache_cannot_actually_batch(tiny_model):
 
     Every scheduled sequence gets its own cache and therefore its own forward pass,
     so a batch of eight costs eight launches. Continuous batching has bought
-    fairness and nothing else — the GPU is doing exactly the Phase 2 work it did
-    before, and this is the measurement that motivates paging.
+    fairness and nothing else — the GPU is doing exactly the per-sequence work the
+    cached model always did, and this is the measurement that motivates paging.
     """
     scheduler = Scheduler(SchedulerConfig(max_sequences=8))
     runner = DenseModelRunner(tiny_model)

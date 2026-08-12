@@ -1,11 +1,10 @@
-"""Steps 1.9 and 2.2 — greedy generation, with and without a KV cache.
+"""Greedy generation, with and without a KV cache.
 
-:func:`generate_ids` is the naive loop from Step 1.9. Every step re-runs all 28
-layers over the entire prefix, so generating token 100 redoes the work of tokens
-0-99 for the hundredth time — quadratic total cost for a job that should be
-linear.
+:func:`generate_ids` is the naive loop. Every step re-runs all 28 layers over the
+entire prefix, so generating token 100 redoes the work of tokens 0-99 for the
+hundredth time — quadratic total cost for a job that should be linear.
 
-:func:`generate_ids_cached` is Step 2.2's version, and it is kept side by side
+:func:`generate_ids_cached` is the cached version, and it is kept side by side
 with the naive one on purpose: they must produce **identical tokens**, which is
 the only convincing evidence that the cache is a pure optimization rather than a
 subtle change of behaviour. The `--no-cache` flag exists so the difference can be
@@ -77,7 +76,7 @@ def load(
 ) -> Loaded:
     """Load the model, tokenizer and stop tokens together.
 
-    ``cached=False`` gives the Step 1.9 model, which exists to be compared
+    ``cached=False`` gives the uncached model, which exists to be compared
     against rather than used.
     """
     from transformers import AutoTokenizer
@@ -119,9 +118,9 @@ def generate_ids(
 
     Stops once every row has produced a stop token. Rows that finish early are
     filled with ``pad_token_id`` so the batch stays rectangular, which is what
-    HuggingFace does too — and is a hint at why Phase 4 abandons rectangular
-    batches entirely: with 16 sequences of wildly different lengths, most of a
-    padded batch is wasted work.
+    HuggingFace does too — and is a hint at why the serving layer abandons
+    rectangular batches entirely: with 16 sequences of wildly different lengths,
+    most of a padded batch is wasted work.
     """
     if input_ids.ndim != 2:
         raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
@@ -244,7 +243,7 @@ def main() -> None:
     parser.add_argument(
         "--no-cache",
         action="store_true",
-        help="use the Step 1.9 loop, which recomputes the whole prefix every step",
+        help="use the uncached loop, which recomputes the whole prefix every step",
     )
     arguments = parser.parse_args()
 

@@ -1,4 +1,4 @@
-// Step 3.2 — RoPE: rotate q and k by the angle for each token's absolute position.
+// RoPE: rotate q and k by the angle for each token's absolute position.
 //
 // The oracle is `apply_rope` in mini_vllm/positional_encoding.py:
 //
@@ -7,9 +7,10 @@
 // which is three kernels and two materialized `B x L x H x D` temporaries in
 // PyTorch — one for the gather, one for `rotate_half`'s concatenation. Fusing
 // them means the gather becomes index arithmetic and the rotation never leaves
-// registers, so the whole op is one read and one write (DESIGN.md §5.1).
+// registers, so the whole op is one read and one write.
 //
-// Two conventions are inherited from Step 1.3 and both matter:
+// Two conventions are inherited from the tables built in
+// mini_vllm/positional_encoding.py, and both matter:
 //
 //   * **Rotate halves, not adjacent pairs.** Element `i` pairs with `i + D/2`.
 //     Qwen3's weights were trained this way; the RoFormer paper's interleaved
@@ -141,7 +142,8 @@ torch::Tensor rope(const torch::Tensor& x,
               cos.size(1),
               " wide but the head dimension is ",
               dim,
-              "; Step 1.3 builds them as max_seq_len x D with the angles duplicated");
+              "; mini_vllm/positional_encoding.py builds them as max_seq_len x D "
+              "with the angles duplicated");
   TORCH_CHECK(cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat,
               "rope: the cos/sin tables must be float32 even when x is bf16 — see "
               "mini_vllm/positional_encoding.py. Got ",

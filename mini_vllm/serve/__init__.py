@@ -1,4 +1,4 @@
-"""Phase 4 — the serving layer: sequences, batches, the scheduler, the engine.
+"""The serving layer: sequences, batches, the scheduler, the engine.
 
 Everything above the model. The model computes one forward pass over whatever it
 is handed; this package decides *what* to hand it, which requests are in flight,

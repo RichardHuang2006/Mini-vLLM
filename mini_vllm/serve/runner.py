@@ -1,4 +1,4 @@
-"""Step 4.9 — executing a scheduler decision against the paged cache.
+"""Executing a scheduler decision against the paged cache.
 
 The replacement for `DenseModelRunner`, and the difference between them is one line
 of shape. The dense runner loops over the scheduled sequences and runs a forward pass

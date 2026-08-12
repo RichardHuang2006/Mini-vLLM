@@ -1,4 +1,4 @@
-"""Step 1.10 — sampling: greedy, temperature, top-k, top-p.
+"""Sampling: greedy, temperature, top-k, top-p.
 
 Sampling is awkward to test because the output is random, so the tests here lean
 on three things that are not: the distribution `sampling_probabilities` returns,
@@ -228,7 +228,7 @@ def test_top_p_keeps_the_smallest_prefix_reaching_p(logits):
 
 
 def test_top_p_never_samples_outside_the_nucleus(logits):
-    """The plan's criterion, checked over many draws.
+    """No draw lands outside the nucleus, checked over many seeds.
 
     `sampling_probabilities` gives zero weight outside the nucleus, so this holds
     by construction — the point is to confirm the draw honours the distribution

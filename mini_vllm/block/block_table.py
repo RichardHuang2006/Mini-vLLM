@@ -1,8 +1,7 @@
-"""Step 4.6 — one sequence's logical-to-physical token mapping.
+"""One sequence's logical-to-physical token mapping.
 
-This is the entire paging indirection ([§6.2](../DESIGN.md#62-block-table-indirection)),
-and it is worth noticing how little there is to it: a list of block ids, a shift, and
-a mask.
+This is the entire paging indirection, and it is worth noticing how little there is to
+it: a list of block ids, a shift, and a mask.
 
 ::
 
@@ -12,7 +11,7 @@ Non-contiguous physical storage — the thing that removes per-sequence contiguo
 reservation and the fragmentation that comes with it — costs one integer division and
 one modulo per token, and because `P` is a power of two both reduce to bit operations.
 That is the whole price of paging, and it is worth being convinced of it here, in
-integer arithmetic, before it reappears inside a CUDA kernel in [Step 4.8].
+integer arithmetic, before it reappears inside the paged attention kernel.
 
 The one output that leaves Python is :meth:`BlockTable.slot_mapping`: the flat index
 vector the paged write path scatters new keys and values through.
@@ -36,9 +35,9 @@ class BlockTable:
     * :attr:`num_tokens` — occupancy, usually not.
 
     Their difference is the internal fragmentation in the final block, bounded by
-    `P - 1` tokens per sequence no matter how long the sequence is — the number
-    [§6](../DESIGN.md#6-paged-kv-cache) is trading against. It is also what tells the
-    block manager whether appending a token needs a new block or fits where it stands.
+    `P - 1` tokens per sequence no matter how long the sequence is — the number paging
+    trades against. It is also what tells the block manager whether appending a token
+    needs a new block or fits where it stands.
     """
 
     def __init__(
@@ -105,9 +104,9 @@ class BlockTable:
     def blocks_needed_for(self, num_new_tokens: int) -> int:
         """How many fresh blocks appending `num_new_tokens` would require.
 
-        The admission-control question of [§7.4](../DESIGN.md#74-admission-control),
-        asked as arithmetic. Space left in the partial block is used first, so this is
-        often zero — which is why a decode step usually allocates nothing at all.
+        The admission-control question, asked as arithmetic. Space left in the partial
+        block is used first, so this is often zero — which is why a decode step usually
+        allocates nothing at all.
         """
         if num_new_tokens < 0:
             raise ValueError(f"num_new_tokens must be non-negative, got {num_new_tokens}")
@@ -144,10 +143,9 @@ class BlockTable:
     def replace_block(self, index: int, block_id: int) -> int:
         """Repoint one table entry, returning the id it displaced.
 
-        The copy-on-write step of [§6.3](../DESIGN.md#63-copy-on-write-sharing). The
-        displaced id is returned rather than dropped, so the caller cannot forget to
-        decref it — a forgotten decref is a leak that only shows up as an OOM much
-        later.
+        The copy-on-write step. The displaced id is returned rather than dropped, so
+        the caller cannot forget to decref it — a forgotten decref is a leak that only
+        shows up as an OOM much later.
         """
         if not 0 <= index < len(self._block_ids):
             raise IndexError(f"block index {index} out of range for {len(self._block_ids)} blocks")
@@ -159,7 +157,7 @@ class BlockTable:
         return displaced
 
     def copy(self) -> BlockTable:
-        """An independent table over the same blocks — the fork of §6.3.
+        """An independent table over the same blocks — the fork half of copy-on-write.
 
         No block data is copied and no refcounts are touched here; the caller increfs.
         The independence is of the *list*, so that appending to one branch cannot

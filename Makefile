@@ -1,4 +1,4 @@
-# Mini-vLLM — a paged-attention LLM inference engine, built bottom-up
+# Mini-vLLM — a paged-attention LLM inference engine
 #
 # Targets: setup (venv + deps) · ext (build CUDA extension) · test · bench · clean · help
 #
@@ -48,7 +48,7 @@ bench:
 
 # The headline: output tokens/sec over a whole request set against
 # `transformers.generate`, swept over concurrency. Downloads Qwen3-0.6B on first
-# run. This is the table in the README (Phase 5).
+# run. This is the table in the README.
 bench-throughput:
 	$(PYTHON) -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16,32 \
 		--compare hf --use-cuda-kernels --kv-fraction 0.35
@@ -61,7 +61,7 @@ bench-scheduler:
 
 # Achieved memory bandwidth for each hand-written kernel, next to the PyTorch
 # expression it replaced. The score for a memory-bound op is its share of peak
-# bandwidth, not its wall-clock (Phase 3).
+# bandwidth, not its wall-clock.
 bench-kernels:
 	$(PYTHON) -m mini_vllm.bench --mode kernels
 

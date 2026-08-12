@@ -1,4 +1,4 @@
-"""Step 4.7 — the block manager, copy-on-write, and paged attention's oracle.
+"""The block manager, copy-on-write, and paged attention's oracle.
 
 Three groups:
 
@@ -342,7 +342,7 @@ def test_paged_attention_matches_a_dense_cache():
 
 
 def test_a_shuffled_block_table_changes_nothing():
-    """The real test of the indirection ([§6.2](../DESIGN.md#62-block-table-indirection)).
+    """The real test of the block-table indirection.
 
     The same tokens, written through a table whose physical order is reversed. If the
     gather arithmetic is wrong this is where it shows: with an unshuffled table,
@@ -376,8 +376,8 @@ def test_a_shuffled_block_table_changes_nothing():
 def test_a_mixed_batch_matches_each_sequence_alone():
     """A chunk beside two decodes, in one call, each row unaffected by its neighbours.
 
-    This is the shape Step 4.8's kernel has to serve in a single launch, so the
-    reference has to serve it too.
+    This is the shape the paged attention kernels have to serve in a single launch,
+    so the reference has to serve it too.
     """
     heads, kv_heads, dim = 4, 2, 8
     manager = BlockManager(16, block_size=4, num_layers=1, num_kv_heads=kv_heads, head_dim=dim)

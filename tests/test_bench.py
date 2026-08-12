@@ -1,4 +1,4 @@
-"""Step 2.3 — the benchmark harness.
+"""The benchmark harness.
 
 A benchmark cannot be tested for the numbers it produces, so these test the things
 that make the numbers trustworthy: that prefill and decode are separated, that a
@@ -228,10 +228,10 @@ def test_clock_sampler_is_safe_without_a_gpu():
 def test_report_states_which_ops_ran_as_kernels():
     """"My kernel made no difference" is usually "my kernel never ran".
 
-    Every op has a kernel as of Step 3.5, so with the flag on the report says `cuda`
-    for all of them *except* the ones the benchmark says are not yet worth
-    preferring — and for those it has to give the reason, since "kernel exists,
-    kernel unused, nobody said so" is the failure this whole report exists to catch.
+    Every op has a kernel, so with the flag on the report says `cuda` for all of them
+    *except* the ones the benchmark says are not yet worth preferring — and for those
+    it has to give the reason, since "kernel exists, kernel unused, nobody said so" is
+    the failure this whole report exists to catch.
     """
     from mini_vllm.kernels import ops
 
@@ -387,12 +387,13 @@ def test_the_prompt_set_is_deliberately_ragged():
 
 @pytest.mark.oracle
 def test_the_engine_beats_transformers_on_a_batch():
-    """The Step 5.1 claim, run small: a batch of 8 is faster through the engine.
+    """The throughput claim, run small: a batch of 8 is faster through the engine.
 
     Eight requests rather than the README's thirty-two, and eight output tokens rather
     than sixty-four, because this is a regression test and not the benchmark. It checks
     the harness measures both sides on the same work and that the engine is ahead — a
-    build where it is *behind* on a ragged batch has lost the point of Phase 4.
+    build where it is *behind* on a ragged batch has lost the point of the serving
+    layer.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

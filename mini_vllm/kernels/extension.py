@@ -1,18 +1,18 @@
 """JIT build and load of the CUDA sources in ``csrc/``.
 
-Everything in Phase 3 and Phase 4 goes through here, so this module owns one
-awkward problem: ``torch.utils.cpp_extension`` refuses to compile when nvcc's
-CUDA *major* version differs from the one torch was built against, and on this
-machine they differ (torch is a cu130 build; the system nvcc is 12.8).
+Every hand-written kernel, and every part of the serving layer that runs one,
+reaches the GPU through here, so this module owns one awkward problem:
+``torch.utils.cpp_extension`` refuses to compile when nvcc's CUDA *major* version
+differs from the one torch was built against, and on this machine they differ
+(torch is a cu130 build; the system nvcc is 12.8).
 
 The fix is to ignore the system toolkit and use the CUDA 13 compiler that ships
 as pip wheels. Those wheels are scattered, though: nvcc and its nvvm backend in
 one, the runtime headers and libraries in another, the CCCL headers that
 ``cuda_fp16.h`` pulls in (``nv/target``) in a third — and pip may install them
 into different site-packages trees, so no single directory looks like a CUDA
-installation. So we assemble a symlink tree that does, under ``build/``, and
-point CUDA_HOME at it. See PLAN.md "Environment" for the alternatives that were
-considered.
+installation. So this module assembles a symlink tree that does, under
+``build/``, and points CUDA_HOME at it.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ TOOLKIT_DIR = BUILD_DIR / "cuda_toolkit"
 EXT_NAME = "mini_vllm_C"
 
 # Blackwell, the RTX 5070 Laptop of record (compute capability 12.0). Targeting
-# one architecture keeps compiles fast; DESIGN.md §10 fixes the hardware.
+# the single architecture this project runs on keeps compiles fast.
 CUDA_ARCH = "sm_120"
 
 _extension: Any = None
@@ -145,8 +145,8 @@ def _ensure_real_dir(path: Path) -> None:
     """Make ``path`` a real directory, replacing a symlink left by an older layout.
 
     Without this, ``mkdir(exist_ok=True)`` on a path that is currently a symlink
-    to a wheel's include directory would silently succeed and we would then
-    scatter symlinks *inside site-packages*.
+    to a wheel's include directory would silently succeed, and the symlinks would
+    then be scattered *inside site-packages*.
     """
     if path.is_symlink():
         path.unlink()
@@ -277,7 +277,7 @@ def load_extension(verbose: bool = False) -> Any:
     # Both of these matter. The environment variables are what nvcc and any
     # subprocess see; the module attribute is what torch itself consults, and it
     # is captured once at import time, so setting only the environment would be
-    # silently ignored whenever cpp_extension was imported before we got here.
+    # silently ignored whenever cpp_extension was imported before this point.
     os.environ["CUDA_HOME"] = str(home)
     os.environ["CUDA_PATH"] = str(home)
     os.environ["PATH"] = f"{home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"

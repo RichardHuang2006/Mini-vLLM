@@ -1,6 +1,6 @@
-"""Step 3.1 — the RMSNorm kernel against the PyTorch RMSNorm it replaces.
+"""The RMSNorm kernel against the PyTorch RMSNorm it replaces.
 
-The oracle is `mini_vllm.layer_norm.rms_norm`, which Step 1.5 already checked
+The oracle is `mini_vllm.layer_norm.rms_norm`, which its own tests already checked
 against HuggingFace. So this file never asks "is this the right formula" — that is
 settled — only "does the kernel compute the same thing the settled formula does".
 That is the whole differential-testing idea, and it is why the slow path is never
@@ -45,7 +45,7 @@ pytestmark = pytest.mark.cuda
 EPS = 1e-6
 
 # The widths Qwen3-0.6B actually norms over: `E` before attention and the MLP,
-# `D` for QK-norm inside attention (DESIGN.md §3).
+# `D` for QK-norm inside attention.
 QWEN3_HIDDEN_SIZE = 1024
 QWEN3_HEAD_DIM = 128
 
@@ -205,10 +205,11 @@ def test_a_zero_row_stays_finite(kernel):
 def test_reduction_accumulates_in_fp32(kernel):
     """Summing 4096 bf16 squares in bf16 is visibly wrong, so it must not happen.
 
-    The kernel's storage is bf16 and its accumulator is fp32 (DESIGN.md §5.3).
-    This pins that down by showing the kernel agrees with the fp32 reduction and
-    that the bf16 reduction is a different number — otherwise the test would pass
-    for a kernel that reduced in the wrong precision.
+    The kernel's storage is bf16 while its accumulator is fp32: every kernel here
+    accumulates in fp32 whatever the storage dtype. This pins that down by showing
+    the kernel agrees with the fp32 reduction and that the bf16 reduction is a
+    different number — otherwise the test would pass for a kernel that reduced in
+    the wrong precision.
     """
     dim = 4096
     x = torch.randn(4, dim, device="cuda", dtype=torch.bfloat16) * 3.0
@@ -349,7 +350,7 @@ def test_model_logits_are_unchanged(tiny_pair):
 
 
 def test_model_greedy_output_is_token_identical(tiny_pair):
-    """The claim Step 3.1 actually has to make: the kernel changed speed, not text."""
+    """The claim the kernel actually has to make: it changed speed, not text."""
     torch_path, cuda_path = tiny_pair(torch.float32)
     ids = torch.randint(0, TINY_QWEN3_DIMS["vocab_size"], (1, 5), device="cuda")
 
@@ -368,8 +369,8 @@ def test_real_model_generates_the_same_text(dtype):
     RMSNorm runs five times in each plus once at the end. This is the version of
     the claim that counts, and it is run in both dtypes because they fail
     differently — fp32 has the headroom for token identity, while bf16 is where a
-    reassociated sum can legally move the last bit (PLAN.md "Numerical
-    tolerances"), so it gets the drift check instead.
+    reassociated sum can legally move the last bit, so it gets the drift check
+    instead.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -396,7 +397,7 @@ def test_real_model_generates_the_same_text(dtype):
         else:
             # 28 layers, not the tiny model's 4, so the bound is the full-forward
             # one: a single bf16 rounding difference amplifies to ~1.9% here, which
-            # is the same order as our fp32-vs-HuggingFace drift and a long way
+            # is the same order as the fp32-vs-HuggingFace drift and a long way
             # below the 14% a genuinely broken model shows.
             assert_relative_error_below(
                 cuda_path(ids, cuda_path.create_kv_cache()),
@@ -412,10 +413,10 @@ def test_model_logits_are_unchanged_in_bf16(tiny_pair):
     """bf16 gets the drift instrument, not the exact one.
 
     The kernel sums a row in a different order than PyTorch does, which is legal
-    and unavoidable, so in bf16 the last bit may differ — see PLAN.md
-    "Numerical tolerances". What must hold is that the difference stays at the
-    rounding floor instead of growing, and `KERNEL_DRIFT_LIMIT` is where that floor
-    is once every Phase 3 kernel is live.
+    and unavoidable, so in bf16 the last bit may differ; `tests/conftest.py` holds
+    the shared bounds that decide how much of that is acceptable. What must hold is
+    that the difference stays at the rounding floor instead of growing, and
+    `KERNEL_DRIFT_LIMIT` is where that floor is once every CUDA kernel is live.
     """
     torch_path, cuda_path = tiny_pair(torch.bfloat16)
     ids = torch.randint(0, TINY_QWEN3_DIMS["vocab_size"], (2, 7), device="cuda")

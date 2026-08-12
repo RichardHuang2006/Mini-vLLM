@@ -1,4 +1,4 @@
-"""Step 4.4 — chunked prefill and piggyback decoding.
+"""Chunked prefill and piggyback decoding.
 
 Two claims, and they fail in different ways:
 
@@ -21,10 +21,10 @@ import pytest
 import torch
 from conftest import assert_allclose
 
-# This file extends Step 4.3's harness rather than reimplementing it: the engine
-# loop, the greedy parameters and the single-sequence reference are exactly the ones
-# the continuous-batching tests use, and a chunked run has to match *that* reference
-# to mean anything.
+# This file extends the scheduler tests' harness rather than reimplementing it: the
+# engine loop, the greedy parameters and the single-sequence reference are exactly the
+# ones the continuous-batching tests use, and a chunked run has to match *that*
+# reference to mean anything.
 from test_scheduler import GREEDY, WHOLE, alone, make, run_to_completion
 
 from mini_vllm.serve.scheduler import DenseModelRunner, Scheduler, SchedulerConfig
@@ -80,7 +80,7 @@ def test_no_token_is_emitted_until_the_prompt_is_finished():
 
 
 def test_the_head_of_line_stall_is_gone():
-    """The same prompt that monopolized an iteration in Step 4.3, now bounded.
+    """The same prompt that monopolizes an iteration without chunking, now bounded.
 
     With chunking off it takes 2000 tokens in one pass and everything else waits;
     with it on, no iteration exceeds the budget it was given.
@@ -110,8 +110,8 @@ def decoding_scheduler(config: SchedulerConfig, count: int) -> tuple[Scheduler, 
 def test_decodes_ride_along_with_a_prefill_chunk():
     """One forward pass carrying a 300-token chunk and three single-token decodes.
 
-    This is [§7.3](./DESIGN.md#73-stall-free-piggyback-decoding), and the ragged
-    `ForwardBatch` exists for exactly this shape.
+    This is stall-free piggyback decoding, and the ragged `ForwardBatch` exists for
+    exactly this shape.
     """
     scheduler, decoders = decoding_scheduler(
         SchedulerConfig(max_batched_tokens=1024, chunk_size=300), count=3
@@ -133,7 +133,7 @@ def test_decodes_ride_along_with_a_prefill_chunk():
 
 
 def test_a_decode_is_never_stalled_by_a_long_prefill():
-    """The point of the whole step, stated as a latency claim.
+    """The point of piggybacking, stated as a latency claim.
 
     A sequence in decode advances one token every iteration while a 2000-token
     prompt is being chunked beside it. Without piggybacking it would advance on none
@@ -221,9 +221,9 @@ def test_the_batch_describes_each_sequence_at_its_own_length():
 def test_positions_resume_where_the_previous_chunk_stopped():
     """The chunk-boundary bug, caught at the metadata rather than in the logits.
 
-    RoPE takes explicit positions ([Step 1.3](../PLAN.md)) precisely so the second
-    chunk can start at 8 instead of at 0. An `arange(L)` here would be invisible
-    until the text came out subtly wrong.
+    RoPE takes explicit positions precisely so the second chunk can start at 8
+    instead of at 0. An `arange(L)` here would be invisible until the text came out
+    subtly wrong.
     """
     scheduler = Scheduler(SchedulerConfig(max_batched_tokens=64, chunk_size=8))
     sequence = make(24)
@@ -264,7 +264,7 @@ def logits_in_chunks(model, prompt: list[int], chunk: int) -> torch.Tensor:
 
 
 def test_chunked_prefill_gives_the_same_logits_as_one_pass(tiny_model):
-    """The headline claim of the step, checked on the logits themselves.
+    """The headline claim, checked on the logits themselves.
 
     Not bitwise: the chunked run multiplies differently-shaped matrices, so cuBLAS
     (or MKL) is free to accumulate in a different order. What must hold is agreement

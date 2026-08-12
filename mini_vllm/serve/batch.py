@@ -1,4 +1,4 @@
-"""Step 4.2 — the contract between the scheduler and the GPU.
+"""The contract between the scheduler and the GPU.
 
 One forward pass, one `ForwardBatch`. It describes a **ragged** batch: sequences of
 different lengths, some prefilling and some decoding, flattened into a single token
@@ -14,13 +14,12 @@ axis with offsets rather than padded into a rectangle.
 
 Why flattened and not padded: padding a 300-token prefill next to two decode steps
 into a `3 x 300` rectangle is 598 wasted token-slots of compute, and the waste
-grows with the length spread — the same argument as [§6](./DESIGN.md#6-paged-kv-cache)
-makes about memory. The paged kernels in [Step 4.8] read `cu_seqlens_q` and
-`context_lens` and serve the whole ragged batch in one launch with no host-side
-per-sequence branching, so this object is shaped for them now rather than
-reshaped later.
+grows with the length spread — the same argument paging makes about memory. The
+paged attention kernels read `cu_seqlens_q` and `context_lens` and serve the whole
+ragged batch in one launch with no host-side per-sequence branching, so this object
+is shaped for them rather than reshaped later.
 
-`seq_lens` and `context_lens` are separate for the same reason [Step 4.1] separates
+`seq_lens` and `context_lens` are separate for the same reason `Sequence` separates
 `num_computed_tokens` from `len(sequence)`: `L` is how many tokens this pass
 computes and `S` is how many it attends over. They differ whenever a prefix is
 already cached, which is every decode step and every chunk after the first.
@@ -141,7 +140,7 @@ class ForwardBatch:
     index into another one and the failure mode of getting that wrong is silently
     wrong text rather than an exception. The invariants are checked once, here, on
     construction — which is cheap next to a forward pass and is what makes the rest
-    of Phase 4 debuggable.
+    of the serving layer debuggable.
     """
 
     input_ids: torch.Tensor  # int64 [total_tokens], flattened across sequences
@@ -152,9 +151,9 @@ class ForwardBatch:
     seq_ids: tuple[int, ...]
     sampling_params: tuple[SamplingParams, ...]
 
-    # Paging ([Step 4.7]). Optional because the dense runner has no use for them and
-    # the pure-scheduling tests should not have to build a block manager to construct
-    # a batch.
+    # Paging metadata, filled in from the block manager. Optional because the dense
+    # runner has no use for them and the pure-scheduling tests should not have to build
+    # a block manager to construct a batch.
     #
     #   slot_mapping  int32 [total_tokens]        where each new K/V is written
     #   block_tables  int32 [num_sequences, max]  right-padded with -1
@@ -273,11 +272,11 @@ class ForwardBatch:
         The token count is the scheduler's decision, not the sequence's: a 2000-token
         prompt admitted under a 512-token budget contributes 512 here and remembers
         the rest through `num_computed_tokens`. That is the whole of chunked prefill
-        as far as this object is concerned ([Step 4.4] changes the caller, not this).
+        as far as this object is concerned: chunking changes the caller, not this.
 
-        Positions start at each sequence's `num_computed_tokens`, which is why
-        [Step 1.3] insisted RoPE take an explicit position tensor: a chunk's tokens
-        are at positions 512..1023, and nothing in the tensor shapes says so.
+        Positions start at each sequence's `num_computed_tokens`, which is why RoPE
+        takes an explicit position tensor: a chunk's tokens are at positions 512..1023,
+        and nothing in the tensor shapes says so.
 
         Pass `manager` (a `BlockManager`) to fill in the paging metadata as well. It
         is optional so that a scheduling test can build a batch without a pool, and

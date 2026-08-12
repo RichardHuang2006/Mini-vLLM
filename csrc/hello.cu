@@ -1,4 +1,4 @@
-// Step 0.1 — axpby: y = a*x + b.
+// axpby: y = a*x + b — the toolchain smoke test.
 //
 // This kernel is deliberately trivial. Its only job is to prove that the whole
 // extension pipeline works before anything depends on it: nvcc finds a CUDA
@@ -11,9 +11,8 @@
 
 namespace {
 
-// Accumulate in float even for half/bfloat16 inputs. Every kernel in this
-// project follows that rule (see DESIGN.md §5.3); starting here keeps it
-// habitual rather than something remembered later under pressure.
+// Accumulate in fp32 regardless of the storage dtype, half and bfloat16 inputs
+// included. Every kernel in csrc/ follows that rule.
 template <typename scalar_t>
 __global__ void axpby_kernel(const scalar_t* __restrict__ x,
                              scalar_t* __restrict__ y,

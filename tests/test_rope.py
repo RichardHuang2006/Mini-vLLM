@@ -1,4 +1,4 @@
-"""Step 1.3 — RoPE against HuggingFace's own rotary embedding.
+"""RoPE against HuggingFace's own rotary embedding.
 
 HF applies rotation to `B x H x L x D` tensors with `cos`/`sin` of shape
 `B x L x D`; ours takes `B x L x H x D` and gathers the tables itself from a
@@ -27,7 +27,7 @@ THETA = TINY_QWEN3_DIMS["rope_theta"]
 
 @pytest.fixture
 def hf_rotary():
-    """HF's rotary embedding for the tiny config, the oracle for this step."""
+    """HF's rotary embedding for the tiny config, the oracle for these tests."""
     return Qwen3RotaryEmbedding(Qwen3Config(**TINY_QWEN3_DIMS))
 
 
@@ -118,7 +118,7 @@ def test_matches_hf_for_contiguous_positions(hf_rotary, length):
 
 
 def test_matches_hf_for_offset_positions(hf_rotary):
-    """The `[5, 6, 7]` case from the plan: a chunk that does not start at zero.
+    """The `[5, 6, 7]` case: a chunk that does not start at zero.
 
     This is what chunked prefill produces for every chunk after the first, so it
     is the case an implicit `arange` would silently get wrong.

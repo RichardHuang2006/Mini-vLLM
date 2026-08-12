@@ -1,7 +1,7 @@
-"""Step 0.2 — fixtures and comparison helpers shared by every later test.
+"""Fixtures and comparison helpers shared by every test.
 
 Three things live here, and each exists to make a specific class of bug cheap to
-find later:
+find:
 
 * **Seeding**, so any failure reproduces exactly.
 * **Dtype-aware comparison**, so no test hardcodes a tolerance and drifts.
@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 import torch
 
-# PLAN.md "Numerical tolerances". Keyed by dtype so a test never picks its own
+# The shared numerical tolerances. Keyed by dtype so a test never picks its own
 # threshold: a comparison that needs a looser bound than these is reporting a
 # bug, not a tolerance problem.
 OP_TOLERANCES: dict[torch.dtype, float] = {
@@ -62,9 +62,9 @@ KERNEL_DRIFT_LIMIT = 1e-2
 SEED = 1234
 
 # The tiny model's dimensions. Deliberately keeps two properties of the real
-# Qwen3-0.6B that catch reshape bugs (DESIGN.md §3):
+# Qwen3-0.6B that catch reshape bugs:
 #   * H_q * D != E, so the attention projection is *wider* than the hidden size
-#     and code that conflates the two fails here rather than in Phase 4.
+#     and code that conflates the two fails here rather than in the serving layer.
 #   * G = H_q / H_k = 2, the real GQA group size, so the KV-head dimension is
 #     genuinely exercised instead of degenerating to plain multi-head attention.
 TINY_QWEN3_DIMS: dict[str, Any] = {
@@ -231,10 +231,9 @@ def tokens_equal():
 def make_tiny_qwen3(**overrides: Any):
     """Build a randomly-initialized Qwen3 small enough to test against.
 
-    This is HuggingFace's Qwen3 rather than ours, because ours does not exist
-    until Step 1.8 — which is the right way round anyway: from Step 1.8 on this
-    is the *oracle*, and our model is checked against it using these same random
-    weights, no download required.
+    This is HuggingFace's Qwen3 rather than ours, which is the right way round:
+    it is the *oracle*, and `mini_vllm.model.qwen3.Qwen3` is checked against it
+    using these same random weights, no download required.
     """
     from transformers import Qwen3Config, Qwen3ForCausalLM
 

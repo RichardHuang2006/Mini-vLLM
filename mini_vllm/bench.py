@@ -1,7 +1,7 @@
-"""Step 2.3 — the measuring instrument for the rest of the project.
+"""The measuring instrument for the rest of the project.
 
-Phase 3 exists to make things faster, so it lives or dies on whether this file
-tells the truth. Three ways a GPU benchmark lies, all handled here:
+The CUDA kernels exist to make things faster, so they live or die on whether this
+file tells the truth. Three ways a GPU benchmark lies, all handled here:
 
 * **Asynchronous launches.** CUDA calls return before the work finishes, so a
   naive timer measures how fast Python can enqueue kernels. Every timed region is
@@ -22,27 +22,26 @@ tokens/sec** is dominated by memory bandwidth, since each step reads all 1.2 GB 
 weights to produce one token. An optimization almost always helps one and not the
 other, so a single average would hide exactly what you need to see.
 
-`--mode kernels` measures the Phase 3 kernels instead of the model, and reports
+`--mode kernels` measures the CUDA kernels instead of the model, and reports
 achieved memory bandwidth rather than wall-clock. That is the right score for
 RMSNorm, RoPE and SwiGLU: they do a few flops per element, so their ceiling is how
 fast the card can move the bytes, and "80% of peak bandwidth" says something a
 millisecond figure does not.
 
-`--mode throughput` (Step 5.1) measures the engine rather than a single request, and it
-is the mode the README quotes. The unit is **output tokens per second over a whole
-request set**, submitted at once, against `transformers.generate` on the same set. That
-comparison is not quite apples to apples and the asymmetry is the finding: `generate`
-takes one padded rectangle, so sixteen prompts of 32 to 512 tokens all run for 512, while
-the engine gives each sequence its own length and admits a replacement the iteration a
-request finishes. Continuous batching and paging are what that gap is made of.
+`--mode throughput` measures the engine rather than a single request, and it is the mode
+the README quotes. The unit is **output tokens per second over a whole request set**,
+submitted at once, against `transformers.generate` on the same set. That comparison is
+not quite apples to apples and the asymmetry is the finding: `generate` takes one padded
+rectangle, so sixteen prompts of 32 to 512 tokens all run for 512, while the engine gives
+each sequence its own length and admits a replacement the iteration a request finishes.
+Continuous batching and paging are what that gap is made of.
 
-`--mode scheduler` (Step 5.2) measures the *scheduler* rather than the model, on an
-adversarial mix: many 32-token requests with a 2048-token prompt dropped in every
-twentieth, arriving on a Poisson schedule. It replays that schedule twice through one
-engine — once with chunked prefill, once with the prefill-prioritized policy vLLM
-shipped before it — and reports the tail of the inter-token latency. Throughput barely
-moves between the two, which is the point: the same work is done either way, and what
-changes is who waits for it.
+`--mode scheduler` measures the *scheduler* rather than the model, on an adversarial mix:
+many 32-token requests with a 2048-token prompt dropped in every twentieth, arriving on a
+Poisson schedule. It replays that schedule twice through one engine — once with chunked
+prefill, once with the prefill-prioritized policy vLLM shipped before it — and reports
+the tail of the inter-token latency. Throughput barely moves between the two, which is
+the point: the same work is done either way, and what changes is who waits for it.
 
 Run it::
 
@@ -205,8 +204,8 @@ class ClockSampler:
 
     A single reading proves nothing: clocks ramp, and one taken at the wrong
     moment is either idle or a boost spike. The *peak over a run* answers the
-    question that matters — was the card ever allowed to go fast while we were
-    measuring it?
+    question that matters — was the card ever allowed to go fast while the
+    measurement was running?
     """
 
     def __init__(self, interval: float = 0.25) -> None:
@@ -452,8 +451,9 @@ def copy_ceiling(megabytes: int = 256, dtype: torch.dtype = torch.bfloat16) -> B
     The theoretical peak is an upper bound nothing reaches; this is the number a
     kernel that does nothing but move bytes actually gets on this machine today,
     which makes it the fairer thing to be measured against. It doubles as the
-    throttle check from Step 2.3: if this is an order of magnitude below spec, the
-    GPU is asleep and every figure below it is meaningless.
+    throttle check described at the top of this module: if this is an order of
+    magnitude below spec, the GPU is asleep and every figure below it is
+    meaningless.
     """
     elements = megabytes * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size()
     source = torch.randn(elements, device="cuda", dtype=dtype)
@@ -482,7 +482,7 @@ def rows_exceeding_l2(width: int, dtype: torch.dtype, multiple: int = 8) -> int:
     tensors a 0.6B model touches. A benchmark whose input and output both fit in
     L2 is not measuring memory bandwidth at all, and it does not fail quietly: it
     reports a number *above* the card's DRAM peak, which is the only reason the
-    problem is noticeable. See the Step 3.1 note in PLAN.md.
+    problem is noticeable.
     """
     element_size = torch.tensor([], dtype=dtype).element_size()
     l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
@@ -660,7 +660,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
         # materializes an L x S score matrix but computes it with cuBLAS, and tensor
         # cores beat any amount of shared-memory tidiness at this arithmetic intensity.
         # It is in the table because leaving it out would be choosing the shapes that
-        # flatter the kernel — see [Step 3.6] in PLAN.md, deferred on purpose.
+        # flatter the kernel; a tensor-core prefill kernel is deferred on purpose.
         for query_len, context_len in ((512, 2048), (2048, 2048)):
             blocks_each = -(-context_len // block_size)
             keys = torch.randn(
@@ -973,8 +973,8 @@ def poisson_arrivals(num_requests: int, rate: float, seed: int = 0) -> list[floa
 
     Poisson rather than evenly spaced because evenly spaced is the easy case: the hard
     thing about a scheduler is a *burst*, and exponential gaps produce them for free —
-    a third of the gaps are shorter than a third of the mean. Rate 0 means "all at
-    once", which is the throughput workload from Step 5.1 rather than a serving one.
+    a third of the gaps are shorter than a third of the mean. Rate 0 means "all at once",
+    which is the throughput benchmark's workload rather than a serving one.
     """
     if num_requests < 0:
         raise ValueError(f"num_requests must be >= 0, got {num_requests}")
@@ -1039,9 +1039,10 @@ class LatencyStats:
     """One policy's run over the stress mix, in the units an SLO is written in.
 
     `inter_token` is the gap between consecutive tokens of the *same* sequence, which
-    is the latency a caller reading a stream actually sees. Its tail is the metric this
-    step exists to move: a mean hides a stall, because one iteration spent on a
-    2048-token prompt is amortized away by the hundreds of fast iterations around it.
+    is the latency a caller reading a stream actually sees. Its tail is the metric the
+    scheduler stress benchmark exists to move: a mean hides a stall, because one iteration
+    spent on a 2048-token prompt is amortized away by the hundreds of fast iterations
+    around it.
     """
 
     label: str
@@ -1356,7 +1357,7 @@ def run_single(arguments) -> tuple[list[SingleResult], GpuState | None]:
 
 
 def _measure_uncached(model, input_ids, arguments, label, generate_ids) -> SingleResult:
-    """Time the Step 1.9 loop, for the comparison that motivates the cache."""
+    """Time the uncached generation loop, for the comparison that motivates the cache."""
     device = input_ids.device
 
     for _ in range(arguments.warmup):
@@ -1454,11 +1455,11 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--compare", default=None, choices=["hf"])
-    parser.add_argument("--no-cache", action="store_true", help="measure the Step 1.9 loop")
+    parser.add_argument("--no-cache", action="store_true", help="measure the uncached loop")
     parser.add_argument(
         "--use-cuda-kernels",
         action="store_true",
-        help="route ops through hand-written kernels where they exist (Phase 3)",
+        help="route ops through hand-written kernels where they exist",
     )
     arguments = parser.parse_args()
     if arguments.output_len is None:

@@ -1,4 +1,4 @@
-"""Step 1.6 — the embedding table, used in both directions.
+"""The embedding table, used in both directions.
 
 Qwen3-0.6B sets ``tie_word_embeddings=true``, so one matrix serves as both the
 input embedding and the output projection. That is why this is a single object
@@ -48,8 +48,9 @@ class Embedding:
         """``h @ weightᵀ`` — the tied LM head.
 
         A vocabulary-wide matmul, so this is the single most expensive op in a
-        decode step: `E x V` work to produce logits for one token. Phase 4 only
-        ever runs it on the *last* position of each sequence for that reason.
+        decode step: `E x V` work to produce logits for one token. The serving
+        layer only ever runs it on the *last* position of each sequence for that
+        reason.
         """
         if h.shape[-1] != self.dim:
             raise ValueError(f"expected last dimension {self.dim}, got {h.shape[-1]}")

@@ -1,15 +1,15 @@
-"""Steps 1.2 and 1.4 — attention, from the textbook form to Qwen3's GQA.
+"""Attention, from the textbook form to Qwen3's GQA.
 
-Two implementations live here and both are kept forever:
+Two implementations live here and both are kept:
 
 * :func:`scaled_dot_product_attention_simple` is the textbook form, `H_q == H_k`.
 * :func:`scaled_dot_product_attention_grouped` is what Qwen3 actually uses, with
   fewer key/value heads than query heads.
 
 Neither is fast. They materialize the whole `L x S` score matrix, which is
-exactly what the FlashAttention-style kernels in Steps 3.4 and 3.5 avoid. That
-is the point: these are the oracles those kernels are diffed against, so they
-are written to be obviously right rather than efficient.
+exactly what the FlashAttention-style decode and prefill kernels avoid. That is
+the point: these are the oracles those kernels are diffed against, so they are
+written to be obviously right rather than efficient.
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ def scaled_dot_product_attention_grouped(
     broadcasting line each KV head up against its own group, rather than by
     materializing ``G`` copies of K and V with ``repeat_interleave``. Same
     numbers, but no ``G``-fold duplication of the cache — which is the entire
-    reason GQA exists, and which the paged kernels in Step 4.8 depend on.
+    reason GQA exists, and which the paged attention kernels depend on.
     """
     *batch, num_query_heads, query_len, head_dim = q.shape
     num_kv_heads = k.shape[-3]
@@ -172,9 +172,9 @@ class SimpleMultiHeadAttention:
     from the weight rather than from ``E / H``, which is the assumption that
     breaks on the real model.
 
-    Superseded by the Qwen3 attention block in Step 1.8, which adds QK-norm,
-    RoPE, GQA and a cache. Kept because it is the smallest thing that can be
-    checked directly against ``torch.nn.MultiheadAttention``.
+    Superseded by the Qwen3 attention block, which adds QK-norm, RoPE, GQA and a
+    cache. Kept because it is the smallest thing that can be checked directly
+    against ``torch.nn.MultiheadAttention``.
     """
 
     def __init__(

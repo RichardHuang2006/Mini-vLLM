@@ -1,4 +1,4 @@
-"""Step 5.2 — the scheduler under an adversarial arrival schedule.
+"""The scheduler under an adversarial arrival schedule.
 
 Two claims are on trial here, and they need different instruments.
 
@@ -6,10 +6,10 @@ Two claims are on trial here, and they need different instruments.
 asserts on milliseconds is a test that fails on a busy laptop. So the tests measure the
 thing the milliseconds are made of: how many *iterations* a decoding sequence goes
 without being scheduled. That number is deterministic, it is what the wall-clock tail is
-a monotone function of, and it is the head-of-line stall stated exactly —
-[§7.2](../DESIGN.md#72-chunked-prefill) says a decode should never wait for a whole
-prompt, and "stall of 1 iteration" is that sentence in a form pytest can check.
-`bench --mode scheduler` is where the same claim is measured in milliseconds.
+a monotone function of, and it is the head-of-line stall stated exactly: a decode should
+never wait for a whole prompt, and "stall of 1 iteration" is that requirement in a form
+pytest can check. `bench --mode scheduler` is where the same claim is measured in
+milliseconds.
 
 **"A multi-thousand-request run leaks nothing"** is a claim about bookkeeping, and it
 needs volume rather than realism: thousands of requests through a pool small enough that
@@ -382,7 +382,7 @@ def test_prefill_priority_makes_a_decode_wait_for_the_prompts(engine_parts):
 
 @pytest.mark.cuda
 def test_chunking_is_what_keeps_an_iteration_inside_its_budget(engine_parts):
-    """[§7.2](../DESIGN.md#72-chunked-prefill), stated as the property it actually is.
+    """Chunked prefill's latency promise, stated as the property it actually is.
 
     With chunking off, a prompt longer than the budget still has to run, so the engine
     runs it alone and overruns — a 128-token iteration under a 32-token budget. The
@@ -407,7 +407,7 @@ def test_chunking_is_what_keeps_an_iteration_inside_its_budget(engine_parts):
 
 @pytest.mark.cuda
 def test_the_policy_does_not_change_the_answer(engine_parts):
-    """Four policies, one mix, identical tokens. The invariant Phase 4 rests on.
+    """Four policies, one mix, identical tokens. The invariant the serving layer rests on.
 
     Compared positionally rather than by sequence id: ids come from a global counter, so
     the second run of the same workload gets different ones.
@@ -477,7 +477,7 @@ def test_a_request_that_arrives_late_is_waited_for(engine_parts):
 @pytest.mark.cuda
 @pytest.mark.slow
 def test_three_thousand_requests_leak_no_blocks(engine_parts):
-    """The volume test the plan asks for: no leaks, no OOM, everything completes.
+    """The volume test: no leaks, no OOM, everything completes.
 
     All at once (`rate=0`) against a pool of 96 pages, which is a few hundred tokens —
     small enough that admission is refused constantly and preemption is routine, and

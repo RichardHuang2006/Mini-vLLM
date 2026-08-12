@@ -1,25 +1,25 @@
-// Step 4.8 — attention over a paged KV cache: the Phase 3 kernels with the gather
+// Attention over a paged KV cache: the dense-cache attention kernels with the gather
 // moved *inside*.
 //
-// Nothing about the mathematics changes. The online softmax recurrence is the one
-// from Step 3.4 and the causal offset is the one from Step 2.2. What changes is where
-// a key comes from: instead of `k[b][h][j][d]` in a contiguous per-sequence tensor,
+// Nothing about the mathematics changes. The online softmax recurrence is the one from
+// the dense-cache decode kernel and the causal offset is the one from the PyTorch
+// reference's causal mask. What changes is where a key comes from: instead of
+// `k[b][h][j][d]` in a contiguous per-sequence tensor,
 //
 //   slot = block_tables[seq][j / P] * P + (j % P)
 //   key  = key_pool[slot][h][d]
 //
 // one integer division and one modulo per key, both of which reduce to a shift and a
 // mask because `P` is a power of two. That is the entire cost of non-contiguous
-// storage ([§6.2](../DESIGN.md#62-block-table-indirection)), and doing it here rather
-// than on the host is the point: a host-side gather would copy every sequence's whole
-// cache into a contiguous temporary every iteration, which is more traffic than the
-// attention itself and is exactly what `mini_vllm/paged_attention.py` does as the
-// deliberately-slow oracle.
+// storage, and doing it here rather than on the host is the point: a host-side gather
+// would copy every sequence's whole cache into a contiguous temporary every iteration,
+// which is more traffic than the attention itself and is exactly what
+// `mini_vllm/paged_attention.py` does as the deliberately-slow oracle.
 //
 // Two kernels, because decode and prefill remain different problems:
 //
 //   decode   L == 1. One block per (sequence, query head), walking the whole context
-//            in tiles with the Step 3.4 recurrence. Memory-bound; the parallelism
+//            in tiles with the online softmax recurrence. Memory-bound; the parallelism
 //            comes from the *sequence* axis, which a served batch supplies.
 //   prefill  L > 1. One warp per query row, with K and V tiles staged in shared
 //            memory so the warps in a block share each gather, and causal masking
@@ -73,11 +73,11 @@ constexpr int kPrefillKeysPerStep = 8;
 constexpr int kMaxLanesPerThread = 8;
 constexpr int kMaxHeadDim = kMaxLanesPerThread * kWarpSize;
 
-// Splitting the key axis, as in Step 3.4. A served batch usually supplies enough
-// parallelism on the sequence axis to make this unnecessary — but "usually" is not
-// "always", and the case it misses is the one a laptop actually runs: a single
-// conversation with a long history. One sequence at S = 8192 is 16 blocks of work for
-// 36 SMs, which measured 16 GB/s of a 384 GB/s card and lost to the dense-gather
+// Splitting the key axis, as the dense-cache decode kernel does. A served batch usually
+// supplies enough parallelism on the sequence axis to make this unnecessary — but
+// "usually" is not "always", and the case it misses is the one a laptop actually runs: a
+// single conversation with a long history. One sequence at S = 8192 is 16 blocks of work
+// for 36 SMs, which measured 16 GB/s of a 384 GB/s card and lost to the dense-gather
 // oracle it is supposed to replace.
 constexpr int kMaxSplits = 32;
 constexpr int kMinKeysPerSplit = 512;
@@ -342,9 +342,9 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
   const bool active = local_row < query_len;
 
   // The causal offset. These `L` queries are the *last* `L` positions of `S`, so
-  // query `i` may see keys up to `S - L + i` — the Step 2.2 mask, as a comparison
-  // instead of a tensor. Getting this wrong is the bug that prefills correctly and
-  // then decodes nonsense, or lets a chunk see its own future.
+  // query `i` may see keys up to `S - L + i` — the PyTorch reference's causal mask, as
+  // a comparison instead of a tensor. Getting this wrong is the bug that prefills
+  // correctly and then decodes nonsense, or lets a chunk see its own future.
   const int64_t offset = context - query_len;
   const int64_t visible = active ? offset + local_row + 1 : 0;
 

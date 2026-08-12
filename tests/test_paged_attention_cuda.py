@@ -1,12 +1,13 @@
-"""Step 4.8 — paged attention kernels, against Step 4.7's dense-gather oracle.
+"""The paged attention kernels, against the `paged_attention_gathered` oracle.
 
-The oracle copies each sequence's cache out of the pool and calls Phase 1's attention;
-the kernel walks the block table inside its inner loop. Everything below is that
-comparison, at the shapes where the two could differ:
+The oracle copies each sequence's cache out of the pool and calls
+`scaled_dot_product_attention_grouped`; the kernel walks the block table inside its
+inner loop. Everything below is that comparison, at the shapes where the two could
+differ:
 
-* a **shuffled** block table, so physical order and logical order disagree. This is
-  the test the step exists for — with a freshly allocated pool the two coincide, and
-  an indexing bug looks correct.
+* a **shuffled** block table, so physical order and logical order disagree. This is the
+  case the whole file is really about — with a freshly allocated pool the two coincide,
+  and an indexing bug looks correct.
 * a **mixed** batch of prefill chunks and decode steps in one launch, where each row
   must equal what it produces alone.
 * the **split** path, where a long context is divided across blocks and merged, plus
@@ -234,7 +235,7 @@ def test_output_is_a_convex_combination_of_visible_values(extension, device):
 
 
 def test_a_mixed_batch_gives_each_sequence_what_it_gets_alone(extension, device):
-    """`[prefill(300), decode, decode, prefill(50)]` — the batch the plan asks for.
+    """`[prefill(300), decode, decode, prefill(50)]` — the batch the scheduler produces.
 
     One launch of each kernel covers it: a block whose sequence is in the other phase
     returns immediately. So the interesting failure is interference — a prefill block
@@ -296,9 +297,9 @@ def test_low_precision_stays_within_a_rounding(extension, device, dtype):
     """The kernel keeps fp32 accumulators to the store; the oracle rounds between ops.
 
     So they disagree by about one ULP of the storage type, with the kernel the more
-    accurate of the two — the same relationship Step 3.4 measured. Compared by
-    aggregate relative norm, because an elementwise bound at this magnitude mostly
-    reports magnitude.
+    accurate of the two — the same relationship the decode attention kernel has to its
+    own oracle. Compared by aggregate relative norm, because an elementwise bound at
+    this magnitude mostly reports magnitude.
     """
     case = PagedCase([512], [1], device, dtype=dtype)
     got, expected = case.kernel(extension), case.reference()

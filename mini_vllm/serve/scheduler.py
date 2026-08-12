@@ -1,34 +1,32 @@
-"""Steps 4.3 and 4.4 — continuous batching, chunked prefill, piggyback decoding.
+"""Continuous batching, chunked prefill, piggyback decoding.
 
-The idea, from Orca and [§7.1](./DESIGN.md#71-iteration-level-scheduling): re-form
-the batch **every iteration** instead of holding it fixed for a request's lifetime.
-Static batching makes every request in a batch wait for the longest one, so a batch
-of sixteen where fifteen want 20 tokens and one wants 500 spends 96% of its
-iterations mostly idle. Here a finished sequence is replaced by a waiting one at the
-same iteration boundary it finished on.
+The idea, from Orca's iteration-level scheduling: re-form the batch **every
+iteration** instead of holding it fixed for a request's lifetime. Static batching
+makes every request in a batch wait for the longest one, so a batch of sixteen where
+fifteen want 20 tokens and one wants 500 spends 96% of its iterations mostly idle.
+Here a finished sequence is replaced by a waiting one at the same iteration boundary
+it finished on.
 
 The invariant that makes it testable: **a scheduling decision may change timing,
 never output.** Whether a sequence ran alone, or beside fifteen others, or was
 preempted and recomputed, its tokens must come out identical. Every test in
 `test_scheduler.py` asserts that against a single-sequence run.
 
-[Step 4.4] adds the two policies that make the batch genuinely ragged: a prompt
-longer than `chunk_size` is spread over iterations ([§7.2](./DESIGN.md#72-chunked-prefill)),
-and whatever budget a chunk leaves is filled with pending decode steps from other
-sequences ([§7.3](./DESIGN.md#73-stall-free-piggyback-decoding)). Both are decided
-in :meth:`Scheduler.schedule` alone — the model already took explicit RoPE positions
-and an offset causal mask from Step 2.2, which is what made this a scheduler change
-instead of a rewrite.
+Two policies make the batch genuinely ragged: a prompt longer than `chunk_size` is
+spread over iterations, and whatever budget a chunk leaves is filled with pending
+decode steps from other sequences. Both are decided in :meth:`Scheduler.schedule`
+alone — the model takes explicit RoPE positions and an offset causal mask, which is
+what keeps chunking a scheduler change instead of a rewrite.
 
 Two objects live here, deliberately split:
 
 * :class:`Scheduler` is pure policy — queues, budget, status — with no tensors in
   it at all, so its decisions can be tested without a GPU.
 * :class:`DenseModelRunner` executes those decisions, and is the part
-  [Step 4.7](../block/block_manager.py) replaces. It is also where this step's
-  wall is: a dense per-sequence cache **cannot be batched**, so it runs one forward
-  pass per sequence and the "batch" buys nothing. That is not a shortcoming of the
-  scheduler; it is the reason paging exists, and it is measured in
+  `PagedModelRunner` replaces. It is also where the wall is: a dense per-sequence
+  cache **cannot be batched**, so it runs one forward pass per sequence and the
+  "batch" buys nothing. That is not a shortcoming of the scheduler; it is the reason
+  paging exists, and it is measured in
   `test_scheduler.py::test_the_dense_cache_cannot_actually_batch`.
 """
 
@@ -55,18 +53,18 @@ class SchedulerConfig:
     ``max_batched_tokens`` is the compute budget: how many token-positions one
     forward pass may cover. ``max_sequences`` is the memory-and-overhead budget on
     how many requests may be in flight. ``chunk_size`` bounds a single prefill's
-    share of an iteration ([§7.2](./DESIGN.md#72-chunked-prefill)).
+    share of an iteration.
 
-    ``enable_chunked_prefill`` defaults on as of [Step 4.4] and exists as a flag
-    because turning it off is how the tests get their reference: the same prompt in
-    one pass, which must produce the same logits as the chunked run.
+    ``enable_chunked_prefill`` defaults on and exists as a flag because turning it off
+    is how the tests get their reference: the same prompt in one pass, which must
+    produce the same logits as the chunked run.
 
     ``prefill_priority`` inverts the pass order — prompts before decode steps — which
-    is the policy vLLM shipped before chunked prefill and the baseline
-    [Step 5.2](../../PLAN.md) measures against. It is off because it is worse: with
-    it on, a prompt long enough to eat the budget leaves nothing for the sequences a
-    caller is already reading, and their next token waits for the whole prompt. Kept
-    reachable so that claim can be a number instead of an assertion.
+    is the policy vLLM shipped before chunked prefill and the baseline the benchmarks
+    measure against. It is off because it is worse: with it on, a prompt long enough
+    to eat the budget leaves nothing for the sequences a caller is already reading, and
+    their next token waits for the whole prompt. Kept reachable so that claim can be a
+    number instead of an assertion.
     """
 
     max_batched_tokens: int = 2048
@@ -145,8 +143,8 @@ class Scheduler:
         Optional because the interesting scheduling questions — fairness, chunking,
         the budget — are answerable without a pool, and a test that has to build one
         to ask them is a test that needs a GPU to ask them. With a manager, the same
-        policy runs under a second constraint: a decode step needs a slot, and a slot
-        can be unavailable ([§7.4](./DESIGN.md#74-admission-control)).
+        policy runs under a second constraint on admission: a decode step needs a slot,
+        and a slot can be unavailable.
         """
         self.config = config or SchedulerConfig()
         self.manager = manager
@@ -184,8 +182,8 @@ class Scheduler:
         1. **Decodes.** Every running sequence past its prompt takes one token. They
            are one token each, so all of them together cost less than a single
            chunk, and they are the requests with a caller already reading output —
-           making them wait behind a prefill is what
-           [§7.3](./DESIGN.md#73-stall-free-piggyback-decoding) calls the stall.
+           making them wait behind a prefill is the stall that piggyback decoding
+           exists to remove.
         2. **Prefill chunks** for sequences already admitted, filling what is left.
            A prefill that has begun holds cache and will not release it until it
            finishes, so finishing it beats starting another.
@@ -415,7 +413,7 @@ class Scheduler:
         Recompute rather than swap-to-host: the blocks go straight back to the pool
         and the sequence re-prefills over its prompt *and* its output so far. It
         costs the compute already spent on it, and it keeps the engine free of a
-        swap path — see [Step 4.1]'s `reset_for_recompute`.
+        swap path — see `Sequence.reset_for_recompute`.
 
         Back to the *front* of the waiting queue, not the back. It has been served
         before and its caller has already seen output; sending it behind requests that
@@ -436,14 +434,14 @@ class Scheduler:
 
 
 class DenseModelRunner:
-    """Executes a `SchedulerOutput` against Phase 2's per-sequence dense cache.
+    """Executes a `SchedulerOutput` against the dense per-sequence cache.
 
     **This is the wall.** A `DenseKvCache` is one contiguous `B x H x S x D` tensor
     per sequence, and two sequences at different lengths cannot share one. So a
     scheduled "batch" of `n` sequences becomes `n` separate forward passes here, and
     continuous batching buys scheduling fairness while buying **no** GPU efficiency
-    at all: the GPU sees the same one-sequence-at-a-time work it saw in Phase 2, plus
-    `n` times the launch overhead.
+    at all: the GPU sees the same one-sequence-at-a-time work an unbatched dense-cache
+    run produces, plus `n` times the launch overhead.
 
     Two ways out, and only one of them works:
 
@@ -452,9 +450,9 @@ class DenseModelRunner:
       the waste grows with the length spread.
     * *Page* the cache, so K and V live in fixed-size blocks that any sequence can
       hold in any order, and hand the kernel `cu_seqlens_q` and `context_lens` so one
-      launch covers the ragged batch. That is [Step 4.8].
+      launch covers the ragged batch. That is what the paged attention kernel does.
 
-    Keeping this class around after paging lands is deliberate: it is the oracle the
+    Keeping this class alongside the paged runner is deliberate: it is the oracle the
     paged runner is diffed against.
     """
 

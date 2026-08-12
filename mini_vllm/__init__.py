@@ -1,6 +1,4 @@
-"""Mini-vLLM — a paged-attention LLM inference engine for Qwen3, built bottom-up.
-
-See DESIGN.md for the architecture and PLAN.md for the build order.
+"""Mini-vLLM — a paged-attention LLM inference engine for Qwen3.
 
 ::
 
@@ -12,8 +10,8 @@ See DESIGN.md for the architecture and PLAN.md for the build order.
 `LLM` lives in `mini_vllm.serve.engine`, which is where it belongs but not how it
 should be spelled: the module path is an implementation detail of an engine assembled
 from a scheduler, a block manager and a paged model, and the caller needs none of that.
-Imported lazily so that `import mini_vllm.basics` in a Phase 1 test does not drag in
-transformers and a model loader.
+Imported lazily so that `import mini_vllm.basics` in a test of the readable reference
+implementation does not drag in transformers and a model loader.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Step 2.2 — the same model, but it stops recomputing the past.
+"""The same model, but it stops recomputing the past.
 
 A **fork** of `model/qwen3.py`, not a replacement. That file stays exactly as it
 was and remains the oracle: every claim made here is checked by producing the same
@@ -10,17 +10,17 @@ Three things change, and they are all about position bookkeeping:
 * Only the **new** tokens are fed in. Their keys and values join the cache, and
   attention runs against everything cached so far — so `q` has length `L` while
   `k` and `v` have length `S`.
-* RoPE positions become ``arange(offset, offset + L)`` instead of ``arange(L)``.
-  This is why Step 1.3 insisted on explicit positions.
-* The causal mask becomes ``(L, S)``, using the offset form from Step 1.4 so a
-  single decode token may attend to the entire cache.
+* RoPE positions become ``arange(offset, offset + L)`` instead of ``arange(L)``,
+  which is why the rotary embedding takes its positions explicitly rather than
+  deriving them from the sequence length.
+* The causal mask becomes ``(L, S)``, using the offset form of the reference mask so
+  a single decode token may attend to the entire cache.
 
-That same `offset` machinery is what chunked prefill needs in Phase 4, which is
-the point of building it now: Step 4.4 becomes a scheduler change rather than a
-model rewrite.
+That same `offset` machinery is what chunked prefill in the serving layer needs, so
+chunked prefill is a scheduler change rather than a model rewrite.
 
-Every op routes through `mini_vllm.kernels.ops`, so Phase 3 can swap in kernels
-without editing this file.
+Every op routes through `mini_vllm.kernels.ops`, so the CUDA kernels can be swapped
+in without editing this file.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class Qwen3CachedAttention:
         #
         # For prefill, the shorthand rather than the tensor: the mask is a pure
         # function of `(L, S)`, both of which the callee already knows, and naming
-        # it lets the Step 3.5 kernel apply it as an index comparison instead of
+        # it lets the flash prefill kernel apply it as an index comparison instead of
         # reading back an `L x S` tensor. The oracle builds exactly the same tensor
         # from the same shorthand, so nothing about the reference path changes.
         mask = None if length == 1 else "causal"

@@ -1,4 +1,4 @@
-"""Step 1.1 — linear, silu, softmax against their torch builtins."""
+"""Linear, silu, and softmax against their torch builtins."""
 
 from __future__ import annotations
 

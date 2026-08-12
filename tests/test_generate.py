@@ -1,4 +1,4 @@
-"""Step 1.9 — greedy generation against `transformers.generate`.
+"""Greedy generation against `transformers.generate`.
 
 The acceptance criterion is token identity, not similarity: greedy decoding is
 deterministic, so agreeing with HF for 32 steps means every logit that mattered
@@ -179,7 +179,7 @@ def our_greedy(ours, ids, max_tokens=32, pad_token_id=151643):
 @pytest.mark.oracle
 @pytest.mark.parametrize("prompt", PROMPTS)
 def test_matches_transformers_generate(real, prompt):
-    """The milestone check: token-identical to `generate(do_sample=False)`, 32 steps."""
+    """Token-identical to `generate(do_sample=False)` for 32 steps."""
     ours, theirs, tokenizer, device = real
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
@@ -233,7 +233,7 @@ def test_a_bf16_divergence_is_only_ever_a_near_tie(real):
 
 @pytest.mark.oracle
 def test_generated_text_is_real_language(real):
-    """A sanity check a human can read, and the milestone in one line."""
+    """A sanity check a human can read: the whole path in one line."""
     ours, _theirs, tokenizer, _device = real
     from mini_vllm.generate import Loaded
 

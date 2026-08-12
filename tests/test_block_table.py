@@ -1,9 +1,9 @@
-"""Step 4.6 — the logical-to-physical block table.
+"""The logical-to-physical block table.
 
 The implementation maps positions with shifts and masks, so the tests compare it
-against a naive `//` and `%` reference. That is the whole point of the step: the
-arithmetic is easy to write two ways, only one of them is fast, so the slow one gets
-to be the oracle.
+against a naive `//` and `%` reference. That is the whole point: the arithmetic is
+easy to write two ways, only one of them is fast, so the slow one gets to be the
+oracle.
 
 Block ids are deliberately non-monotonic throughout. Physical order matching logical
 order is precisely the case that hides an indirection bug, and after a few thousand
@@ -23,7 +23,7 @@ BLOCK_SIZES = [1, 2, 4, 8, 16, 32]
 
 
 def naive_physical_slot(block_ids, block_size: int, position: int) -> int:
-    """[§6.2](../DESIGN.md#62-block-table-indirection), transcribed literally."""
+    """The block-table indirection, transcribed literally."""
     return block_ids[position // block_size] * block_size + position % block_size
 
 
@@ -273,7 +273,7 @@ def test_slot_mapping_refuses_unoccupied_positions():
 def test_slot_mapping_round_trips_through_a_scatter():
     """Write one distinguishable value per token through the mapping, read back blocks.
 
-    This is the paged write path in miniature, and it is the test that would catch a
+    This is the paged write path end to end, and it is the test that would catch a
     mapping which is self-consistent but points into the wrong blocks.
     """
     block_size, pool_blocks = 4, 8

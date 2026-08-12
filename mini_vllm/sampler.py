@@ -1,4 +1,4 @@
-"""Step 1.10 — greedy, temperature, top-k and top-p sampling.
+"""Greedy, temperature, top-k and top-p sampling.
 
 Everything here is **vectorized across the batch with per-row parameters**, which
 is the one design constraint that matters. A server batches whatever requests

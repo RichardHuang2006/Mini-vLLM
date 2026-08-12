@@ -1,4 +1,4 @@
-"""Step 4.2 — forward batch metadata.
+"""Forward batch metadata.
 
 Every field here is an index into another, and the failure mode of a wrong index
 is not an exception but a sequence attending over another sequence's tokens. So
@@ -6,8 +6,8 @@ the tests are mostly invariants, and they are checked on construction rather tha
 at use: this object is the entire contract between the scheduler and the GPU, and
 a batch that violates it should not be constructible.
 
-The example from the plan is spelled out in `test_the_worked_example`, which is the
-one to read first.
+A worked example is spelled out in `test_the_worked_example`, which is the one to
+read first.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def batch_of(*pairs) -> ForwardBatch:
 
 
 def test_the_worked_example():
-    """`[prefill(A, 300), decode(B, 1), decode(C, 1)]` from the plan.
+    """A batch of `[prefill(A, 300), decode(B, 1), decode(C, 1)]`.
 
     B has 511 tokens computed and one just sampled, so it attends over 512; C has
     46 computed and attends over 47. Nothing about the tensor shapes says any of
@@ -83,10 +83,11 @@ def test_a_decode_step_feeds_the_token_just_sampled():
 def test_positions_resume_where_the_sequence_left_off():
     """Positions are absolute, so a chunk starting at 512 says 512.
 
-    This is the payoff of Step 1.3's explicit positions. A kernel that inferred
+    This is the payoff of RoPE taking explicit positions. A kernel that inferred
     positions from `arange(L)` would rotate a resumed chunk as if it were the start
     of the prompt, and the result is a continuation that is fluent and wrong — the
-    failure mode that motivated the whole chunk-boundary test in Step 4.4.
+    failure mode that motivated the whole chunk-boundary test in
+    `test_chunked_prefill.py`.
     """
     sequence = make(prompt_len=1000, computed=512)
 
@@ -237,8 +238,8 @@ def test_pure_decode_is_recognized():
 def test_sampling_params_come_from_the_sequences():
     """Per-row, because a batch is whatever arrived together and will not agree.
 
-    The sampler in Step 1.10 is vectorized over exactly this: row 0 greedy while
-    row 1 is at temperature 1.5, in one call.
+    The sampler in `mini_vllm/sampler.py` is vectorized over exactly this: row 0
+    greedy while row 1 is at temperature 1.5, in one call.
     """
     greedy = make(2, sampling_params=SamplingParams(temperature=0.0))
     hot = make(2, sampling_params=SamplingParams(temperature=1.5))

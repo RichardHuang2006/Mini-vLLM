@@ -1,6 +1,6 @@
-"""Steps 1.2 and 1.4 — attention against torch's SDPA and MultiheadAttention.
+"""Attention against torch's SDPA and MultiheadAttention.
 
-Test names carry `simple`, `mha`, `causal` or `grouped` so each step can run its
+Test names carry `simple`, `mha`, `causal` or `grouped` so each variant can run its
 own slice with `-k`.
 """
 
@@ -23,7 +23,7 @@ from mini_vllm.attention import (
 BATCH_SHAPES = [(2,), (2, 3), (2, 4, 3)]
 
 
-# ------------------------------------------------------- Step 1.2: simple SDPA
+# ----------------------------------------------------------------- simple SDPA
 
 
 @pytest.mark.parametrize("batch", BATCH_SHAPES)
@@ -103,11 +103,11 @@ def test_simple_attention_rejects_unknown_mask_shorthand():
         scaled_dot_product_attention_simple(q, k, v, mask="bidirectional")
 
 
-# --------------------------------------------------------------- Step 1.2: MHA
+# ------------------------------------------------------------------------- MHA
 
 
 def _torch_mha(hidden_size, num_heads, wq, wk, wv, wo):
-    """torch's MultiheadAttention wired up with our weights."""
+    """torch's MultiheadAttention wired up with the same weights."""
     reference = torch.nn.MultiheadAttention(
         hidden_size, num_heads, bias=False, batch_first=True
     )
@@ -167,7 +167,7 @@ def test_mha_rejects_head_count_that_does_not_divide_the_projection():
         )
 
 
-# ------------------------------------------------------ Step 1.4: causal masks
+# ---------------------------------------------------------------- causal masks
 
 
 @pytest.mark.parametrize("length", [1, 2, 5])
@@ -219,7 +219,7 @@ def test_causal_mask_respects_dtype(dtype):
     assert torch.isneginf(mask[0, 1])
 
 
-# ------------------------------------------------- Step 1.4: grouped attention
+# ----------------------------------------------------------- grouped attention
 
 
 @pytest.mark.parametrize(

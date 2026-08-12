@@ -1,9 +1,9 @@
-"""Step 4.5 — block pool allocation and reference counting.
+"""Block pool allocation and reference counting.
 
 No GPU, no tensors, no model: every test here runs in microseconds, which is exactly
 why this layer is worth testing exhaustively. A refcount bug that escapes this file
-resurfaces in Phase 5 as an out-of-memory after four thousand requests, with nothing
-left to say which one of them leaked.
+resurfaces in the benchmarks as an out-of-memory after four thousand requests, with
+nothing left to say which one of them leaked.
 
 The last section is a `hypothesis` state machine driving random allocate / incref /
 decref sequences against a plain dict. It is the part that finds what hand-written
@@ -167,7 +167,7 @@ def test_decref_many_reports_how_many_it_freed(pool: BlockPool):
 
 
 def test_a_shared_block_survives_until_its_last_holder(pool: BlockPool):
-    """The mechanism behind fork and prefix reuse ([§6.3](../DESIGN.md#63-copy-on-write-sharing))."""
+    """The mechanism behind copy-on-write sharing: fork and prefix reuse."""
     block_id = pool.allocate()
     pool.incref(block_id)
     pool.incref(block_id)

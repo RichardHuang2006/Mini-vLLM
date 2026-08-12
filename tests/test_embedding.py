@@ -1,4 +1,4 @@
-"""Step 1.6 — the embedding table in both directions."""
+"""The embedding table in both directions."""
 
 from __future__ import annotations
 

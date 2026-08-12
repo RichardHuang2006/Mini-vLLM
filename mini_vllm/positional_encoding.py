@@ -1,15 +1,15 @@
-"""Step 1.3 — rotary position embedding, driven by an explicit position tensor.
+"""Rotary position embedding, driven by an explicit position tensor.
 
 The one design decision that matters here is the interface, not the arithmetic:
 :meth:`RoPE.__call__` takes the absolute position of every token as a tensor and
 never assumes ``arange(L)``.
 
-That costs nothing now and is what makes Phase 4 possible. A decode step for a
-sequence at position 500 and a prefill chunk covering positions 0-511 have to
-share a single forward pass (DESIGN.md §7.3), so position is a property of each
-token rather than of the batch. An implicit ``arange`` here would have to be torn
-out later, and the resulting bug — correct prefill, subtly wrong continuation —
-is among the hardest in the project to see.
+That costs nothing and is what makes the serving layer possible. A decode step
+for a sequence at position 500 and a prefill chunk covering positions 0-511 have
+to share a single forward pass, so position is a property of each token rather
+than of the batch. An implicit ``arange`` here would have to be torn out to
+support that, and the resulting bug — correct prefill, subtly wrong continuation
+— is among the hardest in the project to see.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def apply_rope(
         out:       same shape and dtype as x
 
     Split out from :class:`RoPE` so it can take the tables as plain tensors: the
-    fused kernel in Step 3.2 has the same signature, which lets
+    fused RoPE kernel has the same signature, which lets
     `mini_vllm.kernels.ops.rope` dispatch between the two without either side
     knowing about the other.
     """
@@ -72,8 +72,8 @@ class RoPE:
         out:       same shape as x
 
     ``cos`` and ``sin`` are exposed as attributes because the fused RoPE kernel
-    in Step 3.2 reads these same tables directly, and it must agree with this
-    implementation row for row.
+    reads these same tables directly, and it must agree with this implementation
+    row for row.
     """
 
     def __init__(

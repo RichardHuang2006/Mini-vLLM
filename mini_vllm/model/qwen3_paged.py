@@ -1,16 +1,17 @@
-"""Step 4.9 — Qwen3 over a ragged batch and a paged cache.
+"""Qwen3 over a ragged batch and a paged cache.
 
-The third and last fork of the model, and the shortest hop of the three. Step 1.8's
-version recomputed everything; Step 2.2's kept a dense cache per sequence; this one
-keeps no cache of its own at all. It is handed a `ForwardBatch` and a `BlockManager`
-and writes its keys and values straight into the pool.
+The third and last fork of the model, and the smallest departure of the three. The
+version in `model/qwen3.py` recomputed everything; the one in `model/qwen3_cached.py`
+kept a dense cache per sequence; this one keeps no cache of its own at all. It is
+handed a `ForwardBatch` and a `BlockManager` and writes its keys and values straight
+into the pool.
 
 Two changes from `qwen3_cached.py`, and both are about shape rather than mathematics:
 
 * **No batch axis.** Activations are `T x ...` where `T` is every scheduled token in
   the iteration, sequences concatenated. A padded `B x L` rectangle is what paging
   exists to avoid, and reintroducing one here to keep the code familiar would give
-  back the memory the last five steps spent buying.
+  back the memory the paged cache exists to buy.
 * **Attention takes metadata instead of tensors.** `cu_seqlens_q` says which rows
   belong to which sequence, `context_lens` how far back each may look, and the block
   tables where its pages are. One call covers a 512-token prefill chunk and eleven
