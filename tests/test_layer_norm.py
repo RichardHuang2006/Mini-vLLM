@@ -1,4 +1,4 @@
-"""Step 1.5 — RMSNorm against HuggingFace's Qwen3RMSNorm."""
+"""RMSNorm against HuggingFace's Qwen3RMSNorm."""
 
 from __future__ import annotations
 

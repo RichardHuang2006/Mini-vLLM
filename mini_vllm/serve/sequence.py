@@ -1,4 +1,4 @@
-"""Step 4.1 — one request's state, from arrival to completion.
+"""One request's state, from arrival to completion.
 
 The whole file exists to make two numbers distinguishable:
 
@@ -7,12 +7,12 @@ The whole file exists to make two numbers distinguishable:
   keys and values are therefore in the cache.
 
 In a naive engine those are the same number and the distinction looks like
-bookkeeping for its own sake. It is not: their difference **is** chunked prefill
-(:doc:`DESIGN.md` §7.2). A sequence with 2000 prompt tokens and 512 computed is
-mid-prefill, and everything the scheduler needs to know to resume it — where RoPE
-positions start, how many tokens to feed, how long the causal mask's key axis is —
-follows from that one counter. Modelling it now means [Step 4.4] is a scheduler
-change rather than a rewrite of this class.
+bookkeeping for its own sake. It is not: their difference **is** chunked prefill. A
+sequence with 2000 prompt tokens and 512 computed is mid-prefill, and everything the
+scheduler needs to know to resume it — where RoPE positions start, how many tokens to
+feed, how long the causal mask's key axis is — follows from that one counter. Modelling
+it here is what keeps chunked prefill a scheduler change rather than a rewrite of this
+class.
 
 The status machine is here for a different reason: preemption. A sequence can go
 back to waiting after having run, and its already-computed tokens are then thrown
@@ -94,10 +94,10 @@ class Sequence:
     num_computed_tokens: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
 
-    # The sequence's pages, set by the block manager ([Step 4.7]) and the single home
-    # for them: the manager reads and writes this field rather than keeping a registry
-    # of its own, because two places recording which blocks a sequence holds is two
-    # places that can disagree about when to free them.
+    # The sequence's pages, set by the block manager and the single home for them: the
+    # manager reads and writes this field rather than keeping a registry of its own,
+    # because two places recording which blocks a sequence holds is two places that can
+    # disagree about when to free them.
     block_table: BlockTable | None = None
 
     def __post_init__(self) -> None:
@@ -201,7 +201,7 @@ class Sequence:
         Preemption by recomputation rather than by swapping to host memory: the
         blocks go back to the pool and the sequence starts its prefill again, over
         prompt *and* output this time. It costs the compute already spent, and it
-        keeps the engine free of a swap path — the trade [Step 4.3] makes explicit.
+        keeps the engine free of a swap path — the trade the scheduler makes explicit.
 
         Dropping the table is *not* the same as releasing the blocks, and this refuses
         to do the first without the second. Forgetting the pointer to pages the pool

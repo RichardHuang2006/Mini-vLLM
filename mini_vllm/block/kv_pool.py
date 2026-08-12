@@ -1,7 +1,6 @@
-"""Step 4.7 — the physical KV storage the block ids index into.
+"""The physical KV storage the block ids index into.
 
-[§6.1](../DESIGN.md#61-physical-layout): one pre-allocated pool, partitioned into
-fixed-size pages of `P` tokens.
+One pre-allocated pool, partitioned into fixed-size pages of `P` tokens.
 
 ::
 
@@ -18,8 +17,8 @@ Two operations, and the asymmetry between them is the design:
 * :meth:`write` scatters this iteration's new keys and values into whatever slots the
   block tables say, in one indexed copy per layer. Physical order is irrelevant.
 * :meth:`gather` collects one sequence's cache back into a contiguous tensor, which is
-  **not** what the engine wants to do — it is the slow, obviously-correct path that
-  [Step 4.8]'s kernel is diffed against. Doing this gather for real would copy the
+  **not** what the engine wants to do — it is the slow, obviously-correct path that the
+  paged attention kernel is diffed against. Doing this gather for real would copy the
   entire cache every iteration and defeat the purpose.
 """
 
@@ -169,9 +168,10 @@ class PagedKvPool:
 
             returns: 1 x H_k x num_tokens x D, keys and values
 
-        The shape is the one Phase 1's attention takes, so this is what makes a paged
-        cache testable against a dense one. It is a **copy** — the gather every real
-        paged kernel exists to avoid — and is here only as the oracle.
+        The shape is the one the readable reference implementation's attention takes,
+        so this is what makes a paged cache testable against a dense one. It is a
+        **copy** — the gather every real paged kernel exists to avoid — and is here
+        only as the oracle.
         """
         self._check_layer(layer)
         needed = -(-num_tokens // self.block_size)  # ceiling division

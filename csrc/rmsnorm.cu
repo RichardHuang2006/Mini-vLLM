@@ -1,4 +1,4 @@
-// Step 3.1 — RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight, over the last dim.
+// RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight, over the last dim.
 //
 // The oracle is `rms_norm` in mini_vllm/layer_norm.py, and this kernel is only
 // correct insofar as it agrees with it. Two details of that function are load
@@ -9,10 +9,10 @@
 //     weight multiply, which is what HuggingFace does.
 //
 // The shape of the kernel — one block per row, a warp-shuffle reduction for the
-// statistic, 16-byte vectorized loads — is the pattern every later elementwise
-// kernel in the project reuses (DESIGN.md §5.1). The op is memory-bound, so the
-// number worth reporting is achieved bandwidth against the card's peak, not
-// wall-clock; `python -m mini_vllm.bench --mode kernels` prints it.
+// statistic, 16-byte vectorized loads — is the pattern the other elementwise
+// kernels in csrc/ reuse. The op is memory-bound, so the number worth reporting
+// is achieved bandwidth against the card's peak, not wall-clock;
+// `python -m mini_vllm.bench --mode kernels` prints it.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>

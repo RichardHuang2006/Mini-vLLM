@@ -1,4 +1,4 @@
-"""Step 1.7 — the checkpoint loader, against `transformers` itself.
+"""The checkpoint loader, against `transformers` itself.
 
 Most of this file is marked `oracle` because it needs the real Qwen3-0.6B
 weights. The mapping logic is pure string manipulation though, so that part is
@@ -24,8 +24,8 @@ from mini_vllm.model.loader import (
     resolve_model_path,
 )
 
-# DESIGN.md §3, the architecture table. Hardcoded so a silently different
-# checkpoint is caught rather than absorbed.
+# The Qwen3-0.6B architecture table. Hardcoded so a silently different checkpoint
+# is caught rather than absorbed.
 QWEN3_06B = {
     "num_hidden_layers": 28,
     "hidden_size": 1024,
@@ -124,7 +124,7 @@ def test_config_matches_the_design_document(model_path):
     config = ModelConfig.from_dict(raw)
 
     for field, value in QWEN3_06B.items():
-        assert getattr(config, field) == value, f"{field} differs from DESIGN.md §3"
+        assert getattr(config, field) == value, f"{field} differs from QWEN3_06B"
     assert config.dtype is torch.bfloat16
 
 

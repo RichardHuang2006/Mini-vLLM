@@ -1,11 +1,11 @@
-"""Step 1.5 — RMSNorm.
+"""RMSNorm.
 
 Qwen3 uses this in three places, and the third is easy to miss: before attention,
 before the MLP, and *inside* attention as QK-norm, applied over the head
-dimension of `q` and `k` (DESIGN.md §3). The same function serves all three; only
-the axis width differs.
+dimension of `q` and `k`. The same function serves all three; only the axis width
+differs.
 
-Kept forever as the oracle for the CUDA kernel in Step 3.1.
+Kept as the oracle for the CUDA RMSNorm kernel.
 """
 
 from __future__ import annotations

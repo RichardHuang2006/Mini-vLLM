@@ -1,8 +1,8 @@
-"""Step 0.1 — the environment and the CUDA extension pipeline are usable.
+"""The environment and the CUDA extension pipeline are usable.
 
-Everything in Phase 3 and 4 assumes a working `csrc/` build, so this file's job
-is to fail loudly and early if the toolchain is not what the rest of the plan
-expects, rather than letting a version mismatch surface later while a real
+The CUDA kernels and the serving layer both assume a working `csrc/` build, so this
+file's job is to fail loudly and early if the toolchain is not what the rest of the
+project expects, rather than letting a version mismatch surface later while a real
 kernel is also being debugged.
 """
 
@@ -18,7 +18,7 @@ from mini_vllm.kernels import extension
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# DESIGN.md §10 fixes the hardware of record: RTX 5070 Laptop, Blackwell sm_120.
+# The hardware of record: RTX 5070 Laptop, Blackwell sm_120.
 EXPECTED_CAPABILITY = (12, 0)
 
 
@@ -50,7 +50,7 @@ def test_device_is_the_hardware_of_record():
 
 
 def test_markers_are_registered(pytestconfig):
-    """Every marker the plan uses is declared, so no test is silently skipped.
+    """Every marker the suite uses is declared, so no test is silently skipped.
 
     An unregistered marker is a warning, not an error, which makes it exactly
     the kind of thing that rots quietly.
@@ -63,7 +63,7 @@ def test_markers_are_registered(pytestconfig):
 
 
 def test_resolved_nvcc_major_matches_torch():
-    """The crux of Step 0.1.
+    """The crux of the toolchain check.
 
     torch.utils.cpp_extension refuses to compile when nvcc's major version
     differs from the one torch was built against. The system nvcc on this
@@ -108,7 +108,7 @@ def test_toolchain_report_is_complete():
 
 @pytest.mark.cuda
 def test_extension_builds_and_loads():
-    """It compiles, links, and the symbol is callable. The whole point of 0.1."""
+    """It compiles, links, and the symbol is callable — the point of the whole pipeline."""
     module = extension.load_extension()
     assert hasattr(module, "hello"), "extension built but does not export hello"
 
@@ -123,8 +123,8 @@ def test_extension_is_cached():
 def test_hello_matches_torch(dtype):
     """y = a*x + b, against the same expression in PyTorch.
 
-    This is the shape of every kernel test in Phase 3: the kernel is only
-    correct insofar as it agrees with a readable implementation.
+    This is the shape of every CUDA kernel test: the kernel is only correct
+    insofar as it agrees with a readable implementation.
     """
     module = extension.load_extension()
     x = torch.randn(4096, device="cuda", dtype=dtype)

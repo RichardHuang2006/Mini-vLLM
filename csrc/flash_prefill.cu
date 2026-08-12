@@ -1,7 +1,7 @@
-// Step 3.5 — flash prefill: many query tokens against many keys, causally masked.
+// Flash prefill: many query tokens against many keys, causally masked.
 //
-// Same recurrence as Step 3.4, but with `L > 1` there is a second axis to tile,
-// and two things change because of it.
+// Same recurrence as the decode attention kernel, but with `L > 1` there is a
+// second axis to tile, and two things change because of it.
 //
 // **Shared memory earns its place.** In decode each K element is touched by
 // exactly one dot product, so staging it would be a pure copy. Here every K
@@ -75,8 +75,9 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   const int64_t sequence = blockIdx.z;
   const int64_t kv_head = query_head / group_size;
 
-  // The Step 1.4 offset form: with a filled cache the `L` queries are the *last*
-  // `L` positions of the sequence, so the diagonal is shifted right by S - L.
+  // The offset form of the causal mask in the PyTorch reference: with a filled
+  // cache the `L` queries are the *last* `L` positions of the sequence, so the
+  // diagonal is shifted right by S - L.
   const int64_t offset = source_len - query_len;
 
   const scalar_t* query = q + sequence * q_strides.batch + query_head * q_strides.head;

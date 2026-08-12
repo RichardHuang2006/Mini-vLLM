@@ -1,4 +1,4 @@
-// Step 3.4 — decode attention, one query token against the whole cache.
+// Decode attention: one query token against the whole cache.
 //
 // The oracle materializes the full `1 x S` score row, then reads it twice: once
 // for the max, once for the sum. At S = 40960 that row is 160 KB per head, and
@@ -28,8 +28,8 @@
 //                walks the tile — again coalesced, since neighbouring threads
 //                read neighbouring d.
 //
-// K and V are read exactly once each per block, so unlike the prefill kernel in
-// Step 3.5 there is nothing to gain by staging them in shared memory: with one
+// K and V are read exactly once each per block, so unlike the flash prefill
+// kernel there is nothing to gain by staging them in shared memory: with one
 // block per query head, no two dot products in a block share a key element.
 //
 // One block per (sequence, head) is not enough blocks, though, and the benchmark

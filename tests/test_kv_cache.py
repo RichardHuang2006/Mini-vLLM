@@ -1,8 +1,8 @@
-"""Step 2.1 — the dense KV cache.
+"""The dense KV cache.
 
 The oracle is `torch.cat`: whatever order tokens arrive in, the cache must hold
 exactly what concatenating them all at once would have produced. That is the whole
-correctness claim, and it is what lets Step 2.2 trust the cached model.
+correctness claim, and it is what lets the cached model trust the cache.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def kv(length: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def test_dense_cache_satisfies_the_interface():
-    """The ABC is the contract the paged cache will have to meet in Step 4.7."""
+    """The ABC is the contract the paged cache has to meet as well."""
     assert isinstance(DenseKvCache(), KvCache)
 
 
@@ -79,7 +79,7 @@ def test_returned_offset_is_the_write_position_not_the_new_length():
 
 @pytest.mark.parametrize("steps", [1, 2, 8, 33])
 def test_appending_one_token_at_a_time_matches_one_concat(steps):
-    """The plan's criterion: `S` single-token appends equal one `concat`."""
+    """`S` single-token appends equal one `concat`."""
     pieces = [kv(1) for _ in range(steps)]
 
     cache = DenseKvCache()
@@ -107,7 +107,7 @@ def test_prefill_then_decode_matches_one_concat():
 
 
 def test_chunked_writes_match_one_concat():
-    """Ragged chunk sizes, as chunked prefill will produce in Phase 4."""
+    """Ragged chunk sizes, as chunked prefill in the serving layer produces."""
     chunks = [kv(n) for n in (5, 1, 1, 9, 2)]
 
     cache = DenseKvCache()

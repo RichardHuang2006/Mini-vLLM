@@ -1,4 +1,4 @@
-"""Step 3.5 — flash prefill against the Step 1.4 oracle.
+"""Flash prefill against the `mini_vllm.attention` oracle.
 
 Prefill adds one thing decode did not have: a mask. So most of these tests are
 about the diagonal, because that is where the two failure modes live, and they are
@@ -13,8 +13,8 @@ not symmetric.
   through a tolerance, by perturbing a later key and asserting an earlier query's
   output does not move at all.
 
-The tile is 16 wide, so lengths are tested at 16, 17, 31, 32 and 33 — the plan's
-"one token past a tile boundary" in both directions.
+The tile is 16 wide, so lengths are tested at 16, 17, 31, 32 and 33 — one token past a
+tile boundary in both directions.
 """
 
 from __future__ import annotations
@@ -109,9 +109,9 @@ def test_every_query_tile_boundary(kernel, query_len):
 def test_a_prefix_already_in_the_cache(kernel, query_len, source_len):
     """`S > L`: the queries are the *last* `L` positions, not the first.
 
-    This is chunked prefill's shape (Step 4.4) and prefix reuse's shape. The
-    diagonal shifts right by `S - L`, so a kernel that assumes a square lower
-    triangle gets a mask that is far too tight and every one of these fails.
+    This is chunked prefill's shape and prefix reuse's shape. The diagonal shifts
+    right by `S - L`, so a kernel that assumes a square lower triangle gets a mask
+    that is far too tight and every one of these fails.
     """
     num_query_heads, num_kv_heads, head_dim = QWEN3_HEADS
     q, k, v = triple(
@@ -160,7 +160,7 @@ def test_matches_decode_for_the_last_position(kernel):
     Two kernels, two entirely different decompositions — tiled queries with a
     diagonal mask versus a split key axis with none — and they must agree on the
     one row where their problems coincide. Nothing else in the suite checks the
-    two Phase 3 attention kernels against *each other*.
+    two CUDA attention kernels against *each other*.
     """
     num_query_heads, num_kv_heads, head_dim = QWEN3_HEADS
     q, k, v = triple(1, num_query_heads, num_kv_heads, 40, 40, head_dim, torch.float32)
@@ -272,8 +272,8 @@ def test_dispatch_deliberately_keeps_prefill_on_torch(kernel):
 
     Its inner loop is scalar FMA against cuBLAS on tensor cores: 0.4x at L=512, so
     routing to it would make time-to-first-token worse in exchange for nothing.
-    Step 3.6 replaces the loop with `mma.sync` and is what flips it. What this test
-    pins is that the choice is *stated* — the op appears in the dispatch report as
+    Replacing that loop with `mma.sync` is what would flip it. What this test pins
+    is that the choice is *stated* — the op appears in the dispatch report as
     `torch` with the reason attached, rather than being quietly absent.
     """
     assert "flash_prefill" in ops.cuda_kernel_names(), "the kernel exists and is claimed"
@@ -282,7 +282,7 @@ def test_dispatch_deliberately_keeps_prefill_on_torch(kernel):
         row for row in ops.dispatch_report(use_cuda=True).splitlines() if "flash_prefill" in row
     )
     assert line.split()[:2] == ["flash_prefill", "torch"]
-    assert "slower" in line and "Step 3.6" in line, f"routed away with no reason: {line!r}"
+    assert "slower" in line and "cuBLAS" in line, f"routed away with no reason: {line!r}"
 
     q, k, v = triple(1, 16, 8, 40, 40, 128, torch.bfloat16)
     assert_allclose(
@@ -292,7 +292,7 @@ def test_dispatch_deliberately_keeps_prefill_on_torch(kernel):
 
 @pytest.fixture
 def prefill_preferred(monkeypatch):
-    """Route prefill to the kernel, as Step 3.6 will once it is worth preferring.
+    """Route prefill to the kernel, as the dispatch will once it is worth preferring.
 
     Everything the kernel promises has to keep holding through the dispatch and
     through the model, or flipping that one entry later becomes an unbounded
@@ -365,12 +365,12 @@ def test_model_prefill_is_token_identical(tiny_qwen3, device, prefill_preferred)
 
 
 def test_a_chunked_prompt_matches_one_pass(tiny_qwen3, device, prefill_preferred):
-    """Prefill in two chunks against prefill in one, which is Step 4.4's contract.
+    """Prefill in two chunks against prefill in one, which is chunked prefill's contract.
 
     The second chunk is a query length of 24 against a cache of 40 — the `S > L`
     shape — so this is where a diagonal that ignores the `S - L` offset shows up as
     a chunk boundary that ruins the continuation. Worth having here rather than
-    only in Phase 4: if it fails, the kernel is the reason.
+    only in the serving layer's tests: if it fails, the kernel is the reason.
     """
     theirs = tiny_qwen3.to(device=device, dtype=torch.float32)
     config, weights = config_from_hf(theirs), weights_from_hf(theirs)

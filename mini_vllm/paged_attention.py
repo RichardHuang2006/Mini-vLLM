@@ -1,15 +1,15 @@
-"""Step 4.7 — paged attention, written to be obviously correct rather than fast.
+"""Paged attention, written to be obviously correct rather than fast.
 
-The oracle for [Step 4.8]'s kernel. It does the one thing a real paged implementation
-must never do: for each sequence, walk the block table and **copy** that sequence's
-keys and values out of the pool into a contiguous tensor, then call Phase 1's
-attention on it.
+The oracle for the paged attention kernels. It does the one thing a real paged
+implementation must never do: for each sequence, walk the block table and **copy**
+that sequence's keys and values out of the pool into a contiguous tensor, then call
+the readable reference implementation's attention on it.
 
 That is a full copy of the cache every iteration — precisely the traffic paging
 exists to avoid, and worse than the dense cache it replaces. It is also correct by
-construction, which is the point: `scaled_dot_product_attention_grouped` has been the
-reference since Step 1.4, so if the gather is right then the answer is right, and the
-kernel has something exact to be diffed against.
+construction, which is the point: `scaled_dot_product_attention_grouped` is the
+reference, so if the gather is right then the answer is right, and the kernel has
+something exact to be diffed against.
 
 ::
 
@@ -45,8 +45,8 @@ def paged_attention_gathered(
     """Grouped-query causal attention over a paged cache, one sequence at a time.
 
     `key_pool` and `value_pool` are one layer's pages, `num_blocks x P x H_k x D`.
-    Every sequence is masked causally with its own `(L, S)` offset, which is the
-    Step 2.2 mask: a decode step's single query sees the whole context, and a prefill
+    Every sequence is masked causally with its own `(L, S)` offset, which is the cached
+    model's mask: a decode step's single query sees the whole context, and a prefill
     chunk's queries are the *last* `L` positions of `S` and see the diagonal shifted
     right by `S - L`.
     """

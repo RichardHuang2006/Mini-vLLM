@@ -3,7 +3,7 @@
 // Shared between the kernels only. Nothing here is shared with `mini_vllm/`,
 // because the PyTorch implementations there are the oracles these kernels are
 // diffed against, and an oracle that shared code with the thing it validates
-// would be comparing an implementation against itself (PLAN.md "Repo layout").
+// would be comparing an implementation against itself.
 
 #pragma once
 
@@ -75,8 +75,9 @@ __device__ __forceinline__ float warp_all_reduce_sum(float value) {
   return value;
 }
 
-// The same tree, for a maximum. Needed by the online softmax in Step 3.4, where
-// the running max and the running sum are reduced side by side.
+// The same tree, for a maximum. Needed by the online softmax in the decode
+// attention kernels, where the running max and the running sum are reduced side
+// by side.
 __device__ __forceinline__ float warp_reduce_max(float value) {
 #pragma unroll
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {

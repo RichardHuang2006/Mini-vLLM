@@ -1,4 +1,4 @@
-"""Step 3.4 — decode attention (online softmax) against the Step 1.4 oracle.
+"""Decode attention (online softmax) against the `mini_vllm.attention` oracle.
 
 The oracle materializes the whole `1 x S` score row and reads it twice. This
 kernel never materializes it, carrying `(m, l, O)` in FP32 registers instead, so
@@ -85,7 +85,7 @@ def test_every_tile_boundary(kernel, source_len):
 def test_survives_a_late_spike(kernel):
     """The maximum arrives in the last tile, so every accumulator is rescaled.
 
-    This is the test the plan's warning is about. A kernel that rescales the
+    This is the recurrence's classic failure. A kernel that rescales the
     running sum `l` but not the running output `O` still produces weights that
     sum to one, so the output looks like a plausible convex combination and
     nothing raises — it is simply the wrong combination. Putting the spike last
@@ -308,7 +308,7 @@ def test_dispatch_routes_decode_to_the_kernel(kernel):
 
 
 def test_dispatch_keeps_prefill_on_torch():
-    """`L > 1` has no kernel until Step 3.5, and must not reach this one."""
+    """`L > 1` is prefill's shape, and must not reach the decode kernel."""
     q = torch.randn(1, 16, 4, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 8, 4, 128, device="cuda", dtype=torch.bfloat16)
 
@@ -386,7 +386,7 @@ def test_model_decode_agrees_in_bf16(tiny_qwen3, device):
 def test_real_model_is_token_identical():
     """Four kernels, the real 0.6B checkpoint, 48 greedy tokens. Same tokens.
 
-    Longer than the earlier steps' runs on purpose: this is the first kernel whose
+    Longer than the elementwise kernels' end-to-end runs on purpose: this kernel's
     work *grows* with the context, so a rescaling bug that is invisible inside one
     tile becomes visible once decode has walked past 64 cached keys.
     """

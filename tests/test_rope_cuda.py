@@ -1,11 +1,10 @@
-"""Step 3.2 — the RoPE kernel against the PyTorch rotation it replaces.
+"""The RoPE kernel against the PyTorch rotation it replaces.
 
-The oracle is `mini_vllm.positional_encoding.apply_rope`, which Step 1.3 already
-checked against HuggingFace's own rotary embedding. So the question here is only
-whether the fused kernel gathers the same table rows and applies the same
-rotation.
+The oracle is `mini_vllm.positional_encoding.apply_rope`, itself already checked
+against HuggingFace's own rotary embedding. So the question here is only whether
+the fused kernel gathers the same table rows and applies the same rotation.
 
-Position bookkeeping is what this step can get wrong, and it fails quietly: a
+Position bookkeeping is what the kernel can get wrong, and it fails quietly: a
 rotation by the wrong angle produces a plausible tensor, not an error. So the
 tests lean on *positions the model will really pass* — a prefill's `arange`, a
 decode step at a large offset, and positions that do not start at zero — plus the
@@ -47,7 +46,10 @@ def kernel(device):
 
 @pytest.fixture
 def rope(device):
-    """The Step 1.3 tables, on the GPU. The kernel reads these exact tensors."""
+    """The RoPE tables from `mini_vllm.positional_encoding`, on the GPU.
+
+    The kernel reads these exact tensors.
+    """
     return RoPE(HEAD_DIM, MAX_SEQ_LEN, THETA, device="cuda")
 
 
@@ -103,8 +105,9 @@ def test_positions_need_not_be_contiguous(kernel, rope):
     """Shuffled positions prove the gather is a real lookup, not an `arange`.
 
     A kernel that quietly used its own token index would pass every test above
-    and fail this one — and in Phase 4 the positions in a single batch genuinely
-    are unordered, because a prefill chunk and several decodes share one pass.
+    and fail this one — and in the serving layer the positions in a single batch
+    genuinely are unordered, because a prefill chunk and several decodes share one
+    pass.
     """
     x = torch.randn(2, 8, 4, HEAD_DIM, device="cuda", dtype=torch.float32)
     positions = torch.tensor([300, 0, 17, 511, 5, 128, 64, 2], device="cuda")
@@ -257,7 +260,7 @@ def test_rejects_an_odd_head_dimension(kernel):
 
 
 def test_rejects_bf16_tables(kernel, rope):
-    """The tables stay fp32 even when activations do not — see Step 1.3."""
+    """The tables stay fp32 even when activations do not, which is how `RoPE` builds them."""
     x = torch.randn(1, 2, 4, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
 
     with pytest.raises(RuntimeError, match="must be float32"):
@@ -358,7 +361,7 @@ def tiny_pair(tiny_qwen3, device):
 
 
 def test_model_greedy_output_is_token_identical(tiny_pair):
-    """Now with two kernels live, so this is cumulative: RMSNorm *and* RoPE."""
+    """Two kernels live in one model, so this is cumulative: RMSNorm *and* RoPE."""
     torch_path, cuda_path = tiny_pair(torch.float32)
     ids = torch.randint(0, TINY_QWEN3_DIMS["vocab_size"], (1, 5), device="cuda")
 

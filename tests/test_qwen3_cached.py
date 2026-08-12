@@ -1,9 +1,9 @@
-"""Step 2.2 — the cached model against the uncached one.
+"""The cached model against the uncached one.
 
 The cache is an optimization, so the bar is not "close" but **identical**: for the
-same tokens, the cached model must produce the same logits as Step 1.8's model and
-the same greedy tokens as Step 1.9's loop. Anything less means it changed the
-model's behaviour, which is the one thing an optimization may not do.
+same tokens, the cached model must produce the same logits as the uncached `Qwen3`
+and the same greedy tokens as the uncached `generate_ids` loop. Anything less means
+it changed the model's behaviour, which is the one thing an optimization may not do.
 
 Most of these run on `tiny_qwen3` and need no download. The `oracle` ones close the
 loop against `transformers.generate`.
@@ -63,7 +63,7 @@ def test_rejects_the_wrong_number_of_caches(pair):
 
 
 def test_the_uncached_model_is_untouched(pair):
-    """The fork must not have changed Step 1.8's model, which is the oracle."""
+    """The fork must not have changed the uncached model, which is the oracle."""
     from mini_vllm.model.qwen3 import Qwen3
 
     naive, _cached, _vocab = pair
@@ -159,7 +159,7 @@ def test_token_by_token_matches_one_prefill(pair):
 
 
 def test_chunked_prefill_matches_one_prefill(pair):
-    """Ragged chunks, which is exactly what Step 4.4's scheduler will produce."""
+    """Ragged chunks, which is exactly what the scheduler produces."""
     _naive, cached, vocab = pair
     ids = torch.randint(0, vocab, (1, 12))
 
@@ -255,7 +255,7 @@ def test_resetting_caches_allows_a_second_sequence(pair):
 
 
 def test_cached_greedy_matches_the_naive_loop(pair):
-    """Step 2.2's loop against Step 1.9's, token for token."""
+    """The cached loop against the uncached one, token for token."""
     naive, cached, vocab = pair
     ids = torch.randint(0, vocab, (1, 5))
 
@@ -294,7 +294,7 @@ def test_cached_loop_rejects_unbatched_input(pair):
 
 
 def test_caches_can_be_supplied_by_the_caller(pair):
-    """Phase 4's engine will own the caches, so the loop must accept them."""
+    """The serving engine owns the caches, so the loop must accept them."""
     _naive, cached, vocab = pair
     ids = torch.randint(0, vocab, (1, 4))
     caches = cached.create_kv_cache()
@@ -313,10 +313,10 @@ def test_caches_can_be_supplied_by_the_caller(pair):
 def test_every_claimed_kernel_is_callable():
     """A name in `CUDA_KERNELS` must be a kernel the extension actually exports.
 
-    This replaces Step 2.2's "no kernels are claimed yet". Phase 3 flips these
-    flags one at a time, and the flag is what the benchmark reports and what the
-    dispatch trusts, so a flag flipped ahead of the `.cu` would silently make the
-    report a lie. Asserting the symbol exists keeps them honest as the list grows.
+    The CUDA kernels turn these flags on one at a time, and the flag is what the
+    benchmark reports and what the dispatch trusts, so a flag flipped ahead of the
+    `.cu` would silently make the report a lie. Asserting the symbol exists keeps
+    them honest as the list grows.
     """
     claimed = ops.cuda_kernel_names()
     if not claimed:
@@ -349,12 +349,12 @@ def test_use_cuda_falls_back_on_cpu_tensors(tiny_qwen3):
     )
 
 
-def test_dispatch_report_names_every_op_and_its_step():
+def test_dispatch_report_names_every_op_and_its_source():
     report = ops.dispatch_report(use_cuda=True)
 
-    for name, (_implemented, step) in ops.CUDA_KERNELS.items():
+    for name, (_implemented, source) in ops.CUDA_KERNELS.items():
         assert name in report
-        assert step in report
+        assert source in report
 
 
 @pytest.mark.cuda
@@ -374,13 +374,13 @@ def test_runs_on_the_gpu(tiny_qwen3, device):
 def real_models():
     """Qwen3-0.6B at a requested dtype: cached, uncached, and HF, weights shared.
 
-    Both dtypes are needed, and for a sharper reason than in Step 1.8. A decode
-    step computes `q` of length 1 against a cache of length `S`; a full recompute
-    computes length `S` against length `S`. Same arithmetic, different matmul
-    shapes — so cuBLAS reduces them in a different order, and in bf16 the results
-    differ in the last bit. **The cached and uncached models therefore cannot be
-    bitwise identical in bf16, however correct both are.** fp32 has the headroom to
-    absorb that, so it is where token identity is asserted.
+    Both dtypes are needed, and for a sharper reason than for the uncached model.
+    A decode step computes `q` of length 1 against a cache of length `S`; a full
+    recompute computes length `S` against length `S`. Same arithmetic, different
+    matmul shapes — so cuBLAS reduces them in a different order, and in bf16 the
+    results differ in the last bit. **The cached and uncached models therefore
+    cannot be bitwise identical in bf16, however correct both are.** fp32 has the
+    headroom to absorb that, so it is where token identity is asserted.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -429,7 +429,7 @@ def test_real_prefill_matches_the_uncached_model(real_models):
 
 @pytest.mark.oracle
 def test_real_cached_greedy_matches_our_naive_loop_in_fp32(real_models):
-    """The load-bearing test for this step: cache versus no cache, nothing else varying.
+    """The load-bearing test here: cache versus no cache, nothing else varying.
 
     In fp32 this is exact over 24 tokens, which is a complete statement about the
     cache: every decode step reproduced what recomputing the whole prefix would
@@ -446,7 +446,7 @@ def test_real_cached_greedy_matches_our_naive_loop_in_fp32(real_models):
 
 @pytest.mark.oracle
 def test_real_cached_greedy_matches_transformers_in_fp32(real_models):
-    """Closes the loop to the external oracle, on the prompt from the plan."""
+    """Closes the loop to the external oracle: `transformers.generate` itself."""
     cached, _naive, hf, tokenizer, device = real_models(torch.float32)
     ids = tokenizer("The capital of France is", return_tensors="pt").input_ids.to(device)
 
@@ -466,13 +466,13 @@ def test_real_cached_greedy_matches_transformers_in_fp32(real_models):
 
 @pytest.mark.oracle
 def test_real_batch_of_three_prompts_in_fp32(real_models):
-    """A padded batch of different prompts, as the plan asks for.
+    """A padded batch of different prompts.
 
     Left-padding is what makes this work: the prompts are aligned at their *right*
     edge so every sequence's last token sits at the same index and one position
     vector serves the whole batch. That alignment tax — padding shorter prompts to
-    the longest — is the reason Phase 4 abandons rectangular batches for a ragged
-    one.
+    the longest — is the reason the serving layer abandons rectangular batches for a
+    ragged one.
     """
     cached, naive, _hf, tokenizer, device = real_models(torch.float32)
     prompts = ["The capital of France is", "def fibonacci(n):", "Once upon a time"]
@@ -528,7 +528,7 @@ def test_a_bf16_decode_step_agrees_with_a_full_recompute_to_within_rounding(real
 
 @pytest.mark.oracle
 def test_any_bf16_greedy_divergence_is_a_near_tie(real_models):
-    """The bf16 counterpart of the fp32 identity test, using Step 1.9's argument.
+    """The bf16 counterpart of the fp32 identity test, using the near-tie argument.
 
     When the cached and naive loops disagree in bf16, they must disagree only about
     the order of two tokens that bf16 cannot separate. On this prompt they split at

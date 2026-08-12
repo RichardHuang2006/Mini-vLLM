@@ -1,4 +1,4 @@
-"""Step 4.9 — the engine, and the one import a caller needs.
+"""The engine, and the one import a caller needs.
 
 ::
 
@@ -8,8 +8,8 @@
     for completion in llm.generate(["The capital of France is"], max_tokens=32):
         print(completion.text)
 
-Everything below this line has been built already; this file is the wiring, and it is
-short on purpose. The pieces and what each contributes to one iteration:
+This file is the wiring, and it is short on purpose. The pieces, and what each
+contributes to one iteration:
 
 * `Scheduler` decides which sequences run and how many tokens each contributes.
 * `BlockManager` backs that decision with pages, and refuses it when it cannot.
@@ -93,7 +93,7 @@ class StreamUpdate:
 
 @dataclass
 class EngineStats:
-    """Counters for the whole engine's life, read by the Phase 5 benchmarks."""
+    """Counters for the whole engine's life, read by the benchmarks."""
 
     iterations: int = 0
     prompt_tokens: int = 0
@@ -228,11 +228,11 @@ class LLM:
     def reconfigure(self, **changes) -> None:
         """Swap the scheduling policy between runs, keeping the weights and the pool.
 
-        For [Step 5.2](../../PLAN.md)'s A/B, where the same request set is replayed
-        under chunked prefill and under a prefill-prioritized baseline. Loading the
-        model twice to change one boolean would double the resident weights and halve
-        the pool the second engine sizes itself against, which would make the two runs
-        differ in more than the policy.
+        For the benchmarks' A/B, where the same request set is replayed under chunked
+        prefill and under a prefill-prioritized baseline. Loading the model twice to
+        change one boolean would double the resident weights and halve the pool the
+        second engine sizes itself against, which would make the two runs differ in
+        more than the policy.
 
         Only between runs: the queues have to be empty, because a sequence mid-prefill
         has been chunked under a policy that is about to stop existing.

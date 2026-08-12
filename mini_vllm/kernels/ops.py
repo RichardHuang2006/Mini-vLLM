@@ -1,21 +1,20 @@
-"""Step 2.2 — the seam between the model and its kernels.
+"""The seam between the model and its kernels.
 
 Every op the cached model performs goes through a function here, and each one can
-run either the readable PyTorch version from Phase 1 or a hand-written CUDA kernel
-from Phase 3. The model itself never learns which: it passes a `use_cuda` flag
-down and this module decides.
+run either the readable PyTorch reference implementation or a hand-written CUDA
+kernel. The model itself never learns which: it passes a `use_cuda` flag down and
+this module decides.
 
-The point is that Phase 3 becomes a sequence of small, independently verifiable
-changes rather than one rewrite. Landing the RMSNorm kernel means writing
-`csrc/rmsnorm.cu`, pointing `rmsnorm` at it, and flipping one entry in
-:data:`CUDA_KERNELS` — the model file is not touched, and the PyTorch version
-stays as the oracle to diff against.
+The seam is what keeps each kernel an independently verifiable change rather than
+a rewrite: landing the RMSNorm kernel means writing `csrc/rmsnorm.cu`, pointing
+`rmsnorm` at it, and flipping one entry in :data:`CUDA_KERNELS` — the model file
+is not touched, and the PyTorch version stays as the oracle to diff against.
 
 `use_cuda=True` means "use kernels where they exist", so an op with no kernel yet
 falls back silently rather than raising — and so does any op called on CPU
-tensors, since the same model object serves CPU tests and GPU runs. Silence is
-how you end up benchmarking a kernel that never ran, so :func:`dispatch_report`
-says out loud which path each op would take, and the benchmark prints it.
+tensors, since the same model object serves CPU tests and GPU runs. Silence is how
+a kernel that never ran ends up in a benchmark, so :func:`dispatch_report` says out
+loud which path each op would take, and the benchmark prints it.
 """
 
 from __future__ import annotations
@@ -42,19 +41,19 @@ __all__ = [
     "swiglu",
 ]
 
-# Which ops have a hand-written kernel, and which step introduces it. Flipped to
-# True by the Phase 3 step named beside it, one at a time.
+# Which ops have a hand-written kernel, paired with the label the dispatch report
+# prints beside each one — the source file the kernel lives in.
 #
 # The keys are the names the extension exports, not prettier synonyms for them:
 # `test_every_claimed_kernel_is_callable` looks each one up in the compiled module,
 # so a kernel cannot be claimed here and be missing, misspelled, or renamed.
 CUDA_KERNELS: dict[str, tuple[bool, str]] = {
-    "rmsnorm": (True, "Step 3.1"),
-    "rope": (True, "Step 3.2"),
-    "swiglu": (True, "Step 3.3"),
-    "decode_attention": (True, "Step 3.4"),
-    "flash_prefill": (True, "Step 3.5"),
-    "paged_attention": (True, "Step 4.8"),
+    "rmsnorm": (True, "csrc/rmsnorm.cu"),
+    "rope": (True, "csrc/rope.cu"),
+    "swiglu": (True, "csrc/swiglu.cu"),
+    "decode_attention": (True, "csrc/decode_attention.cu"),
+    "flash_prefill": (True, "csrc/flash_prefill.cu"),
+    "paged_attention": (True, "csrc/paged_attention.cu"),
 }
 
 # Kernels that are correct, tested, and deliberately *not* the default, with the
@@ -63,11 +62,11 @@ CUDA_KERNELS: dict[str, tuple[bool, str]] = {
 # behind `use_cuda=True` is exactly what `dispatch_report` exists to prevent.
 #
 # Prefill is here because its inner loop is scalar FMA against cuBLAS on tensor
-# cores, and no amount of tuning closes that gap — Step 3.6 replaces the loop with
-# `mma.sync` and is what flips this entry. Everything that tests the kernel calls it
+# cores, and no amount of tuning closes that gap — replacing that loop with
+# `mma.sync` is what would flip this entry. Everything that tests the kernel calls it
 # directly through the extension, so nothing about its coverage depends on routing.
 NOT_YET_FASTER: dict[str, str] = {
-    "flash_prefill": "0.4x cuBLAS at L=512 until Step 3.6",
+    "flash_prefill": "0.4x cuBLAS at L=512",
 }
 
 # The prefill kernel stages a query, key and value tile in shared memory at once,
@@ -86,7 +85,7 @@ def _use_kernel(name: str, use_cuda: bool, x: torch.Tensor) -> bool:
     A kernel needs three things to be true, and CUDA tensors is one of them: the
     same model object is used for CPU tests and GPU serving.
     """
-    implemented, _step = CUDA_KERNELS[name]
+    implemented, _source = CUDA_KERNELS[name]
     return use_cuda and implemented and name not in NOT_YET_FASTER and x.is_cuda
 
 
@@ -98,15 +97,15 @@ def cuda_kernel_names() -> list[str]:
 def dispatch_report(use_cuda: bool) -> str:
     """One line per op saying which implementation a run would use."""
     lines = []
-    for name, (implemented, step) in CUDA_KERNELS.items():
+    for name, (implemented, source) in CUDA_KERNELS.items():
         if not implemented:
-            note = f"no kernel yet — {step}"
+            note = f"no kernel yet — {source}"
         elif name in NOT_YET_FASTER:
-            note = f"kernel from {step} is slower: {NOT_YET_FASTER[name]}"
+            note = f"kernel from {source} is slower: {NOT_YET_FASTER[name]}"
         elif not use_cuda:
-            note = f"kernel exists from {step}; use_cuda is off"
+            note = f"kernel exists from {source}; use_cuda is off"
         else:
-            lines.append(f"  {name:<18} cuda    (kernel from {step})")
+            lines.append(f"  {name:<18} cuda    (kernel from {source})")
             continue
         lines.append(f"  {name:<18} torch   ({note})")
     return "\n".join(lines)
@@ -121,7 +120,7 @@ def rmsnorm(
     eps: float = 1e-6,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """RMSNorm over the last dimension. Kernel: Step 3.1.
+    """RMSNorm over the last dimension. Kernel: ``csrc/rmsnorm.cu``.
 
     The kernel requires ``weight`` to have the same dtype as ``x``; PyTorch would
     promote instead, and quietly returning a different dtype than the oracle
@@ -139,7 +138,7 @@ def rope(
     sin: torch.Tensor,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Rotary embedding at explicit positions. Kernel: Step 3.2.
+    """Rotary embedding at explicit positions. Kernel: ``csrc/rope.cu``.
 
     The kernel wants fp32 tables, which is what `RoPE` builds regardless of the
     activation dtype, and a head axis to broadcast the position across. Anything
@@ -151,12 +150,13 @@ def rope(
 
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor, use_cuda: bool = False) -> torch.Tensor:
-    """``silu(gate) * up``, the elementwise half of the MLP. Kernel: Step 3.3.
+    """``silu(gate) * up``, the elementwise half of the MLP. Kernel: ``csrc/swiglu.cu``.
 
     Takes the two projections rather than the input, because the projections are
-    ordinary matmuls that cuBLAS already does better than we will. What is worth
-    fusing is this part: two full passes over a `B x L x intermediate` tensor to
-    do a few flops per element, which is pure memory traffic.
+    ordinary matmuls that cuBLAS already does better than a hand-written kernel
+    would. What is worth fusing is this part: two full passes over a
+    `B x L x intermediate` tensor to do a few flops per element, which is pure
+    memory traffic.
     """
     if _use_kernel("swiglu", use_cuda, gate) and gate.dtype == up.dtype:
         return load_extension().swiglu(gate, up)
@@ -170,7 +170,7 @@ def attention(
     mask: torch.Tensor | str | None = None,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Grouped-query attention. Kernels: Step 3.4 (decode) and Step 3.5 (prefill).
+    """Grouped-query attention, with a separate kernel for decode and for prefill.
 
     ::
 
@@ -181,8 +181,9 @@ def attention(
     Decode and prefill are split because they are different problems, not
     different sizes of one. Decode has `L = 1`: no parallelism across queries, one
     long pass over the cache, entirely memory-bound. Prefill has `L = S`: a real
-    matrix multiply worth tiling. They get separate kernels for that reason, and
-    the routing lives here so the model does not have to care.
+    matrix multiply worth tiling. They get separate kernels for that reason —
+    ``csrc/decode_attention.cu`` and ``csrc/flash_prefill.cu`` — and the routing
+    lives here so the model does not have to care.
     """
     is_decode = q.shape[-2] == 1
     name = "decode_attention" if is_decode else "flash_prefill"
@@ -209,7 +210,7 @@ def paged_attention(
     scale: float | None = None,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Ragged attention over a paged cache. Kernel: Step 4.8.
+    """Ragged attention over a paged cache. Kernel: ``csrc/paged_attention.cu``.
 
     ::
 

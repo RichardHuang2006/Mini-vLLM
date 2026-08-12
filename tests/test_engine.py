@@ -1,17 +1,17 @@
-"""Step 4.9 — the engine, end to end.
+"""The engine, end to end.
 
 Three kinds of test, in order of how much they can tell you when they fail:
 
-* **Cross-implementation identity.** The paged engine against the dense one from
-  Step 4.3, on the same weights and the same prompts. Everything between them is
-  different — ragged batch, paged cache, a kernel that gathers K and V through a block
-  table — so if the tokens agree, the whole of Phase 4 agrees with the model Phase 2
-  established. This is the test to reach for first when something breaks.
+* **Cross-implementation identity.** The paged engine against the dense one, on the
+  same weights and the same prompts. Everything between them is different — ragged
+  batch, paged cache, a kernel that gathers K and V through a block table — so if the
+  tokens agree, the whole of the serving layer agrees with the cached model. This is the
+  test to reach for first when something breaks.
 * **Pressure.** A pool small enough to force preemption, and one too small to run
   anything at all. Preemption is the path an engine takes only under load, which is
   exactly where nobody is watching it, so it is worth pinning at leisure.
 * **The API**, on real weights: token-identical to `transformers.generate` for sixteen
-  varied prompts, which is the milestone this step exists to reach.
+  varied prompts.
 
 The tiny-model tests deliberately do not go through `LLM`. `LLM` loads a checkpoint and
 a tokenizer, and a test that needs 1.2 GB of weights to check that a preempted sequence
@@ -54,7 +54,7 @@ def make(prompt: list[int], max_tokens: int = 6) -> Sequence:
 
 
 class Engine:
-    """The Step 4.9 loop over a tiny model, without a tokenizer or a checkpoint.
+    """The engine loop over a tiny model, without a tokenizer or a checkpoint.
 
     Exactly what `LLM.step` does — schedule, execute, sample, commit, free — and it is
     spelled out here rather than reused so that a change to the engine's loop has to be
@@ -107,7 +107,7 @@ def paged(weights_and_config, num_blocks: int = 256, use_cuda: bool = True):
 
 
 def dense_reference(weights_and_config, prompts: list[list[int]], max_tokens: int) -> list[list[int]]:
-    """What Step 4.3's dense runner produces for each prompt, run alone.
+    """What the dense runner produces for each prompt, run alone.
 
     One sequence at a time, one forward pass per token, no paging anywhere: the slowest
     path in the project and the one with the fewest moving parts.
@@ -181,7 +181,7 @@ def test_the_logits_row_is_each_sequence_s_last_position(weights):
 
 @pytest.mark.cuda
 def test_the_paged_engine_is_token_identical_to_the_dense_one(weights):
-    """Phase 4 against Phase 2, on the same weights.
+    """The serving layer against the cached model, on the same weights.
 
     Six requests of different lengths in one engine, against each run alone through the
     dense cache. Between the two: a ragged batch, a paged cache with sequences
@@ -227,9 +227,9 @@ def test_a_chunked_prefill_is_token_identical_too(weights):
 def test_the_oracle_path_gives_the_same_tokens_without_a_gpu(tiny_qwen3):
     """`use_cuda=False` on the CPU, gathering each sequence's cache the slow way.
 
-    Same tokens, no kernel, no device: the engine's correctness does not depend on
-    Phase 3, which is what keeps the CUDA path honest — the two are compared against
-    each other, not each against itself.
+    Same tokens, no kernel, no device: the engine's correctness does not depend on the
+    CUDA kernels, which is what keeps the CUDA path honest — the two are compared
+    against each other, not each against itself.
     """
     theirs = tiny_qwen3.to(dtype=torch.float32)
     bundle = (weights_from_hf(theirs), config_from_hf(theirs))
@@ -427,7 +427,7 @@ REAL_PROMPTS = [
 
 @pytest.mark.oracle
 def test_greedy_output_matches_transformers_for_sixteen_prompts(llm):
-    """**The milestone.** Sixteen varied prompts, batched, token for token.
+    """Sixteen varied prompts, batched, token for token.
 
     Sixteen at once through one engine, against `transformers.generate` one prompt at a
     time: continuous batching, chunked prefill, a paged cache and hand-written kernels
@@ -477,8 +477,8 @@ def test_bf16_only_disagrees_at_a_tie(llm):
     either being wrong.
 
     What would *not* be a tie is a bf16 run that picks a token the fp32 run does not rank
-    second — which is what this pins down, and it is the honest form of the milestone for
-    the dtype that ships.
+    second — which is what this pins down, and it is the honest form of the
+    token-identity guarantee for the dtype that ships.
     """
     exact = llm.generate(REAL_PROMPTS, max_tokens=24)
     fast = real_engine(dtype=torch.bfloat16, num_blocks=192, max_sequences=16)
@@ -607,7 +607,7 @@ def test_sampling_parameters_are_per_request(llm):
 
 @pytest.mark.oracle
 def test_the_engine_reports_what_it_did(llm):
-    """The counters Phase 5 measures with, sanity-checked on a known run."""
+    """The counters the benchmarks measure with, sanity-checked on a known run."""
     before = llm.stats.iterations
     llm.generate(["Once upon a time"] * 4, max_tokens=8)
 

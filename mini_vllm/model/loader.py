@@ -1,4 +1,4 @@
-"""Step 1.7 — read a Qwen3 checkpoint and rename its weights to ours.
+"""Read a Qwen3 checkpoint and rename its weights to this project's scheme.
 
 The interesting part of this file is not the file I/O, it is
 :func:`load_weights` asserting the name mapping is **total in both directions**:
@@ -52,7 +52,7 @@ def _rope_theta(raw: dict) -> float:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """The subset of ``config.json`` this engine actually uses (DESIGN.md §3)."""
+    """The subset of ``config.json`` this engine actually uses."""
 
     num_hidden_layers: int
     hidden_size: int
@@ -122,9 +122,9 @@ class ModelConfig:
 
 # -------------------------------------------------------------- name mapping
 
-# Ours on the right. The names are shortened where HF is verbose (`wq` rather
+# The local names on the right. They are shortened where HF is verbose (`wq` rather
 # than `self_attn.q_proj.weight`) but the structure is deliberately unchanged, so
-# a checkpoint key and our key remain recognisably the same thing.
+# a checkpoint key and a local key remain recognisably the same thing.
 GLOBAL_NAMES: dict[str, str] = {
     "model.embed_tokens.weight": "embedding",
     "model.norm.weight": "final_norm",
@@ -153,7 +153,7 @@ TIED_LM_HEAD = "lm_head.weight"
 
 
 def map_name(hf_name: str) -> str | None:
-    """Translate one checkpoint key to ours, or None if it is deliberately dropped."""
+    """Translate one checkpoint key to the local name, or None if it is deliberately dropped."""
     if hf_name == TIED_LM_HEAD:
         return None
     if hf_name in GLOBAL_NAMES:
@@ -246,9 +246,9 @@ def load_weights(
     config: ModelConfig | None = None,
     device: str = "cpu",
 ) -> tuple[dict[str, torch.Tensor], ModelConfig]:
-    """Load a checkpoint into our naming scheme, verifying the mapping is total.
+    """Load a checkpoint into the local naming scheme, verifying the mapping is total.
 
-    Returns the weights keyed by our names, plus the config they were checked
+    Returns the weights keyed by the local names, plus the config they were checked
     against.
     """
     model_path = resolve_model_path(model)

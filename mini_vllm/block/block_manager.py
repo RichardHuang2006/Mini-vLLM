@@ -1,7 +1,7 @@
-"""Step 4.7 — the block manager: capacity, growth, sharing, and release.
+"""The block manager: capacity, growth, sharing, and release.
 
-The layer that turns [Step 4.5]'s integers and [Step 4.6]'s arithmetic into something
-a scheduler can talk to ([§6.4](../DESIGN.md#64-block-manager-api)):
+The layer that turns the block pool's integers and the block table's arithmetic into
+something a scheduler can talk to:
 
 ::
 
@@ -14,7 +14,7 @@ a scheduler can talk to ([§6.4](../DESIGN.md#64-block-manager-api)):
 It owns the block pool, the KV pool tensors, and — through the sequences themselves —
 the block tables. It has to own all three together because copy-on-write is the one
 operation that touches all of them at once: a refcount, a table entry, and a page of
-actual keys and values ([§6.3](../DESIGN.md#63-copy-on-write-sharing)).
+actual keys and values.
 
 Copy-on-write is worth being precise about, because it is easy to implement as
 "copy the shared blocks" and that would be wrong in both directions. Only the **last
@@ -117,8 +117,7 @@ class BlockManager:
 
         Defaults to everything the sequence has left to compute, which is the
         admission question for a new request. The scheduler asks with a chunk size
-        instead when chunking is on, and with 1 before a decode step
-        ([§7.4](../DESIGN.md#74-admission-control)).
+        instead when chunking is on, and with 1 before a decode step.
         """
         if num_tokens is None:
             num_tokens = sequence.num_uncomputed_tokens

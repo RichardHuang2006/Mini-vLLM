@@ -1,4 +1,4 @@
-"""Step 3.3 — the SwiGLU kernel against `silu(gate) * up`.
+"""The fused SwiGLU kernel against `silu(gate) * up`.
 
 The op is trivial arithmetic, so the interesting content is not "is the formula
 right" but **where the rounding happens**. PyTorch evaluates three separate
@@ -47,7 +47,7 @@ def test_is_bitwise_identical_to_the_oracle(kernel, dtype, shape):
 
     This is the strongest form a kernel test can take, and it is available here
     only because the op has no reduction: nothing is summed, so there is no order
-    to reassociate. Every later kernel gives this up and settles for a tolerance.
+    to reassociate. A kernel that reduces gives this up and settles for a tolerance.
     """
     gate = torch.randn(*shape, device="cuda", dtype=dtype) * 3.0
     up = torch.randn(*shape, device="cuda", dtype=dtype)
@@ -183,18 +183,18 @@ def test_dispatch_falls_back_on_cpu_tensors():
 
 
 def test_model_output_is_bitwise_unchanged(tiny_qwen3, device):
-    """Three kernels live now, and this one is exact even inside the model.
+    """Alone among the elementwise kernels, this one is exact inside the model.
 
     RMSNorm and RoPE only promise token identity, because both reduce or gather
     and PyTorch reduces in a different order. SwiGLU has no reduction, so the
     whole model's logits must come out *bitwise* the same — a much sharper
-    statement, and one that holds only until Step 3.4 adds a summation.
+    statement, and one no kernel that sums over the cache can make.
     """
     theirs = tiny_qwen3.to(device=device, dtype=torch.float32)
     config, weights = config_from_hf(theirs), weights_from_hf(theirs)
     ids = torch.randint(0, TINY_QWEN3_DIMS["vocab_size"], (2, 7), device=device)
 
-    # Only SwiGLU on, so the comparison isolates this step from the other two.
+    # Only SwiGLU on, so the comparison isolates it from RMSNorm and RoPE.
     plain = Qwen3Cached(config, weights, use_cuda=False)
     with_kernel = Qwen3Cached(config, weights, use_cuda=False)
     for block in with_kernel.blocks:

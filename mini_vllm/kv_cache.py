@@ -1,11 +1,11 @@
-"""Step 2.1 — the KV cache, and the interface a paged one will later hide behind.
+"""The KV cache, and the interface a paged one hides behind.
 
 Attention at position `t` needs the keys and values of every position `0..t`, and
-those do not change once computed. Phase 1 recomputed them all anyway, every
-single step, which is why generation ran at 1 token/s. Caching them turns decode
-from quadratic into linear work.
+those do not change once computed. The uncached model recomputes them all anyway,
+every single step, which is why generation runs at 1 token/s. Caching them turns
+decode from quadratic into linear work.
 
-:class:`KvCache` is abstract for one reason: [Step 4.7] adds a paged
+:class:`KvCache` is abstract for one reason: the block manager provides a paged
 implementation that stores the same tensors in fixed-size blocks scattered across
 a pool, and the model must not be able to tell the difference. So the interface is
 deliberately narrow — one method, taking the new keys and values and returning
@@ -66,7 +66,7 @@ class DenseKvCache(KvCache):
     """A cache that simply concatenates along the sequence dimension.
 
     The obvious implementation, and a deliberately flawed one. Two costs, both of
-    which Phase 4 exists to remove:
+    which the serving layer exists to remove:
 
     * **Every decode step reallocates.** ``torch.cat`` cannot extend a tensor in
       place, so appending one token to a cache of `S` copies all `S` positions to
@@ -75,10 +75,10 @@ class DenseKvCache(KvCache):
     * **One contiguous block per sequence.** A batch of sequences with different
       lengths has to be padded to the longest, and a sequence that might reach
       40960 tokens has to be budgeted for as if it will. That is the fragmentation
-      problem PagedAttention solves (DESIGN.md §6).
+      problem PagedAttention solves.
 
     It is correct, though, and correct is what makes it the oracle for the paged
-    version later.
+    version.
     """
 
     def __init__(self) -> None:

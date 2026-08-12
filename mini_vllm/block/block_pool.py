@@ -1,15 +1,14 @@
-"""Step 4.5 — the physical block pool: allocation and reference counting.
+"""The physical block pool: allocation and reference counting.
 
-The bottom of the memory hierarchy in [§6.1](../DESIGN.md#61-physical-layout). The
-pool knows nothing about sequences, tokens, or tensors: it hands out integer ids and
-counts how many holders each one has. Everything above it — block tables, copy-on-write,
-admission control — is built from those two operations, and none of it needs a GPU to
-be tested, which is why paging starts here rather than in a kernel.
+The bottom of the paged memory hierarchy. The pool knows nothing about sequences,
+tokens, or tensors: it hands out integer ids and counts how many holders each one has.
+Everything above it — block tables, copy-on-write, admission control — is built from
+those two operations, and none of it needs a GPU to be tested, which is why paging
+starts here rather than in a kernel.
 
 Reference counting is what makes sharing possible without copying. Forking a sequence
 or reusing a cached prefix increments counts instead of duplicating a page of K and V,
-and a block returns to circulation exactly when its last holder lets go
-([§6.3](../DESIGN.md#63-copy-on-write-sharing)).
+and a block returns to circulation exactly when its last holder lets go.
 
 Two decisions worth recording, because both are the less obvious choice:
 
@@ -18,8 +17,8 @@ Two decisions worth recording, because both are the less obvious choice:
   data it just released and *looks correct*. Cycling the whole pool makes that class
   of bug fail loudly, which is worth more here than the locality.
 * :class:`OutOfBlocks` is a **typed exception, not a `None` return**. Exhaustion is
-  the condition that drives admission control and preemption ([Step 4.7]), so the
-  caller has to handle it; a sentinel return is too easy to drop on the floor.
+  the condition that drives admission control and preemption in the block manager, so
+  the caller has to handle it; a sentinel return is too easy to drop on the floor.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-// Step 3.3 — SwiGLU's elementwise half: out = silu(gate) * up.
+// SwiGLU's elementwise half: out = silu(gate) * up.
 //
 // The two projections stay on cuBLAS. What is worth fusing is this part: three
 // full passes over a `(B·L) x intermediate` tensor (sigmoid, then two multiplies)

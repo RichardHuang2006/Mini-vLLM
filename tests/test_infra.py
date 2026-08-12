@@ -1,9 +1,9 @@
-"""Step 0.2 — the test infrastructure itself is trustworthy.
+"""The test infrastructure itself is trustworthy.
 
-Testing your test helpers looks like navel-gazing right up until a helper that
+Testing the test helpers looks like navel-gazing right up until a helper that
 silently never fails lets a broken kernel through. `assert_allclose` is used by
-almost every later test, so its failure behaviour matters as much as its success
-behaviour, and both directions are checked here.
+almost every test in the suite, so its failure behaviour matters as much as its
+success behaviour, and both directions are checked here.
 
 `torch.testing.assert_close` passes when `|a - b| <= atol + rtol * |b|`, and
 `assert_allclose` sets `atol == rtol == tolerance`, so on a tensor of ones the
@@ -145,7 +145,7 @@ def test_tokens_equal_reports_length_mismatch():
 
 
 def test_tiny_qwen3_has_the_architecture_we_rebuild(tiny_qwen3):
-    """The dimensions match what Phase 1 assumes, including the two traps."""
+    """The dimensions match what the reference implementation assumes, and the two traps."""
     config = tiny_qwen3.config
 
     assert config.num_hidden_layers == TINY_QWEN3_DIMS["num_hidden_layers"]

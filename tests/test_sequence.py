@@ -1,4 +1,4 @@
-"""Step 4.1 — sequence state.
+"""Sequence state.
 
 No GPU and no model: this is integer bookkeeping, which is precisely why it is
 worth testing exhaustively here rather than discovering it through a scheduler bug
