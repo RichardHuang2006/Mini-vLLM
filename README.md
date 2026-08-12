@@ -157,7 +157,7 @@ step; `make ext` forces a rebuild when a stale cache is the suspect. `make test`
 skip without a GPU, and tests that need the real checkpoint skip until it is downloaded:
 
 ```bash
-make test                   # 858 tests, ~70 s on the hardware of record
+make test                   # 858 tests, 70-90 s on the hardware of record
 make test-cpu               # the subset needing neither a GPU nor weights
 ```
 
