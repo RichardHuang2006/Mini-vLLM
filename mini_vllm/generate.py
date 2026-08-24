@@ -1,14 +1,12 @@
 """Greedy generation, with and without a KV cache.
 
-:func:`generate_ids` is the naive loop. Every step re-runs all 28 layers over the
-entire prefix, so generating token 100 redoes the work of tokens 0-99 for the
-hundredth time — quadratic total cost for a job that should be linear.
+:func:`generate_ids` is the naive loop: every step re-runs all 28 layers over the entire
+prefix, so generating token 100 redoes the work of tokens 0-99 for the hundredth time,
+making the total cost quadratic in the output length.
 
-:func:`generate_ids_cached` is the cached version, and it is kept side by side
-with the naive one on purpose: they must produce **identical tokens**, which is
-the only convincing evidence that the cache is a pure optimization rather than a
-subtle change of behaviour. The `--no-cache` flag exists so the difference can be
-felt rather than described.
+:func:`generate_ids_cached` is the cached version, kept beside the naive one because the
+two must produce identical tokens — the evidence that caching is a pure optimization
+rather than a change of behaviour. The `--no-cache` flag makes the difference measurable.
 
 Run it::
 
@@ -54,9 +52,9 @@ class Loaded(NamedTuple):
 def eos_token_ids_for(model_path) -> tuple[int, ...]:
     """The stop tokens, read from `generation_config.json`.
 
-    Qwen3 lists *two* (`<|im_end|>` and `<|endoftext|>`), which is why this
-    returns a tuple rather than a single id. Honouring only `tokenizer.eos_token_id`
-    would miss one and generate past the end of a turn.
+    Qwen3 lists two (`<|im_end|>` and `<|endoftext|>`), hence a tuple rather than a
+    single id: honouring only `tokenizer.eos_token_id` misses one and generates past the
+    end of a turn.
     """
     config_path = model_path / "generation_config.json"
     if not config_path.is_file():
@@ -116,11 +114,10 @@ def generate_ids(
 
         input_ids: B x L      ->  B x (L + generated)
 
-    Stops once every row has produced a stop token. Rows that finish early are
-    filled with ``pad_token_id`` so the batch stays rectangular, which is what
-    HuggingFace does too — and is a hint at why the serving layer abandons
-    rectangular batches entirely: with 16 sequences of wildly different lengths,
-    most of a padded batch is wasted work.
+    Stops once every row has produced a stop token. Rows that finish early are filled
+    with ``pad_token_id`` to keep the batch rectangular, matching HuggingFace. It is also
+    why the serving layer abandons rectangular batches: with 16 sequences of widely
+    differing lengths, most of a padded batch is wasted work.
     """
     if input_ids.ndim != 2:
         raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
@@ -133,7 +130,7 @@ def generate_ids(
     finished = torch.zeros(tokens.shape[0], dtype=torch.bool, device=tokens.device)
 
     for _ in range(max_tokens):
-        # The waste: the whole prefix, every single step.
+        # The whole prefix, recomputed every step.
         logits = model(tokens)[:, -1, :]
         next_tokens = logits.argmax(dim=-1)
 
@@ -166,10 +163,9 @@ def generate_ids_cached(
         prefill: the whole prompt at offset 0   -> first token, cache holds len(prompt)
         decode:  one token at offset = prev_len -> next token, cache grows by 1
 
-    The loop looks almost the same as the naive one, and that is the point — the
-    only structural difference is that it feeds `next_tokens` rather than the whole
-    sequence back in. The caches carry the position, so nothing here tracks an
-    offset by hand.
+    Structurally identical to the naive loop except that it feeds `next_tokens` back in
+    rather than the whole sequence. The caches carry the position, so nothing here tracks
+    an offset by hand.
     """
     if input_ids.ndim != 2:
         raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
@@ -186,8 +182,8 @@ def generate_ids_cached(
     step_input = input_ids
 
     for _ in range(max_tokens):
-        # Only the tokens the model has not seen: the whole prompt on the first
-        # pass, then exactly one per step.
+        # Only the tokens the model has not seen: the whole prompt on the first pass,
+        # then one per step.
         logits = model(step_input, caches, last_only=True)[:, -1, :]
         next_tokens = logits.argmax(dim=-1)
 

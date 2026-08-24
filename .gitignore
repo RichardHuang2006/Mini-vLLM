@@ -13,7 +13,7 @@ dist/
 .venv/
 venv/
 
-# benchmark artifacts (Phase 8)
+# benchmark artifacts
 bench_results/
 *.ncu-rep
 *.nsys-rep

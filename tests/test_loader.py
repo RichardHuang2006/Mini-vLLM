@@ -1,8 +1,7 @@
 """The checkpoint loader, against `transformers` itself.
 
-Most of this file is marked `oracle` because it needs the real Qwen3-0.6B
-weights. The mapping logic is pure string manipulation though, so that part is
-tested without any download.
+Most of this file is marked `oracle` because it needs the real Qwen3-0.6B weights. The
+mapping logic is pure string manipulation, so that part is tested without a download.
 """
 
 from __future__ import annotations
@@ -58,7 +57,7 @@ def test_tied_lm_head_is_dropped_deliberately():
 
 
 def test_unknown_name_raises_rather_than_being_ignored():
-    """Silently skipping an unrecognized weight is how you ship a broken model."""
+    """Silently skipping an unrecognized weight would ship a partially loaded model."""
     with pytest.raises(KeyError, match="unmapped checkpoint weight"):
         map_name("model.layers.0.self_attn.rotary_emb.inv_freq")
     with pytest.raises(KeyError, match="unmapped checkpoint weight"):

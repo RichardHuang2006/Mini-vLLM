@@ -1,20 +1,18 @@
 """The paged attention kernels, against the `paged_attention_gathered` oracle.
 
 The oracle copies each sequence's cache out of the pool and calls
-`scaled_dot_product_attention_grouped`; the kernel walks the block table inside its
-inner loop. Everything below is that comparison, at the shapes where the two could
-differ:
+`scaled_dot_product_attention_grouped`; the kernel walks the block table in its inner
+loop. Everything below is that comparison, at the shapes where the two could differ:
 
-* a **shuffled** block table, so physical order and logical order disagree. This is the
-  case the whole file is really about — with a freshly allocated pool the two coincide,
-  and an indexing bug looks correct.
-* a **mixed** batch of prefill chunks and decode steps in one launch, where each row
-  must equal what it produces alone.
-* the **split** path, where a long context is divided across blocks and merged, plus
-  the ragged case where one sequence's splits are all empty but the first.
+* A shuffled block table, so physical and logical order disagree. This is the central
+  case: with a freshly allocated pool the two coincide and an indexing bug looks correct.
+* A mixed batch of prefill chunks and decode steps in one launch, where each row must
+  equal what it produces alone.
+* The split path, where a long context is divided across blocks and merged, plus the
+  ragged case where all of one sequence's splits but the first are empty.
 
-The kernel is called directly rather than through the model, so nothing here depends
-on how `ops.paged_attention` routes.
+The kernel is called directly rather than through the model, so nothing here depends on
+how `ops.paged_attention` routes.
 """
 
 from __future__ import annotations
@@ -73,9 +71,9 @@ class PagedCase:
             total, block_size, kv_heads, head_dim, generator=generator, dtype=torch.float32
         ).to(device=device, dtype=dtype)
 
-        # A separate generator for the layout, so that shuffling changes *only* the
-        # layout: drawing the permutation from `generator` would advance it and give
-        # the shuffled and unshuffled cases different keys to compare.
+        # A separate generator for the layout so shuffling changes only the layout:
+        # drawing the permutation from `generator` would advance it and give the shuffled
+        # and unshuffled cases different keys to compare.
         layout = torch.Generator(device="cpu").manual_seed(7)
         order = (
             torch.randperm(total, generator=layout) if shuffle else torch.arange(total)

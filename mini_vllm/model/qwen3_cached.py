@@ -1,26 +1,25 @@
 """The same model, but it stops recomputing the past.
 
-A **fork** of `model/qwen3.py`, not a replacement. That file stays exactly as it
-was and remains the oracle: every claim made here is checked by producing the same
-tokens it does. Duplicating a few dozen lines is a small price for never having to
-wonder whether a "shared" refactor changed the reference.
+A fork of `model/qwen3.py` rather than a replacement: that file remains the oracle, and
+every claim made here is checked by producing the same tokens it does. Duplicating a few
+dozen lines avoids a shared refactor being able to change the reference.
 
-Three things change, and they are all about position bookkeeping:
+Three changes, all position bookkeeping:
 
-* Only the **new** tokens are fed in. Their keys and values join the cache, and
-  attention runs against everything cached so far — so `q` has length `L` while
-  `k` and `v` have length `S`.
-* RoPE positions become ``arange(offset, offset + L)`` instead of ``arange(L)``,
-  which is why the rotary embedding takes its positions explicitly rather than
-  deriving them from the sequence length.
-* The causal mask becomes ``(L, S)``, using the offset form of the reference mask so
-  a single decode token may attend to the entire cache.
+* Only the new tokens are fed in. Their keys and values join the cache and attention runs
+  against everything cached so far, so `q` has length `L` while `k` and `v` have length
+  `S`.
+* RoPE positions become ``arange(offset, offset + L)`` rather than ``arange(L)``, which is
+  why the rotary embedding takes positions explicitly instead of deriving them from the
+  sequence length.
+* The causal mask becomes ``(L, S)``, using the offset form of the reference mask so a
+  single decode token may attend to the entire cache.
 
-That same `offset` machinery is what chunked prefill in the serving layer needs, so
-chunked prefill is a scheduler change rather than a model rewrite.
+The same `offset` machinery is what chunked prefill needs, which is why chunked prefill is
+a scheduler change rather than a model rewrite.
 
-Every op routes through `mini_vllm.kernels.ops`, so the CUDA kernels can be swapped
-in without editing this file.
+Every op routes through `mini_vllm.kernels.ops`, so the CUDA kernels can be swapped in
+without editing this file.
 """
 
 from __future__ import annotations
@@ -74,9 +73,9 @@ class Qwen3CachedAttention:
         q = ops.rmsnorm(q, self.q_norm, config.rms_norm_eps, use_cuda=use_cuda)
         k = ops.rmsnorm(k, self.k_norm, config.rms_norm_eps, use_cuda=use_cuda)
 
-        # RoPE is applied *before* the cache, so cached keys carry their position
-        # with them. A cache of unrotated keys would have to be re-rotated on every
-        # read, and the whole saving would evaporate.
+        # RoPE is applied before the cache, so cached keys carry their position with
+        # them. Caching unrotated keys would require re-rotating on every read, which
+        # removes the saving.
         q = ops.rope(q, positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda)
         k = ops.rope(k, positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda)
 
@@ -84,13 +83,12 @@ class Qwen3CachedAttention:
         keys, values, _offset = cache.update_and_fetch(k.transpose(1, 2), v.transpose(1, 2))
 
         # A single decode token may attend to everything cached, so its mask is
-        # all-zeros and worth skipping entirely — that is the common case by far.
+        # all-zeros and skipped outright: the common case.
         #
-        # For prefill, the shorthand rather than the tensor: the mask is a pure
-        # function of `(L, S)`, both of which the callee already knows, and naming
-        # it lets the flash prefill kernel apply it as an index comparison instead of
-        # reading back an `L x S` tensor. The oracle builds exactly the same tensor
-        # from the same shorthand, so nothing about the reference path changes.
+        # Prefill passes the shorthand rather than a tensor. The mask is a pure function
+        # of `(L, S)`, both known to the callee, and naming it lets the flash prefill
+        # kernel apply it as an index comparison instead of reading an `L x S` tensor.
+        # The oracle builds the same tensor from the same shorthand.
         mask = None if length == 1 else "causal"
 
         attended = ops.attention(q.transpose(1, 2), keys, values, mask=mask, use_cuda=use_cuda)
@@ -205,14 +203,13 @@ class Qwen3Cached:
     ) -> torch.Tensor:
         """Forward the new tokens, extending ``caches`` in place.
 
-        ``positions`` defaults to ``arange(offset, offset + L)``, read from the
-        caches — which is the whole trick, and why the caller does not have to
-        track position separately.
+        ``positions`` defaults to ``arange(offset, offset + L)`` read from the caches,
+        which is why the caller does not track position separately.
 
-        ``last_only`` skips the LM head on every position but the last. Generation
-        only ever looks at the last one, and the head is a `V`-wide matmul, so on a
-        128-token prefill this is about 20 GFLOP of pure waste. It defaults to
-        False so the output stays directly comparable to `model/qwen3.py`.
+        ``last_only`` skips the LM head on every position but the last. Generation only
+        reads the last one, and the head is a `V`-wide matmul, so on a 128-token prefill
+        it saves about 20 GFLOP. It defaults to False so the output stays directly
+        comparable to `model/qwen3.py`.
         """
         if len(caches) != len(self.blocks):
             raise ValueError(

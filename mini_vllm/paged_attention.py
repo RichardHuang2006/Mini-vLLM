@@ -1,15 +1,13 @@
 """Paged attention, written to be obviously correct rather than fast.
 
-The oracle for the paged attention kernels. It does the one thing a real paged
-implementation must never do: for each sequence, walk the block table and **copy**
-that sequence's keys and values out of the pool into a contiguous tensor, then call
-the readable reference implementation's attention on it.
+The oracle for the paged attention kernels. For each sequence it walks the block table,
+copies that sequence's keys and values out of the pool into a contiguous tensor, and
+calls the reference attention on it.
 
-That is a full copy of the cache every iteration — precisely the traffic paging
-exists to avoid, and worse than the dense cache it replaces. It is also correct by
-construction, which is the point: `scaled_dot_product_attention_grouped` is the
-reference, so if the gather is right then the answer is right, and the kernel has
-something exact to be diffed against.
+That is a full copy of the cache every iteration, the traffic paging exists to avoid and
+worse than the dense cache it replaces. It is also correct by construction: with
+`scaled_dot_product_attention_grouped` as the reference, a correct gather gives a correct
+answer, which is what the kernels are diffed against.
 
 ::
 
@@ -19,9 +17,9 @@ something exact to be diffed against.
     context_lens: int32 N            how many cached tokens each attends over
     out:          T x H_q x D
 
-The flattened token axis is what makes one call serve a mixed batch: a 300-token
-prefill chunk followed by a dozen single-token decodes is 312 rows here, and the only
-thing distinguishing them is `cu_seqlens_q`.
+The flattened token axis is what lets one call serve a mixed batch: a 300-token prefill
+chunk followed by a dozen single-token decodes is 312 rows here, distinguished only by
+`cu_seqlens_q`.
 """
 
 from __future__ import annotations
@@ -41,14 +39,20 @@ def paged_attention_gathered(
     cu_seqlens_q: torch.Tensor,
     context_lens: torch.Tensor,
     scale: float | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
     """Grouped-query causal attention over a paged cache, one sequence at a time.
 
-    `key_pool` and `value_pool` are one layer's pages, `num_blocks x P x H_k x D`.
-    Every sequence is masked causally with its own `(L, S)` offset, which is the cached
-    model's mask: a decode step's single query sees the whole context, and a prefill
-    chunk's queries are the *last* `L` positions of `S` and see the diagonal shifted
-    right by `S - L`.
+    `key_pool` and `value_pool` are one layer's pages, `num_blocks x P x H_k x D`. Each
+    sequence is masked causally with its own `(L, S)` offset: a decode step's single query
+    sees the whole context, and a prefill chunk's queries are the last `L` positions of
+    `S`, so their diagonal is shifted right by `S - L`.
+
+    With FP8 pools the gather also dequantizes, casting each cached key and value up and
+    multiplying by its scale before the math, so the oracle attends in the activation
+    dtype exactly as the kernel does after dequantizing in registers. The scales default
+    to 1.0, the identity for an unquantized pool.
     """
     if q.dim() != 3:
         raise ValueError(f"expected q shaped T x H_q x D, got {tuple(q.shape)}")
@@ -91,12 +95,17 @@ def paged_attention_gathered(
                 f"but its table is padded there: {block_tables[index].tolist()}"
             )
 
-        # The gather. `index_select` on the block axis, then flatten block and offset
-        # back into one logical axis — which works because the two are adjacent, and
-        # is the same arithmetic the kernel will do per element instead of per block.
+        # The gather: `index_select` on the block axis, then flatten block and offset
+        # back into one logical axis, which works because the two are adjacent. The
+        # kernel does the same arithmetic per element instead of per block.
         ids = table.to(dtype=torch.int64, device=key_pool.device)
         keys = key_pool.index_select(0, ids).reshape(-1, num_kv_heads, head_dim)
         values = value_pool.index_select(0, ids).reshape(-1, num_kv_heads, head_dim)
+
+        # Dequantize an FP8 cache before the math; a no-op cast for a matching pool.
+        if keys.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            keys = keys.float().mul_(k_scale).to(q.dtype)
+            values = values.float().mul_(v_scale).to(q.dtype)
 
         keys = keys[:context_len].permute(1, 0, 2).unsqueeze(0)  # 1 x H_k x S x D
         values = values[:context_len].permute(1, 0, 2).unsqueeze(0)

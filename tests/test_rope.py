@@ -1,9 +1,9 @@
 """RoPE against HuggingFace's own rotary embedding.
 
-HF applies rotation to `B x H x L x D` tensors with `cos`/`sin` of shape
-`B x L x D`; ours takes `B x L x H x D` and gathers the tables itself from a
-position tensor. The comparisons below transpose between the two layouts, so a
-mismatch means the *rotation* differs, not the axis order.
+HF applies rotation to `B x H x L x D` tensors with `cos`/`sin` of shape `B x L x D`;
+this implementation takes `B x L x H x D` and gathers the tables from a position tensor.
+The comparisons below transpose between the two layouts, so a mismatch means the rotation
+differs rather than the axis order.
 """
 
 from __future__ import annotations

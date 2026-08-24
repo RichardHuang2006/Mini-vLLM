@@ -1,13 +1,12 @@
 """The embedding table, used in both directions.
 
-Qwen3-0.6B sets ``tie_word_embeddings=true``, so one matrix serves as both the
-input embedding and the output projection. That is why this is a single object
-with two methods rather than two separate layers: `__call__` reads rows out of it,
-`as_linear` multiplies by its transpose to produce logits.
+Qwen3-0.6B sets ``tie_word_embeddings=true``, so one matrix serves as both the input
+embedding and the output projection: hence one object with two methods rather than two
+layers. `__call__` reads rows out of it, `as_linear` multiplies by its transpose to
+produce logits.
 
-Worth noticing how much of the model this one matrix is. At `V x E` =
-151936 x 1024 it is about 155M of the 596M parameters, and untying it would add
-another 155M for no benefit at this scale.
+The matrix is a large fraction of the model. At `V x E` = 151936 x 1024 it is about 155M
+of the 596M parameters, and untying it would add another 155M.
 """
 
 from __future__ import annotations
@@ -45,12 +44,11 @@ class Embedding:
         return self.weight[ids]
 
     def as_linear(self, h: torch.Tensor) -> torch.Tensor:
-        """``h @ weightᵀ`` — the tied LM head.
+        """``h @ weightᵀ``: the tied LM head.
 
-        A vocabulary-wide matmul, so this is the single most expensive op in a
-        decode step: `E x V` work to produce logits for one token. The serving
-        layer only ever runs it on the *last* position of each sequence for that
-        reason.
+        A vocabulary-wide matmul, and the most expensive op in a decode step: `E x V`
+        work to produce logits for one token. The serving layer therefore runs it only
+        on the last position of each sequence.
         """
         if h.shape[-1] != self.dim:
             raise ValueError(f"expected last dimension {self.dim}, got {h.shape[-1]}")

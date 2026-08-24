@@ -1,21 +1,19 @@
 """The engine, end to end.
 
-Three kinds of test, in order of how much they can tell you when they fail:
+Three kinds of test, ordered by how much a failure localizes:
 
-* **Cross-implementation identity.** The paged engine against the dense one, on the
-  same weights and the same prompts. Everything between them is different — ragged
-  batch, paged cache, a kernel that gathers K and V through a block table — so if the
-  tokens agree, the whole of the serving layer agrees with the cached model. This is the
-  test to reach for first when something breaks.
-* **Pressure.** A pool small enough to force preemption, and one too small to run
-  anything at all. Preemption is the path an engine takes only under load, which is
-  exactly where nobody is watching it, so it is worth pinning at leisure.
-* **The API**, on real weights: token-identical to `transformers.generate` for sixteen
-  varied prompts.
+* Cross-implementation identity: the paged engine against the dense one, on the same
+  weights and prompts. Everything between them differs — ragged batch, paged cache, a
+  kernel that gathers K and V through a block table — so agreeing tokens mean the whole
+  serving layer agrees with the cached model. The first test to consult on a regression.
+* Pressure: a pool small enough to force preemption, and one too small to run anything.
+  Preemption only runs under load, so it is pinned explicitly here.
+* The API, on real weights: token-identical to `transformers.generate` for sixteen varied
+  prompts.
 
-The tiny-model tests deliberately do not go through `LLM`. `LLM` loads a checkpoint and
-a tokenizer, and a test that needs 1.2 GB of weights to check that a preempted sequence
-resumes correctly is a test nobody runs.
+The tiny-model tests do not go through `LLM`, which loads a checkpoint and a tokenizer;
+requiring 1.2 GB of weights to check that a preempted sequence resumes correctly would
+make the test too slow to run routinely.
 """
 
 from __future__ import annotations
@@ -228,8 +226,8 @@ def test_the_oracle_path_gives_the_same_tokens_without_a_gpu(tiny_qwen3):
     """`use_cuda=False` on the CPU, gathering each sequence's cache the slow way.
 
     Same tokens, no kernel, no device: the engine's correctness does not depend on the
-    CUDA kernels, which is what keeps the CUDA path honest — the two are compared
-    against each other, not each against itself.
+    CUDA kernels, so the two paths are compared against each other rather than each
+    against itself.
     """
     theirs = tiny_qwen3.to(dtype=torch.float32)
     bundle = (weights_from_hf(theirs), config_from_hf(theirs))
@@ -276,9 +274,9 @@ def test_a_small_pool_forces_preemption_and_changes_nothing(weights):
     expected = dense_reference(weights, PROMPTS, max_tokens=12)
 
     # Five pages of 8 slots against six requests that grow into fourteen between them.
-    # Admission fills the pool with the first four; the preemptions come from the
-    # *decodes* after that, when a running sequence crosses a page boundary and there is
-    # nothing free — which is the shape this actually takes under load.
+    # Admission fills the pool with the first four; the preemptions then come from the
+    # decodes, when a running sequence crosses a page boundary with nothing free, which is
+    # the shape this takes under load.
     model, manager = paged(weights, num_blocks=5)
     engine = Engine(model, manager, max_batched_tokens=16, max_sequences=6)
     sequences = [make(prompt, 12) for prompt in PROMPTS]
@@ -390,17 +388,15 @@ def real_engine(**kwargs):
 def llm():
     """One fp32 engine for the whole module: the weights are 2.4 GB in fp32.
 
-    **fp32 rather than the bf16 the engine actually serves in**, and the reason is the
-    only interesting caveat in this file. In bf16 the top two logits of a Qwen3 step are
-    frequently one rounding apart — a gap of 0.125 at a logit magnitude of 20 — so
-    greedy decoding has genuine ties, and two correct implementations that accumulate in
-    a different order pick differently. Six of these sixteen prompts diverge from
-    `transformers` in bf16 for exactly that reason, all of them at a tie.
+    fp32 rather than the bf16 the engine serves in, for one reason: in bf16 the top two
+    logits of a Qwen3 step are frequently one rounding apart — a gap of 0.125 at a logit
+    magnitude of 20 — so greedy decoding has genuine ties, and two correct implementations
+    that accumulate in a different order pick differently. Six of these sixteen prompts
+    diverge from `transformers` in bf16 for that reason, all at a tie.
 
-    Testing against that would mean a test that fails for a legitimate reason, which is
-    worse than no test. fp32 removes the ambiguity — every prompt then agrees to the
-    token — and `test_bf16_only_disagrees_at_a_tie` covers the bf16 path by showing that
-    its disagreements are ties and nothing else.
+    A test that fails for a legitimate reason is worse than no test, and fp32 removes the
+    ambiguity: every prompt then agrees to the token. `test_bf16_only_disagrees_at_a_tie`
+    covers the bf16 path by showing its disagreements are all ties.
     """
     return real_engine(dtype=torch.float32, num_blocks=192, max_sequences=16)
 
@@ -472,13 +468,12 @@ def test_bf16_only_disagrees_at_a_tie(llm):
     """The dtype the engine actually serves in, and what it costs.
 
     bf16 keeps 8 bits of mantissa, so a logit near 20 is quantized to steps of 0.125 and
-    two candidates can end up on adjacent representable values. When that happens the
-    argmax is decided by rounding, and the fp32 engine and the bf16 one disagree without
-    either being wrong.
+    two tokens can land on adjacent representable values. The argmax is then decided by
+    rounding, and the fp32 engine and the bf16 one disagree without either being wrong.
 
-    What would *not* be a tie is a bf16 run that picks a token the fp32 run does not rank
-    second — which is what this pins down, and it is the honest form of the
-    token-identity guarantee for the dtype that ships.
+    What would not be a tie is a bf16 run picking a token the fp32 run does not rank
+    second. That is what this pins down, and it is the token-identity guarantee stated for
+    the dtype that ships.
     """
     exact = llm.generate(REAL_PROMPTS, max_tokens=24)
     fast = real_engine(dtype=torch.bfloat16, num_blocks=192, max_sequences=16)

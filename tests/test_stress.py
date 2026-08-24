@@ -1,24 +1,22 @@
 """The scheduler under an adversarial arrival schedule.
 
-Two claims are on trial here, and they need different instruments.
+Two claims, needing different instruments.
 
-**"Chunked prefill lowers tail decode latency"** is a claim about time, and a test that
-asserts on milliseconds is a test that fails on a busy laptop. So the tests measure the
-thing the milliseconds are made of: how many *iterations* a decoding sequence goes
-without being scheduled. That number is deterministic, it is what the wall-clock tail is
-a monotone function of, and it is the head-of-line stall stated exactly: a decode should
-never wait for a whole prompt, and "stall of 1 iteration" is that requirement in a form
-pytest can check. `bench --mode scheduler` is where the same claim is measured in
-milliseconds.
+That chunked prefill lowers tail decode latency is a claim about time, and asserting on
+milliseconds fails on a busy laptop. The tests instead measure what the milliseconds are
+made of: how many iterations a decoding sequence goes without being scheduled. That count
+is deterministic, the wall-clock tail is a monotone function of it, and it states the
+head-of-line stall exactly — a decode should never wait for a whole prompt, and a stall of
+1 iteration is that requirement in a form pytest can check. `bench --mode scheduler`
+measures the same claim in milliseconds.
 
-**"A multi-thousand-request run leaks nothing"** is a claim about bookkeeping, and it
-needs volume rather than realism: thousands of requests through a pool small enough that
-preemption is routine, ending with every block back in the pool. The tiny model makes
-that a few seconds instead of an hour, and nothing about block accounting depends on
-how good the weights are.
+That a multi-thousand-request run leaks nothing is a claim about bookkeeping, needing
+volume rather than realism: thousands of requests through a pool small enough that
+preemption is routine, ending with every block back in the pool. The tiny model makes that
+a few seconds instead of an hour, and block accounting does not depend on weight quality.
 
-The invariant underneath both: **a scheduling policy may change timing, never output.**
-Every test that runs two policies compares their tokens as well as their latency.
+The invariant under both: a scheduling policy may change timing, never output. Every test
+that runs two policies compares their tokens as well as their latency.
 """
 
 from __future__ import annotations
@@ -47,9 +45,9 @@ from mini_vllm.serve.sequence import Sequence
 GREEDY = SamplingParams(temperature=0.0)
 BLOCK_SIZE = 8
 
-# The two policies, as the flags that distinguish them. `prefill_priority` without
-# chunking is what vLLM served with before chunked prefill landed, and it is the
-# baseline every latency comparison below is against.
+# The two policies, as the flags that distinguish them. `prefill_priority` without chunking
+# is what vLLM served with before chunked prefill landed, and is the baseline for every
+# latency comparison below.
 CHUNKED = {"enable_chunked_prefill": True, "prefill_priority": False}
 PREFILL_FIRST = {"enable_chunked_prefill": False, "prefill_priority": True}
 
@@ -65,9 +63,9 @@ def test_arrivals_are_monotone_and_average_out():
     assert times == sorted(times)
     assert times[0] > 0.0
 
-    # The mean gap of a Poisson process is 1/rate. Four thousand samples put the
-    # sample mean within a couple of percent, which is loose enough not to flake and
-    # tight enough to catch a rate that means something other than requests per second.
+    # The mean gap of a Poisson process is 1/rate. Four thousand samples put the sample
+    # mean within a couple of percent: loose enough not to flake, tight enough to catch a
+    # rate expressed in some other unit than requests per second.
     mean_gap = times[-1] / len(times)
     assert mean_gap == pytest.approx(1.0 / rate, rel=0.1)
 
@@ -192,9 +190,8 @@ class TinyEngine:
         self.scheduler = Scheduler(SchedulerConfig(**config), manager=manager)
         self.runner = PagedModelRunner(model, manager)
         self.stats = EngineStats()
-        # Per iteration: who got a token, how many tokens the iteration computed, and
-        # who was in it. That is enough to reconstruct every latency claim below without
-        # a clock.
+        # Per iteration: who got a token, how many tokens the iteration computed, and who
+        # was in it. Enough to reconstruct every latency claim below without a clock.
         self.history: list[Iteration] = []
 
     def add_request(self, prompt, max_tokens: int = 4, ignore_eos: bool = True) -> Sequence:
@@ -260,10 +257,10 @@ def build(engine_parts, num_blocks: int = 512, **config) -> TinyEngine:
 
 # ------------------------------------------------------- the head-of-line stall
 
-# The mix, scaled to the tiny model but the same shape as the benchmark's: short
-# requests being served while long prompts queue up behind them. `LONG_LEN` is four
-# times the budget, so with chunking off it cannot share an iteration with anything, and
-# it stays inside the tiny model's 256-position RoPE table with its output on top.
+# The mix, scaled to the tiny model but shaped like the benchmark's: short requests served
+# while long prompts queue behind them. `LONG_LEN` is four times the budget, so with
+# chunking off it cannot share an iteration, and it fits inside the tiny model's
+# 256-position RoPE table with its output on top.
 SHORT_LEN, LONG_LEN, BUDGET, CHUNK = 4, 128, 32, 8
 
 # How many iterations the short requests run alone before the long prompts arrive. The
@@ -286,19 +283,18 @@ class Mix:
 def run_mix(engine_parts, num_short: int = 6, num_long: int = 4, **policy) -> Mix:
     """Serve `num_short` short requests, drop `num_long` long prompts in, run it out.
 
-    The measurements, and why each is the one that matters:
+    The measurements:
 
-    * `stall` — the most iterations a short request went without a token once it had its
+    * `stall`: the most iterations a short request went without a token once it had its
       first. 1 means it got one in every iteration.
-    * `wait` — the most *tokens the engine computed* between two of its tokens. This is
-      the honest proxy for the wall-clock tail, because an iteration's cost is roughly
-      linear in its token count, and it is the quantity `bench --mode scheduler` sees
-      through a clock. Counting iterations instead would call sixteen small stalls worse
-      than five huge ones.
-    * `longest_iteration` — the largest iteration in the run. Chunked prefill's promise
-      is that this stays inside the configured budget.
-    * `prompt_start` — iterations from arrival to a long prompt's *first* scheduled
-      chunk, which is the head-of-line stall seen from the prompt's side.
+    * `wait`: the most tokens the engine computed between two of a request's tokens. The
+      proxy for the wall-clock tail, since an iteration's cost is roughly linear in its
+      token count, and the quantity `bench --mode scheduler` sees through a clock. Counting
+      iterations instead would rank sixteen small stalls above five huge ones.
+    * `longest_iteration`: the largest iteration in the run. Chunked prefill's guarantee is
+      that this stays inside the configured budget.
+    * `prompt_start`: iterations from arrival to a long prompt's first scheduled chunk, the
+      head-of-line stall seen from the prompt's side.
     """
     engine = build(engine_parts, max_batched_tokens=BUDGET, chunk_size=CHUNK, **policy)
     shorts = [engine.add_request([7] * SHORT_LEN, max_tokens=8) for _ in range(num_short)]
@@ -509,10 +505,10 @@ def test_three_thousand_requests_leak_no_blocks(engine_parts):
 def test_a_pool_that_forces_preemption_still_finishes_everything(engine_parts):
     """Under real pressure the engine preempts, recomputes, and still lands.
 
-    Preemption is the path that only runs when memory is tight, which is where nobody is
-    watching; this pins it at volume. A recomputed sequence re-prefills its prompt *and*
-    its output so far, so the guarantee being checked is progress — that the loop cannot
-    livelock trading pages between two sequences that both need them.
+    Preemption only runs when memory is tight, so it is rarely exercised; this pins it at
+    volume. A recomputed sequence re-prefills its prompt and its output so far, so the
+    guarantee checked here is progress: the loop cannot livelock trading pages between two
+    sequences that both need them.
     """
     engine = build(engine_parts, num_blocks=40, max_batched_tokens=BUDGET, chunk_size=CHUNK, **CHUNKED)
     requests = stress_requests(

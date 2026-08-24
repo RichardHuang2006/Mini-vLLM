@@ -1,29 +1,27 @@
 // Flash prefill: many query tokens against many keys, causally masked.
 //
-// Same recurrence as the decode attention kernel, but with `L > 1` there is a
-// second axis to tile, and two things change because of it.
+// Same online-softmax recurrence as the decode attention kernel, but `L > 1` adds a
+// second axis to tile, and two consequences follow.
 //
-// **Shared memory earns its place.** In decode each K element is touched by
-// exactly one dot product, so staging it would be a pure copy. Here every K
-// element is touched by all `kQueryTile` queries in the block and every V element
-// by all of them too, so a tile is loaded from global once (coalesced) and read
-// `kQueryTile` times from shared. That reuse is also what lets each *thread* own a
-// whole `(query, key)` dot product: no cross-lane reduction, unlike the decode
-// kernel where the warp had to shuffle because K came straight from global.
+// Shared memory pays off. In decode each K element feeds exactly one dot product, so
+// staging it would be a pure copy. Here every K and V element is touched by all
+// `kQueryTile` queries in the block, so a tile is loaded from global once (coalesced) and
+// read `kQueryTile` times from shared. That reuse also lets each thread own a whole
+// `(query, key)` dot product with no cross-lane reduction, unlike the decode kernel where
+// the warp must shuffle because K comes straight from global.
 //
-// **Half the work does not exist.** Query `i` may attend only to keys up to
-// `(S - L) + i`, so key tiles strictly above the diagonal are skipped rather than
-// computed and masked — for a square prefill that is half the flops. Only the tile
-// *on* the diagonal needs the per-element mask, and it is the tile where an
-// off-by-one lets a token see its own future and produces a model that scores
-// suspiciously well and generates nonsense.
+// Half the work does not exist. Query `i` may attend only to keys up to `(S - L) + i`, so
+// key tiles strictly above the diagonal are skipped rather than computed and masked —
+// half the flops for a square prefill. Only the tile on the diagonal needs the
+// per-element mask; an off-by-one there lets a token attend to its own future, which
+// lowers loss and generates nonsense.
 //
-// Shared layouts, both chosen for bank behaviour rather than tidiness:
+// Shared layouts, chosen for bank behaviour:
 //
 //   q_shared[i][d]      row-major   threads in a warp share `i`, so this broadcasts
 //   k_shared[d][j]      transposed  threads in a warp differ in `j`, so this is
-//                                   consecutive — padded by one to keep the
-//                                   coalesced *store* from conflicting as well
+//                                   consecutive — padded by one so the coalesced
+//                                   store does not conflict either
 //   v_shared[j][d]      row-major   the P·V phase has threads differ in `d`
 
 #include <ATen/cuda/CUDAContext.h>
@@ -75,9 +73,9 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   const int64_t sequence = blockIdx.z;
   const int64_t kv_head = query_head / group_size;
 
-  // The offset form of the causal mask in the PyTorch reference: with a filled
-  // cache the `L` queries are the *last* `L` positions of the sequence, so the
-  // diagonal is shifted right by S - L.
+  // The offset form of the PyTorch reference's causal mask: with a filled cache the `L`
+  // queries are the last `L` positions of the sequence, so the diagonal shifts right by
+  // S - L.
   const int64_t offset = source_len - query_len;
 
   const scalar_t* query = q + sequence * q_strides.batch + query_head * q_strides.head;
@@ -99,22 +97,21 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   const int score_query = thread / kKeyTile;
   const int score_key = thread % kKeyTile;
 
-  // The accumulator stays in registers — another kQueryTile x D floats of shared
-  // memory would not fit beside the three tiles. Thread `t` owns the
-  // `(query, dimension)` pairs `t, t + kThreads, ...`, one register each.
+  // The accumulator stays in registers; another kQueryTile x D floats of shared memory
+  // would not fit beside the three tiles. Thread `t` owns the `(query, dimension)` pairs
+  // `t, t + kThreads, ...`, one register each.
   //
-  // Every loop over these slots is bounded by a *compile-time* count and exits on
-  // a runtime predicate, rather than being bounded by the runtime count directly.
-  // That is deliberate: `accumulator[slot]` has to be a constant index for the
-  // array to live in registers at all, and a runtime trip count would silently
-  // spill it to local memory — correct, and several times slower.
+  // Every loop over these slots is bounded by a compile-time count and exits on a runtime
+  // predicate rather than being bounded by the runtime count directly: `accumulator[slot]`
+  // must be a constant index for the array to live in registers, and a runtime trip count
+  // spills it to local memory, which is correct but several times slower.
   constexpr int kSlots = (kQueryTile * kMaxHeadDim + kThreads - 1) / kThreads;
   float accumulator[kSlots];
 
-  // Which `(query, dimension)` each slot is, resolved once here rather than per
-  // tile. `head_dim` is a runtime value, so `index / head_dim` is a genuine integer
-  // division of around twenty instructions, and it belongs nowhere near a loop
-  // whose body is one multiply-add.
+  // Which `(query, dimension)` each slot is, resolved once here rather than per tile.
+  // `head_dim` is a runtime value, so `index / head_dim` is a real integer division of
+  // around twenty instructions and does not belong in a loop whose body is one
+  // multiply-add.
   int slot_query[kSlots];
   int slot_dim[kSlots];
   const int64_t owned = kQueryTile * head_dim;
@@ -140,9 +137,8 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   }
   __syncthreads();
 
-  // Every key tile that any query in this tile can see. The last query in the tile
-  // has the longest reach, so its bound is the block's bound — and skipping the
-  // rest is the causal speedup, not an optimization on top of it.
+  // Every key tile any query in this tile can see. The last query has the longest reach,
+  // so its bound is the block's bound; skipping the rest is the causal speedup itself.
   const int64_t last_key = offset + query_begin + kQueryTile - 1;
   const int64_t key_limit = last_key + 1 < source_len ? last_key + 1 : source_len;
 

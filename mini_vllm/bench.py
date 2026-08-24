@@ -1,47 +1,49 @@
-"""The measuring instrument for the rest of the project.
+"""Measurement harness for the kernels, the model and the engine.
 
-The CUDA kernels exist to make things faster, so they live or die on whether this
-file tells the truth. Three ways a GPU benchmark lies, all handled here:
+Three ways a GPU benchmark reports the wrong number, all handled here:
 
-* **Asynchronous launches.** CUDA calls return before the work finishes, so a
-  naive timer measures how fast Python can enqueue kernels. Every timed region is
-  bracketed by `torch.cuda.synchronize()`.
-* **A cold first iteration.** Allocator growth, cuBLAS autotuning and JIT loading
-  land on whichever iteration runs first, so there is a warmup.
-* **A throttled GPU.** This is the one that quietly ruins everything: a card
-  parked in a low power state runs 30x slow, and a benchmark that does not look
-  will happily report the number anyway. :func:`gpu_state` reads the clocks and
-  the harness prints a loud warning when they are far below maximum.
+* Asynchronous launches. CUDA calls return before the work finishes, so a naive timer
+  measures how fast Python enqueues kernels. Every timed region is bracketed by
+  `torch.cuda.synchronize()`.
+* A cold first iteration. Allocator growth, cuBLAS autotuning and JIT loading land on
+  whichever iteration runs first, so there is a warmup.
+* A throttled GPU. A card parked in a low power state runs 30x slow. :func:`gpu_state`
+  reads the clocks and the harness warns when they are far below maximum.
 
-The report also prints which ops ran as CUDA kernels, because "my kernel made no
-difference" is usually "my kernel never ran".
+The report also prints which ops ran as CUDA kernels, since a kernel that made no
+difference is usually a kernel that never ran.
 
-Prefill and decode are reported separately because they are separate problems.
-**TTFT** is dominated by a compute-bound pass over the whole prompt; **decode
-tokens/sec** is dominated by memory bandwidth, since each step reads all 1.2 GB of
-weights to produce one token. An optimization almost always helps one and not the
-other, so a single average would hide exactly what you need to see.
+Prefill and decode are reported separately. TTFT is dominated by a compute-bound pass over
+the whole prompt; decode tokens/sec is dominated by memory bandwidth, since each step reads
+all 1.2 GB of weights to produce one token. An optimization typically helps one and not the
+other, so a single average hides the effect.
 
-`--mode kernels` measures the CUDA kernels instead of the model, and reports
-achieved memory bandwidth rather than wall-clock. That is the right score for
-RMSNorm, RoPE and SwiGLU: they do a few flops per element, so their ceiling is how
-fast the card can move the bytes, and "80% of peak bandwidth" says something a
-millisecond figure does not.
+`--mode kernels` measures the CUDA kernels rather than the model and reports achieved
+memory bandwidth. That is the right metric for RMSNorm, RoPE and SwiGLU: they do a few
+flops per element, so their ceiling is how fast the card moves bytes.
 
-`--mode throughput` measures the engine rather than a single request, and it is the mode
-the README quotes. The unit is **output tokens per second over a whole request set**,
-submitted at once, against `transformers.generate` on the same set. That comparison is
-not quite apples to apples and the asymmetry is the finding: `generate` takes one padded
-rectangle, so sixteen prompts of 32 to 512 tokens all run for 512, while the engine gives
-each sequence its own length and admits a replacement the iteration a request finishes.
-Continuous batching and paging are what that gap is made of.
+`--mode throughput` measures the engine rather than a single request, and is the mode the
+README quotes. The unit is output tokens per second over a whole request set submitted at
+once, against `transformers.generate` on the same set. The comparison is asymmetric by
+construction, which is the finding: `generate` takes one padded rectangle, so sixteen
+prompts of 32 to 512 tokens all run for 512, while the engine gives each sequence its own
+length and admits a replacement the iteration a request finishes. That gap is what
+continuous batching and paging buy.
 
-`--mode scheduler` measures the *scheduler* rather than the model, on an adversarial mix:
-many 32-token requests with a 2048-token prompt dropped in every twentieth, arriving on a
-Poisson schedule. It replays that schedule twice through one engine — once with chunked
-prefill, once with the prefill-prioritized policy vLLM shipped before it — and reports
-the tail of the inter-token latency. Throughput barely moves between the two, which is
-the point: the same work is done either way, and what changes is who waits for it.
+`--mode scheduler` measures the scheduler on an adversarial mix: many 32-token requests
+with a 2048-token prompt dropped in every twentieth, arriving on a Poisson schedule. It
+replays that schedule twice through one engine — once with chunked prefill, once with the
+prefill-prioritized policy vLLM shipped before it — and reports the tail of the inter-token
+latency. Throughput barely moves between the two: the same work is done either way, and
+what changes is which requests wait for it.
+
+`--mode prefix-cache` runs the workload the radix tree exists for, many requests behind one
+long shared preamble, with caching on and off, and reports TTFT: a cache hit removes prompt
+tokens from the prefill and leaves decode unchanged.
+
+`--mode spec` sweeps the draft depth for speculative decoding and reports the acceptance
+rate beside the wall clock. Both columns are needed, since a draft deep enough to be
+accepted costs nearly what the target costs while a shallow one is cheap and rejected.
 
 Run it::
 
@@ -50,6 +52,8 @@ Run it::
     python -m mini_vllm.bench --mode kernels
     python -m mini_vllm.bench --mode throughput --batch-sizes 1,4,16 --compare hf
     python -m mini_vllm.bench --mode scheduler --num-requests 2000
+    python -m mini_vllm.bench --mode prefix-cache
+    python -m mini_vllm.bench --mode spec --draft-layers 4,14,28
 """
 
 from __future__ import annotations
@@ -97,9 +101,8 @@ __all__ = [
     "throughput_prompts",
 ]
 
-# Repeated to fill any requested prompt length. Real text rather than random ids:
-# speed does not care, but it keeps the generated continuation readable when
-# something looks wrong.
+# Repeated to fill any requested prompt length. Real text rather than random ids: speed is
+# unaffected, but it keeps the generated continuation readable when something looks wrong.
 FILLER = (
     "The city of Rome was founded in 753 BC by the twin brothers Romulus and Remus, "
     "and grew over the following centuries into the capital of an empire. "
@@ -111,7 +114,7 @@ FILLER = (
 
 @dataclass(frozen=True)
 class GpuState:
-    """What the GPU was actually doing, as opposed to what it can do."""
+    """What the GPU was doing, as opposed to what it is capable of."""
 
     name: str
     sm_clock: int
@@ -133,9 +136,8 @@ class GpuState:
     def is_throttled(self) -> bool:
         """True when the card is running far enough below its clocks to void results.
 
-        Half speed is the threshold. Boost behaviour means a healthy GPU never
-        sits at exactly its maximum, but a card at less than half of it is not
-        being benchmarked, it is being sampled while asleep.
+        Half speed is the threshold: boost behaviour means a healthy GPU never sits at
+        exactly its maximum, but under half of it the card is idle rather than working.
         """
         return self.sm_fraction < 0.5 or self.memory_fraction < 0.5
 
@@ -202,10 +204,9 @@ def gpu_state() -> GpuState | None:
 class ClockSampler:
     """Watches the GPU clocks in the background and keeps the highest seen.
 
-    A single reading proves nothing: clocks ramp, and one taken at the wrong
-    moment is either idle or a boost spike. The *peak over a run* answers the
-    question that matters — was the card ever allowed to go fast while the
-    measurement was running?
+    A single reading is not informative: clocks ramp, so one taken at the wrong moment is
+    either idle or a boost spike. The peak over a run establishes whether the card was
+    allowed to run fast while the measurement was in flight.
     """
 
     def __init__(self, interval: float = 0.25) -> None:
@@ -278,9 +279,8 @@ def measure_ours(
 ) -> SingleResult:
     """Time the cached model: prefill once, then ``output_len - 1`` decode steps.
 
-    Prefill is timed on its own rather than inferred, since the model exposes it
-    directly. Stop tokens are deliberately not passed: a run that ends early would
-    be timing a different amount of work than it claims.
+    Prefill is timed on its own rather than inferred, since the model exposes it directly.
+    Stop tokens are not passed: a run that ended early would time less work than it claims.
     """
     device = input_ids.device
 
@@ -324,10 +324,9 @@ def measure_hf(
 ) -> SingleResult:
     """Time `transformers.generate` on identical inputs.
 
-    TTFT comes from a one-token generation and the decode rate from the remainder
-    of a full run, because `generate` does not expose its prefill separately.
-    `min_new_tokens` pins the token count so an early stop cannot flatter the
-    result.
+    TTFT comes from a one-token generation and the decode rate from the remainder of a full
+    run, since `generate` does not expose its prefill separately. `min_new_tokens` pins the
+    token count so an early stop cannot inflate the result.
     """
     device = input_ids.device
 
@@ -375,9 +374,9 @@ def measure_hf(
 class BandwidthResult:
     """One kernel, timed and converted into bytes per second.
 
-    `bytes_moved` is the traffic the op *cannot avoid* — read the input, write the
-    output — not the traffic it happened to generate. Counting a redundant reread
-    would flatter a kernel for being wasteful, since the number would go up.
+    `bytes_moved` is the traffic the op cannot avoid — read the input, write the output —
+    rather than the traffic it happened to generate, so a redundant reread lowers the
+    reported rate instead of raising it.
     """
 
     label: str
@@ -407,10 +406,10 @@ class BandwidthResult:
 def theoretical_bandwidth(device: int = 0) -> float | None:
     """The card's peak memory bandwidth in GB/s, from its clock and bus width.
 
-    Double data rate, so the transfer rate is twice the reported memory clock. On
-    the hardware of record this comes to 384 GB/s (12.001 GHz over 128 bits),
-    which matches the published figure — worth checking on a new card, because a
-    peak that is wrong by 2x turns every percentage below it into fiction.
+    Double data rate, so the transfer rate is twice the reported memory clock. On the
+    hardware of record this comes to 384 GB/s (12.001 GHz over 128 bits), matching the
+    published figure. Worth re-checking on a new card: a peak that is wrong by 2x
+    invalidates every percentage derived from it.
     """
     if not torch.cuda.is_available():
         return None
@@ -428,9 +427,8 @@ def measure_bandwidth(
 ) -> BandwidthResult:
     """Time ``call`` back to back and report the traffic rate it sustained.
 
-    The whole run is bracketed by one pair of syncs rather than syncing each
-    iteration: a sync per call would time the synchronization for the short cases,
-    which is most of them.
+    The whole run is bracketed by one pair of syncs rather than syncing per iteration,
+    which for the short cases would time the synchronization instead.
     """
     for _ in range(warmup):
         call()
@@ -448,12 +446,10 @@ def measure_bandwidth(
 def copy_ceiling(megabytes: int = 256, dtype: torch.dtype = torch.bfloat16) -> BandwidthResult:
     """What a bare `copy_` of a large buffer achieves — the practical ceiling.
 
-    The theoretical peak is an upper bound nothing reaches; this is the number a
-    kernel that does nothing but move bytes actually gets on this machine today,
-    which makes it the fairer thing to be measured against. It doubles as the
-    throttle check described at the top of this module: if this is an order of
-    magnitude below spec, the GPU is asleep and every figure below it is
-    meaningless.
+    The theoretical peak is an upper bound nothing reaches; this is what a kernel that only
+    moves bytes achieves on this machine, making it the fairer baseline. It doubles as the
+    throttle check described at the top of this module: an order of magnitude below spec
+    means the GPU is idling and every figure below it is invalid.
     """
     elements = megabytes * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size()
     source = torch.randn(elements, device="cuda", dtype=dtype)
@@ -478,11 +474,9 @@ class KernelCase:
 def rows_exceeding_l2(width: int, dtype: torch.dtype, multiple: int = 8) -> int:
     """How many rows it takes for the working set to be `multiple` times the L2.
 
-    Needed because this card has a **32 MB** L2, which is larger than most of the
-    tensors a 0.6B model touches. A benchmark whose input and output both fit in
-    L2 is not measuring memory bandwidth at all, and it does not fail quietly: it
-    reports a number *above* the card's DRAM peak, which is the only reason the
-    problem is noticeable.
+    This card has a 32 MB L2, larger than most tensors a 0.6B model touches. A benchmark
+    whose input and output both fit in L2 is not measuring memory bandwidth; the symptom is
+    a reported rate above the card's DRAM peak.
     """
     element_size = torch.tensor([], dtype=dtype).element_size()
     l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
@@ -490,18 +484,29 @@ def rows_exceeding_l2(width: int, dtype: torch.dtype, multiple: int = 8) -> int:
     return max(1, multiple * l2_bytes // bytes_per_row)
 
 
+def _quantize_into(key, value, pools, use_cuda: bool):
+    """Scatter one step's KV into ``pools``, and hand back the key pool to compare.
+
+    `ops.quantize_scatter` writes in place and returns nothing, but a benchmark case must
+    return what it computed so `test_bench` can check that the kernel and its reference
+    agree rather than assuming a speedup is not one side doing less work. Returning the
+    pool is free: it is the tensor just written, not a copy.
+    """
+    ops.quantize_scatter(key, value, *pools, 1.0, 1.0, use_cuda=use_cuda)
+    return pools[0]
+
+
 def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
     """One case per implemented kernel per interesting shape.
 
-    Widths are the model's real ones; the row counts are chosen to separate three
-    regimes that a single number would blur together:
+    Widths are the model's real ones; the row counts separate three regimes a single number
+    would blur together:
 
-    * **1 row** — one block on one SM. This measures launch latency, and a decode
-      step is exactly this shape, so it is the case the engine actually lives in.
-    * **128 rows** — a prefill chunk. Enough blocks to fill the card, small enough
-      to sit in cache.
-    * **past L2** — the only regime where "fraction of peak bandwidth" means what
-      it says.
+    * 1 row: one block on one SM, measuring launch latency. A decode step has exactly this
+      shape, so it is the regime the engine spends its time in.
+    * 128 rows: a prefill chunk. Enough blocks to fill the card, small enough to sit in
+      cache.
+    * past L2: the only regime where a fraction of peak bandwidth is meaningful.
     """
     from mini_vllm.kernels.extension import load_extension
 
@@ -574,10 +579,9 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
             )
 
     if "decode_attention" in implemented:
-        # Attention is the one kernel whose work grows with the context rather
-        # than with the batch, so the axis swept here is the cache length. At 8192
-        # the K/V of a single layer is 32 MB — exactly this card's L2 — which is
-        # why only the longest context here is honestly DRAM-bound.
+        # Attention is the one kernel whose work grows with the context rather than the
+        # batch, so the swept axis is the cache length. At 8192 the K/V of a single layer
+        # is 32 MB, exactly this card's L2, so only the longest context is DRAM-bound.
         query_heads, kv_heads, head_dim = 16, 8, 128
         scale = 1.0 / math.sqrt(head_dim)
         for source_len in (128, 1024, 8192):
@@ -596,9 +600,9 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
             )
 
     if "flash_prefill" in implemented:
-        # Prefill is the one compute-bound case in this table, so its GB/s column
-        # is close to meaningless and the speedup column is the whole point: the
-        # oracle materializes an L x S score matrix that this kernel never writes.
+        # Prefill is the one compute-bound case in this table, so its GB/s column carries
+        # little information and the speedup column is what matters: the oracle
+        # materializes an L x S score matrix that this kernel never writes.
         query_heads, kv_heads, head_dim = 16, 8, 128
         scale = 1.0 / math.sqrt(head_dim)
         for query_len in (128, 512, 2048):
@@ -616,11 +620,11 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
             )
 
     if "paged_attention" in implemented:
-        # The engine's actual decode shape: a batch of sequences, one token each,
-        # attending over pages scattered through a pool. The reference is the
-        # dense-gather oracle, and the speedup column here is measuring something
-        # different from the rows above — not a better loop over the same data, but
-        # the removal of a full copy of every sequence's cache per iteration.
+        # The engine's decode shape: a batch of sequences, one token each, attending over
+        # pages scattered through a pool. The reference is the dense-gather oracle, so the
+        # speedup column measures something different from the rows above — not a better
+        # loop over the same data, but the removal of a full copy of every sequence's
+        # cache per iteration.
         query_heads, kv_heads, head_dim, block_size = 16, 8, 128, 16
         scale = 1.0 / math.sqrt(head_dim)
 
@@ -631,7 +635,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 pool_blocks, block_size, kv_heads, head_dim, device="cuda", dtype=dtype
             )
             values = torch.randn_like(keys)
-            # Shuffled on purpose: a pool in logical order would give the kernel
+            # Shuffled deliberately: a pool in logical order would give the kernel
             # sequential reads it will not get after a few thousand allocations.
             shuffled = torch.randperm(pool_blocks, device="cuda", dtype=torch.int32)
             block_tables = shuffled.reshape(batch, blocks_each).contiguous()
@@ -656,11 +660,11 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 )
             )
 
-        # A prefill chunk, which is the case the scalar kernel *loses*: the oracle
-        # materializes an L x S score matrix but computes it with cuBLAS, and tensor
-        # cores beat any amount of shared-memory tidiness at this arithmetic intensity.
-        # It is in the table because leaving it out would be choosing the shapes that
-        # flatter the kernel; a tensor-core prefill kernel is deferred on purpose.
+        # A prefill chunk, the case the scalar kernel loses: the oracle materializes an
+        # L x S score matrix but computes it with cuBLAS, and tensor cores win at this
+        # arithmetic intensity regardless of shared-memory layout. Kept in the table so
+        # the shapes are not selected to favour the kernel; a tensor-core prefill kernel
+        # is deferred.
         for query_len, context_len in ((512, 2048), (2048, 2048)):
             blocks_each = -(-context_len // block_size)
             keys = torch.randn(
@@ -689,6 +693,43 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                     ),
                     reference=lambda q=q, p=paged, ql=query_len, s=context_len: ops.paged_attention(
                         q, *p, ql, s, scale
+                    ),
+                    bytes_moved=moved,
+                )
+            )
+
+    if "kv_quantize_scatter" in implemented:
+        # Writing a step's KV into the FP8 cache. Pure memory traffic — a division, a cast
+        # and a store per element — making it the clearest fusion case here: the reference
+        # reads the activations, writes a whole quantized temporary, reads it back and
+        # scatters it, where the kernel reads once and writes once. The swept axis is the
+        # token count, which is what separates a decode step from a prefill chunk.
+        kv_heads, head_dim = 8, 128
+        for tokens, note in ((1, "decode, 1 token"), (512, "prefill chunk"), (4096, "past L2")):
+            key = torch.randn(tokens, kv_heads, head_dim, device="cuda", dtype=dtype)
+            value = torch.randn_like(key)
+            # Room for the tokens several times over, so the slots are scattered rather
+            # than the contiguous run a fresh pool would hand out.
+            pool_slots = max(4096, 4 * tokens)
+            slots = torch.randperm(pool_slots, device="cuda")[:tokens].to(torch.int64)
+
+            def pools() -> tuple:
+                shape = (pool_slots, kv_heads, head_dim)
+                empty = torch.zeros(shape, device="cuda", dtype=torch.float8_e4m3fn)
+                return (empty, torch.zeros_like(empty), slots)
+
+            # One read of the activations and one write of the quantized byte per element
+            # of each of K and V. The reference moves a whole quantized temporary on top
+            # of that, written and read back, which is what the case measures.
+            moved = 2 * key.numel() * (key.element_size() + 1)
+
+            kernel_pools, reference_pools = pools(), pools()
+            cases.append(
+                KernelCase(
+                    label=f"kv_quantize_scatter T={tokens} ({note})",
+                    kernel=lambda k=key, v=value, p=kernel_pools: _quantize_into(k, v, p, True),
+                    reference=lambda k=key, v=value, p=reference_pools: _quantize_into(
+                        k, v, p, False
                     ),
                     bytes_moved=moved,
                 )
@@ -740,10 +781,10 @@ def run_kernels(
 
 # ------------------------------------------------------------------ throughput
 
-# The prompt lengths a throughput run cycles through. Varied on purpose: equal-length
-# prompts are the one case where padding costs nothing, so a benchmark that used them
-# would hide most of what continuous batching and paging buy. A 16x spread between the
-# shortest and the longest is ordinary for a chat workload.
+# The prompt lengths a throughput run cycles through. Varied deliberately: equal-length
+# prompts are the one case where padding costs nothing, so using them would hide most of
+# what continuous batching and paging buy. A 16x spread between shortest and longest is
+# ordinary for a chat workload.
 THROUGHPUT_LENGTHS = (32, 64, 128, 256, 512)
 
 
@@ -759,7 +800,7 @@ class ThroughputResult:
 
     @property
     def tokens_per_second(self) -> float:
-        """*Output* tokens per second — the number a serving SLO is written against."""
+        """Output tokens per second, the unit a serving SLO is written against."""
         return self.generated_tokens / self.seconds if self.seconds else 0.0
 
     @property
@@ -788,13 +829,12 @@ def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
 def measure_engine(llm, prompts: list[str], output_len: int, warmup: int = 1) -> ThroughputResult:
     """Time the engine over the whole request set, submitted all at once.
 
-    All at once because that is the workload continuous batching is for: the engine
-    decides what shares each iteration, admits a replacement the moment a request
-    finishes, and never waits for the longest member of a fixed batch.
+    All at once, since that is the workload continuous batching is for: the engine decides
+    what shares each iteration, admits a replacement the moment a request finishes, and
+    never waits for the longest member of a fixed batch.
 
-    `ignore_eos` fixes the token count. Without it a run where three requests stop at
-    token 9 is being credited with less work than the baseline does, and the comparison
-    stops being one.
+    `ignore_eos` fixes the token count; without it a run where three requests stop at
+    token 9 would be credited with less work than the baseline performs.
     """
     for _ in range(warmup):
         llm.generate(prompts[: min(2, len(prompts))], max_tokens=4, ignore_eos=True)
@@ -819,11 +859,10 @@ def measure_hf_throughput(
 ) -> ThroughputResult:
     """Time `transformers.generate` on the same set, as one padded batch.
 
-    One padded batch is what `generate` offers, and the padding is the baseline's real
-    cost rather than a handicap invented here: sixteen prompts of 32 to 512 tokens
-    become a `16 x 512` rectangle, every row runs for the longest row's length, and the
-    KV cache is allocated for all of it. Reporting it any other way would be measuring a
-    serving engine against something nobody serves with.
+    One padded batch is what `generate` offers, and the padding is the baseline's real cost
+    rather than a handicap imposed here: sixteen prompts of 32 to 512 tokens become a
+    `16 x 512` rectangle, every row runs for the longest row's length, and the KV cache is
+    allocated for all of it.
     """
     encoded = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")
     encoded = {key: value.to(hf_model.device) for key, value in encoded.items()}
@@ -867,10 +906,9 @@ def run_throughput(arguments) -> tuple[list[tuple[int, ThroughputResult, Through
     tokenizer = AutoTokenizer.from_pretrained(path)
     batch_sizes = [int(size) for size in arguments.batch_sizes.split(",")]
 
-    # The baseline is loaded *first* when there is one, because the engine sizes its KV
-    # pool from the memory that is free when it starts. Loading it second would hand it
-    # a budget it then has to give back, and on an 8 GB card that is the difference
-    # between a comparison and an out-of-memory error.
+    # The baseline is loaded first when there is one, because the engine sizes its KV pool
+    # from the memory free at startup. Loading it second would hand the engine a budget it
+    # then has to give back, which on an 8 GB card is an out-of-memory error.
     hf_model = None
     if arguments.compare == "hf":
         from transformers import AutoModelForCausalLM
@@ -945,10 +983,10 @@ def report_throughput(arguments) -> None:
 
 # -------------------------------------------------------------- scheduler stress
 
-# The adversarial mix, and every default here is chosen to make the head-of-line stall
-# visible rather than to flatter the scheduler. Many short requests are what a chat
-# workload is; the occasional 2048-token prompt is a document summary landing in the
-# middle of it, and it is the one request that can hurt everybody else.
+# The adversarial mix. Every default here is chosen to make the head-of-line stall visible
+# rather than to favour the scheduler: many short requests are the chat workload, and the
+# occasional 2048-token prompt is a document summary landing in the middle of it, the one
+# request that can delay every other.
 STRESS_SHORT_LEN = 32
 STRESS_LONG_LEN = 2048
 STRESS_LONG_EVERY = 20
@@ -971,10 +1009,9 @@ class StressRequest:
 def poisson_arrivals(num_requests: int, rate: float, seed: int = 0) -> list[float]:
     """Arrival times of a Poisson process of `rate` requests per second.
 
-    Poisson rather than evenly spaced because evenly spaced is the easy case: the hard
-    thing about a scheduler is a *burst*, and exponential gaps produce them for free —
-    a third of the gaps are shorter than a third of the mean. Rate 0 means "all at once",
-    which is the throughput benchmark's workload rather than a serving one.
+    Poisson rather than evenly spaced: bursts are what stress a scheduler, and exponential
+    gaps produce them, with a third of the gaps shorter than a third of the mean. Rate 0
+    means all at once, the throughput benchmark's workload rather than a serving one.
     """
     if num_requests < 0:
         raise ValueError(f"num_requests must be >= 0, got {num_requests}")
@@ -1003,9 +1040,9 @@ def stress_requests(
 ) -> list[StressRequest]:
     """`num_requests` arrivals, one long prompt every `long_every` short ones.
 
-    Prompts are random token ids, not text. Nothing here reads the output, and a
+    Prompts are random token ids rather than text: nothing here reads the output, and a
     tokenizer call per request would put minutes of Python between the engine and the
-    thing being measured.
+    measurement.
     """
     generator = random.Random(seed + 1)
     arrivals = poisson_arrivals(num_requests, rate, seed)
@@ -1024,8 +1061,8 @@ def stress_requests(
 def percentile(values: SequenceABC[float], fraction: float) -> float:
     """The nearest-rank percentile: the smallest sample at or above `fraction` of them.
 
-    No interpolation. A P99 that averages two neighbours reports a latency that no
-    request experienced, and the point of a tail figure is that somebody waited it.
+    No interpolation: a P99 that averages two neighbours reports a latency no request
+    experienced, where a tail figure should name one a caller actually waited.
     """
     if not values:
         return 0.0
@@ -1038,11 +1075,10 @@ def percentile(values: SequenceABC[float], fraction: float) -> float:
 class LatencyStats:
     """One policy's run over the stress mix, in the units an SLO is written in.
 
-    `inter_token` is the gap between consecutive tokens of the *same* sequence, which
-    is the latency a caller reading a stream actually sees. Its tail is the metric the
-    scheduler stress benchmark exists to move: a mean hides a stall, because one iteration
-    spent on a 2048-token prompt is amortized away by the hundreds of fast iterations
-    around it.
+    `inter_token` is the gap between consecutive tokens of the same sequence, the latency a
+    caller reading a stream sees. Its tail is the metric the scheduler stress benchmark
+    exists to move: a mean hides a stall, since one iteration spent on a 2048-token prompt
+    is amortized away by the hundreds of fast iterations around it.
     """
 
     label: str
@@ -1076,11 +1112,11 @@ class LatencyStats:
     def max_iteration_ms(self) -> float:
         """The slowest single iteration, which is the tail's floor.
 
-        Worth reporting beside the inter-token tail because it separates the two things
-        that produce a long gap: a decode that was not scheduled for several iterations
-        (a policy problem, which is what this mode is about) and one iteration that took
-        a long time (a machine problem — allocator growth, a driver stall, something else
-        on the GPU). A P99 gap of roughly one iteration is the scheduler behaving.
+        Reported beside the inter-token tail because it separates the two causes of a long
+        gap: a decode that was not scheduled for several iterations (a policy problem, what
+        this mode measures) and one iteration that took a long time (allocator growth, a
+        driver stall, other work on the GPU). A P99 gap of roughly one iteration means the
+        scheduler is behaving.
         """
         return max(self.iteration_seconds, default=0.0) * 1000.0
 
@@ -1090,14 +1126,13 @@ class LatencyStats:
 
     @property
     def stalled_seconds(self) -> float:
-        """Total time callers spent waiting *beyond* a normal iteration, summed.
+        """Total time callers spent waiting beyond a normal iteration, summed.
 
-        The load-robust view of the same thing the tail describes. A percentile answers
-        "how bad was the bad case", which depends on how many callers were unlucky and
-        therefore on the arrival rate; this answers "how much waiting did the policy
-        cause in total", which does not. One median iteration per gap is the floor —
-        nobody gets a token faster than the engine produces one — so only the excess
-        counts.
+        The load-robust view of what the tail describes. A percentile reports how bad the
+        bad case was, which depends on how many callers were unlucky and therefore on the
+        arrival rate; this reports how much waiting the policy caused in total, which does
+        not. One median iteration per gap is the floor, since no caller gets a token faster
+        than the engine produces one, so only the excess counts.
         """
         floor = percentile(self.iteration_seconds, 0.50)
         return sum(max(gap - floor, 0.0) for gap in self.inter_token)
@@ -1126,14 +1161,13 @@ def run_stress(
 ) -> LatencyStats:
     """Replay an arrival schedule through the engine, timing every token.
 
-    The driver is the honest shape for a synchronous engine: admit whatever is due,
-    run one iteration, record what came out. Arrivals are therefore quantized to
-    iteration boundaries, and the wait that quantization causes is counted in TTFT —
-    which is correct, because a real server admits at the same boundaries.
+    The driver matches the shape of a synchronous engine: admit whatever is due, run one
+    iteration, record what came out. Arrivals are therefore quantized to iteration
+    boundaries and the resulting wait is counted in TTFT, which is correct since a real
+    server admits at the same boundaries.
 
-    Timing is taken after `step` returns, and `step` samples, which reads a device
-    tensor and so waits for the iteration's work. No extra synchronize is needed and
-    adding one would time it.
+    Timing is taken after `step` returns. `step` samples, which reads a device tensor and
+    so waits for the iteration's work, making an extra synchronize unnecessary.
     """
     pending = deque(sorted(requests, key=lambda request: request.arrival))
     arrival_of: dict[int, float] = {}
@@ -1173,8 +1207,8 @@ def run_stress(
             stats.completed += int(sequence.is_done())
 
         stats.iterations += 1
-        # The finished list is a record for the tests; over thousands of requests it
-        # would hold every prompt of the run in memory.
+        # The finished list exists for the tests; over thousands of requests it would hold
+        # every prompt of the run in memory.
         llm.scheduler.finished.clear()
 
         if progress_every and stats.iterations % progress_every == 0:
@@ -1223,8 +1257,8 @@ def run_scheduler(arguments) -> tuple[list[LatencyStats], GpuState | None]:
         f"{long_prompts} of {arguments.long_len}"
     )
 
-    # Same requests, same engine, same pool — one boolean pair apart. The chunked run
-    # goes first so that a crash in the baseline still leaves the interesting number.
+    # Same requests, same engine, same pool, one boolean pair apart. The chunked run goes
+    # first so a crash in the baseline still leaves the interesting number.
     policies = (
         ("chunked prefill", {"enable_chunked_prefill": True, "prefill_priority": False}),
         ("prefill-priority", {"enable_chunked_prefill": False, "prefill_priority": True}),
@@ -1277,19 +1311,18 @@ def report_scheduler(arguments) -> None:
             )
 
         print(
-            f"\nThe worst gap is the claim that holds regardless of load. Chunking bounds an\n"
-            f"iteration to the {arguments.max_batched_tokens}-token budget, so it bounds the "
-            "longest a decode can wait —\nby configuration, rather than by whatever prompt "
-            f"happens to arrive. The baseline lets a\n{arguments.long_len}-token prompt take "
-            "an iteration to itself and excludes the decodes from it, so\ntheir wait is that "
-            "prompt's length plus the next iteration.\n"
-            "\n`decode stalled` is the same total waiting under both policies, which is the "
-            "honest\nshape of the result: chunked prefill *redistributes* the stall rather "
-            "than removing it —\nmany decodes waiting one chunk each instead of a few waiting "
-            "a whole prompt. Whether that\nshows up in P99 depends on how many decodes are in "
-            "flight when a long prompt lands, so\nread the P99 row together with the TTFT "
-            "above it: a run whose queue never grows has few\nvictims per prompt and a P99 "
-            "that misses them entirely."
+            "\nThe worst-case gap is the bound that holds regardless of load. Chunking caps an\n"
+            f"iteration at the {arguments.max_batched_tokens}-token budget, so the longest a "
+            "decode can wait is set\nby configuration rather than by the longest prompt to "
+            f"arrive. The baseline gives\na {arguments.long_len}-token prompt an iteration to "
+            "itself and excludes decodes from it, so their\nwait is that prompt's length plus "
+            "the next iteration.\n"
+            "\n`decode stalled` is the same total under both policies: chunked prefill\n"
+            "redistributes the stall rather than removing it, spreading one chunk of waiting\n"
+            "across many decodes instead of a whole prompt across a few. Whether that reaches\n"
+            "P99 depends on how many decodes are in flight when a long prompt lands, so read\n"
+            "the P99 row alongside the TTFT above it: a run whose queue never grows has few\n"
+            "affected decodes per prompt and a P99 that misses them entirely."
         )
 
     _report_gpu_state(state)
@@ -1326,8 +1359,8 @@ def run_single(arguments) -> tuple[list[SingleResult], GpuState | None]:
         if arguments.no_cache:
             from mini_vllm.generate import generate_ids
 
-            # The uncached model has no cache to prefill, so TTFT and the decode
-            # rate are both timed through the naive loop.
+            # The uncached model has no cache to prefill, so TTFT and the decode rate are
+            # both timed through the naive loop.
             results = [
                 _measure_uncached(loaded.model, input_ids, arguments, label, generate_ids)
             ]
@@ -1423,14 +1456,187 @@ def report_kernels(arguments) -> None:
     _report_gpu_state(state)
 
 
+def run_prefix_cache(arguments) -> tuple[list[tuple[str, float, int, int]], GpuState | None]:
+    """`--mode prefix-cache`: the same shared-preamble workload with the cache on and off.
+
+    The workload is the one prefix caching exists for and the one a chat server has: many
+    requests opening with the same long system prompt and differing only in a short
+    question. The reported figure is TTFT, where a cache hit lands: it removes prompt
+    tokens from the prefill, so the first token arrives sooner while decode is untouched.
+    """
+    from mini_vllm import LLM
+    from mini_vllm.sampler import SamplingParams
+
+    preamble = (
+        "You are a careful, concise assistant. Answer accurately, admit uncertainty, "
+        "and prefer short replies to long ones. "
+    ) * 12
+    questions = [
+        "What is the capital of France?",
+        "Name a prime number above fifty.",
+        "What colour is a ripe banana?",
+        "How many days are in a leap year?",
+        "What is the chemical symbol for gold?",
+        "Who wrote the Odyssey?",
+    ]
+    prompts = [preamble + question for question in questions]
+    greedy = SamplingParams(temperature=0.0)
+
+    rows: list[tuple[str, float, float, int]] = []
+    with ClockSampler() as sampler:
+        for label, enabled in (("caching off", False), ("caching on", True)):
+            llm = LLM(
+                arguments.model,
+                device=arguments.device,
+                kv_fraction=arguments.kv_fraction,
+                enable_prefix_caching=enabled,
+                use_cuda_kernels=arguments.use_cuda_kernels,
+            )
+            # Warm the cache the way a server would: by the time the second request
+            # arrives the preamble is resident, and a cold first run would understate
+            # what the cache does for every request after it.
+            llm.generate(prompts[0], sampling_params=greedy, max_tokens=1)
+
+            # One request at a time, so TTFT is per request. Submitted together, six
+            # prefills share an iteration and the figure would measure the batch instead.
+            ttfts = []
+            for prompt in prompts:
+                started = time.perf_counter()
+                for _update in llm.generate_stream(
+                    prompt, sampling_params=greedy, max_tokens=arguments.output_len
+                ):
+                    ttfts.append(time.perf_counter() - started)
+                    break
+
+            total_started = time.perf_counter()
+            llm.generate(prompts, sampling_params=greedy, max_tokens=arguments.output_len)
+            total = time.perf_counter() - total_started
+
+            rows.append(
+                (label, 1000 * sum(ttfts) / len(ttfts), total, llm.stats.cached_tokens)
+            )
+            del llm
+            _free_device_memory()
+
+    return rows, sampler.peak
+
+
+def report_prefix_cache(arguments) -> None:
+    """Print the cache-on/cache-off comparison for `--mode prefix-cache`."""
+    rows, state = run_prefix_cache(arguments)
+
+    print(
+        f"\n6 requests sharing one long preamble, {arguments.output_len} output tokens "
+        f"each, greedy.\n"
+    )
+    print(f"{'policy':<14} {'mean TTFT':>11} {'batch secs':>11} {'cached tokens':>15}")
+    for label, ttft, total, cached in rows:
+        print(f"{label:<14} {ttft:>9.1f}ms {total:>11.3f} {cached:>15}")
+
+    if len(rows) == 2:
+        off, on = rows[0], rows[1]
+        print(
+            f"\nwith the cache: {off[1] / on[1]:.2f}x on TTFT. Decode is untouched, which is\n"
+            "why the whole-batch column barely moves — a cache hit removes prompt tokens\n"
+            "from the prefill and nothing else, so a run dominated by decode cannot show it."
+        )
+
+    _report_gpu_state(state)
+
+
+def run_spec(arguments) -> tuple[list[tuple[str, float, int, float, float]], GpuState | None]:
+    """`--mode spec`: speculation off, then on at a sweep of draft depths.
+
+    Reports the acceptance rate beside the wall clock, since either alone is misleading: a
+    deep draft is accepted often and costs nearly what the target costs, while a shallow one
+    is cheap and rejected.
+    """
+    from mini_vllm import LLM
+    from mini_vllm.sampler import SamplingParams
+
+    prompt = "Explain, step by step, why the sky appears blue during the day."
+    greedy = SamplingParams(temperature=0.0)
+    depths = [int(depth) for depth in arguments.draft_layers.split(",") if depth]
+
+    rows: list[tuple[str, float, int, float, float]] = []
+    with ClockSampler() as sampler:
+        for label, spec_tokens, layers in [("no speculation", 0, 0)] + [
+            (f"k={arguments.num_speculative_tokens}, {depth} draft layers",
+             arguments.num_speculative_tokens, depth)
+            for depth in depths
+        ]:
+            llm = LLM(
+                arguments.model,
+                device=arguments.device,
+                kv_fraction=arguments.kv_fraction,
+                num_speculative_tokens=spec_tokens,
+                num_draft_layers=layers or None,
+                use_cuda_kernels=arguments.use_cuda_kernels,
+            )
+            llm.generate(prompt, sampling_params=greedy, max_tokens=4)  # warm up
+
+            started = time.perf_counter()
+            completion = llm.generate(
+                prompt, sampling_params=greedy, max_tokens=arguments.output_len
+            )[0]
+            elapsed = time.perf_counter() - started
+
+            if llm.spec is None:
+                rows.append((label, elapsed, len(completion.token_ids), 0.0, 1.0))
+            else:
+                stats = llm.spec.stats
+                rows.append((
+                    label, elapsed, len(completion.token_ids),
+                    stats.acceptance_rate, stats.tokens_per_step,
+                ))
+            del llm
+            _free_device_memory()
+
+    return rows, sampler.peak
+
+
+def report_spec(arguments) -> None:
+    """Print the speculation table for `--mode spec`."""
+    rows, state = run_spec(arguments)
+
+    print(f"\none greedy request, {arguments.output_len} output tokens.\n")
+    print(f"{'configuration':<32} {'seconds':>9} {'tokens':>7} {'accept':>8} {'tok/pass':>9}")
+    for label, elapsed, tokens, acceptance, per_step in rows:
+        print(f"{label:<32} {elapsed:>9.3f} {tokens:>7} {acceptance:>8.3f} {per_step:>9.2f}")
+
+    print(
+        "\nAcceptance and wall clock have to be read together: a draft deep enough to be\n"
+        "accepted costs nearly what the target costs, and a shallow one is rejected."
+    )
+    _report_gpu_state(state)
+
+
+def _free_device_memory() -> None:
+    """Release the allocator's cache so the next engine sizes itself against real free
+    memory."""
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Mini-vLLM.")
     parser.add_argument(
-        "--mode", default="single", choices=["single", "kernels", "throughput", "scheduler"]
+        "--mode",
+        default="single",
+        choices=["single", "kernels", "throughput", "scheduler", "prefix-cache", "spec"],
+    )
+    parser.add_argument(
+        "--num-speculative-tokens", type=int, default=4, help="--mode spec: proposals per step"
+    )
+    parser.add_argument(
+        "--draft-layers", default="4,14,28", help="--mode spec: draft depths to sweep"
     )
     parser.add_argument("--input-len", type=int, default=128)
-    # Resolved below, because the right default depends on the mode: a latency run
-    # wants a long generation from few requests, and a stress run wants the opposite.
+    # Resolved below, since the right default depends on the mode: a latency run wants a
+    # long generation from few requests, and a stress run wants the opposite.
     parser.add_argument("--output-len", type=int, default=None)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--batch-sizes", default="1,4,16", help="--mode throughput: concurrency to sweep")
@@ -1439,12 +1645,11 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--kv-fraction", type=float, default=0.4)
     parser.add_argument("--num-requests", type=int, default=2000, help="--mode scheduler")
-    # Near what this card sustains on the mix below, because that is where a scheduler is
-    # interesting. Far under capacity, a long prompt catches only one or two decodes and
-    # the tail percentiles never see it; far over, every policy ends up with an unbounded
-    # queue and the tail measures the backlog instead of the decision. The run reports
-    # TTFT: around a second means the rate is about right for this machine, tens of
-    # seconds means lower it.
+    # Near what this card sustains on the mix below, which is where scheduling decisions
+    # show up. Far under capacity a long prompt catches only one or two decodes and the
+    # tail percentiles never see it; far over, every policy accumulates an unbounded queue
+    # and the tail measures the backlog rather than the decision. The run reports TTFT:
+    # around a second means the rate suits this machine, tens of seconds means lower it.
     parser.add_argument("--rate", type=float, default=16.0, help="--mode scheduler: arrivals/sec")
     parser.add_argument("--short-len", type=int, default=STRESS_SHORT_LEN)
     parser.add_argument("--long-len", type=int, default=STRESS_LONG_LEN)
@@ -1473,6 +1678,12 @@ def main() -> None:
         return
     if arguments.mode == "scheduler":
         report_scheduler(arguments)
+        return
+    if arguments.mode == "prefix-cache":
+        report_prefix_cache(arguments)
+        return
+    if arguments.mode == "spec":
+        report_spec(arguments)
         return
 
     results, state = run_single(arguments)

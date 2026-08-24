@@ -1,16 +1,14 @@
 """The KV cache, and the interface a paged one hides behind.
 
-Attention at position `t` needs the keys and values of every position `0..t`, and
-those do not change once computed. The uncached model recomputes them all anyway,
-every single step, which is why generation runs at 1 token/s. Caching them turns
-decode from quadratic into linear work.
+Attention at position `t` needs the keys and values of every position `0..t`, and those
+do not change once computed. An uncached model recomputes all of them every step, making
+decode quadratic in the sequence length; caching them makes it linear.
 
-:class:`KvCache` is abstract for one reason: the block manager provides a paged
-implementation that stores the same tensors in fixed-size blocks scattered across
-a pool, and the model must not be able to tell the difference. So the interface is
-deliberately narrow — one method, taking the new keys and values and returning
-everything accumulated so far — and any cache that satisfies it can be swapped in
-without the model changing.
+:class:`KvCache` is abstract so the paged implementation — the same tensors stored in
+fixed-size blocks scattered across a pool — is indistinguishable to the model. The
+interface is therefore one method, taking the new keys and values and returning
+everything accumulated so far, and any cache satisfying it can be substituted without
+changing the model.
 """
 
 from __future__ import annotations
@@ -46,15 +44,13 @@ class KvCache(ABC):
             returns full_key/value: B x H_k x S x D     where S = offset + L
             returns offset:         the length *before* this call
 
-        The returned offset is the position this update was written *at*, not the
-        length afterwards — so ``S == offset + L`` holds as written above, and
-        ``self.offset`` afterwards equals ``S``. The distinction matters because
-        the caller uses it to build a causal mask, and being off by ``L`` there
-        silently lets a token attend to its own future.
+        The returned offset is the position this update was written at, not the length
+        afterwards, so ``S == offset + L`` and ``self.offset`` afterwards equals ``S``.
+        The caller builds a causal mask from it, and being off by ``L`` there lets a
+        token attend to its own future.
 
-        Note that keys must already have RoPE applied before they get here.
-        Positions are baked into the cached tensors, which is what makes a cache
-        entry reusable at all.
+        Keys must already have RoPE applied: positions are baked into the cached
+        tensors, which is what makes a cache entry reusable.
         """
 
     @abstractmethod
@@ -65,20 +61,16 @@ class KvCache(ABC):
 class DenseKvCache(KvCache):
     """A cache that simply concatenates along the sequence dimension.
 
-    The obvious implementation, and a deliberately flawed one. Two costs, both of
-    which the serving layer exists to remove:
+    The obvious implementation, with two costs the serving layer exists to remove:
 
-    * **Every decode step reallocates.** ``torch.cat`` cannot extend a tensor in
-      place, so appending one token to a cache of `S` copies all `S` positions to
-      a new buffer. Over a full generation that is quadratic memory traffic to
-      store linear data.
-    * **One contiguous block per sequence.** A batch of sequences with different
-      lengths has to be padded to the longest, and a sequence that might reach
-      40960 tokens has to be budgeted for as if it will. That is the fragmentation
-      problem PagedAttention solves.
+    * Every decode step reallocates. ``torch.cat`` cannot extend a tensor in place, so
+      appending one token to a cache of `S` copies all `S` positions into a new buffer:
+      quadratic memory traffic to store linear data.
+    * One contiguous allocation per sequence. A batch of differing lengths must be padded
+      to the longest, and a sequence that might reach 40960 tokens has to be budgeted as
+      if it will — the fragmentation PagedAttention removes.
 
-    It is correct, though, and correct is what makes it the oracle for the paged
-    version.
+    It is correct, which makes it the oracle for the paged version.
     """
 
     def __init__(self) -> None:

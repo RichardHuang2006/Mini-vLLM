@@ -1,9 +1,8 @@
 """Sampling: greedy, temperature, top-k, top-p.
 
-Sampling is awkward to test because the output is random, so the tests here lean
-on three things that are not: the distribution `sampling_probabilities` returns,
-exact reproducibility under a seeded generator, and — for the one genuinely
-statistical claim — enough draws that Monte-Carlo error is smaller than the effect
+The output is random, so the tests rely on three things that are not: the distribution
+`sampling_probabilities` returns, exact reproducibility under a seeded generator, and, for
+the one statistical claim, enough draws that Monte-Carlo error is smaller than the effect
 being measured.
 """
 
@@ -107,7 +106,7 @@ def test_temperature_one_is_plain_softmax(logits):
 
 
 def test_low_temperature_sharpens_and_high_flattens(logits):
-    """Entropy is the honest summary: cold is more certain, hot is less."""
+    """Entropy summarizes the effect: cold is more certain, hot is less."""
 
     def entropy(temperature: float) -> torch.Tensor:
         probabilities = sampling_probabilities(logits, SamplingParams(temperature=temperature))

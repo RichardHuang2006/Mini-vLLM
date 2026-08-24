@@ -11,7 +11,8 @@ VENV    = .venv
 VENVBIN = $(VENV)/bin
 TORCH_INDEX = https://download.pytorch.org/whl/cu130
 
-.PHONY: setup ext test test-cpu bench bench-throughput bench-scheduler bench-kernels clean help
+.PHONY: setup ext test test-cpu bench bench-throughput bench-scheduler bench-kernels \
+        bench-prefix-cache bench-spec clean help
 .DEFAULT_GOAL := help
 
 # ------------------------------------------------------------------- setup ---
@@ -65,6 +66,17 @@ bench-scheduler:
 bench-kernels:
 	$(PYTHON) -m mini_vllm.bench --mode kernels
 
+# Radix-tree prefix caching on and off over a shared-preamble workload. Reports TTFT,
+# because that is the only place a cache hit lands: it takes prompt tokens out of the
+# prefill and leaves decode exactly as it was.
+bench-prefix-cache:
+	$(PYTHON) -m mini_vllm.bench --mode prefix-cache --use-cuda-kernels
+
+# Speculative decoding, sweeping the draft's depth. Acceptance rate beside the wall
+# clock, because neither column means much alone.
+bench-spec:
+	$(PYTHON) -m mini_vllm.bench --mode spec --draft-layers 4,14,28 --use-cuda-kernels
+
 # --------------------------------------------------------------- housekeeping
 clean:
 	rm -rf $(VENV) build .pytest_cache .hypothesis
@@ -80,4 +92,6 @@ help:
 	@echo "  bench-throughput  the headline: output tok/s vs transformers, by concurrency"
 	@echo "  bench-scheduler   decode-latency tails: chunked prefill vs prefill-first"
 	@echo "  bench-kernels  achieved bandwidth per kernel vs the torch it replaced"
+	@echo "  bench-prefix-cache  TTFT with and without radix-tree prefix caching"
+	@echo "  bench-spec     speculative decoding: acceptance rate and wall clock by draft depth"
 	@echo "  clean     remove .venv, build/, caches, and __pycache__"

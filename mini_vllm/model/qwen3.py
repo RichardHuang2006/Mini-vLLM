@@ -1,17 +1,16 @@
 """The whole Qwen3 model, assembled from the primitives in `mini_vllm`.
 
-No cache and no custom kernels: one forward pass over a whole sequence. This is
-the readable reference implementation, and **it is never modified again**.
-`model/qwen3_cached.py` forks it to add a KV cache, the CUDA kernels are diffed
-against it, and paged attention is diffed against that. Every fast path in the
-project is ultimately justified by agreeing with this file, so it stays pure
-PyTorch and imports nothing from `mini_vllm.kernels`.
+No cache and no custom kernels: one forward pass over a whole sequence. This is the
+reference implementation and it is frozen. `model/qwen3_cached.py` forks it to add a KV
+cache, the CUDA kernels are diffed against it, and paged attention is diffed against
+that, so every fast path in the project is ultimately justified by agreeing with this
+file. It stays pure PyTorch and imports nothing from `mini_vllm.kernels`.
 
-Two Qwen3-specific details that Qwen2.5 does not have, and that produce fluent
-nonsense rather than errors when omitted:
+Two Qwen3-specific details absent from Qwen2.5, both of which produce fluent nonsense
+rather than errors when omitted:
 
-* **QK-norm** — an RMSNorm over the head dimension of `q` and `k`, before RoPE.
-* **GQA** — 8 key/value heads serving 16 query heads.
+* QK-norm: an RMSNorm over the head dimension of `q` and `k`, before RoPE.
+* GQA: 8 key/value heads serving 16 query heads.
 """
 
 from __future__ import annotations
@@ -56,14 +55,14 @@ class Qwen3Attention:
         config = self.config
         batch, length, _ = x.shape
 
-        # B x L x (H·D) -> B x L x H x D. Note the head count differs between q
-        # and k/v: that asymmetry *is* GQA.
+        # B x L x (H·D) -> B x L x H x D. The head count differs between q and k/v:
+        # that asymmetry is GQA.
         q = linear(x, self.wq).reshape(batch, length, config.num_attention_heads, config.head_dim)
         k = linear(x, self.wk).reshape(batch, length, config.num_key_value_heads, config.head_dim)
         v = linear(x, self.wv).reshape(batch, length, config.num_key_value_heads, config.head_dim)
 
-        # QK-norm: normalize each head vector over D, before the rotation. Order
-        # matters — normalizing after RoPE would be a different function.
+        # QK-norm: normalize each head vector over D, before the rotation. Normalizing
+        # after RoPE would be a different function.
         q = rms_norm(q, self.q_norm, config.rms_norm_eps)
         k = rms_norm(k, self.k_norm, config.rms_norm_eps)
 
@@ -82,9 +81,9 @@ class Qwen3Attention:
 class Qwen3MLP:
     """SwiGLU: ``down(silu(gate(x)) * up(x))``.
 
-    Two parallel projections up to `intermediate`, gated against each other, then
-    one back down. The elementwise product is what the fused SwiGLU kernel takes
-    over, to avoid a second pass over the wide activation.
+    Two parallel projections up to `intermediate`, gated against each other, then one
+    back down. The elementwise product is what the fused SwiGLU kernel replaces, to avoid
+    a second pass over the wide activation.
     """
 
     def __init__(self, weights: dict[str, torch.Tensor]) -> None:
@@ -105,8 +104,7 @@ class Qwen3Block:
         out = h + mlp(rmsnorm(h))
 
     Pre-norm rather than post-norm: the residual path from input to output is
-    unnormalized, which is what keeps gradients (and, here, activations) stable
-    through 28 layers.
+    unnormalized, which keeps activations stable through 28 layers.
     """
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor], rope: RoPE) -> None:
@@ -177,10 +175,10 @@ class Qwen3:
     ) -> torch.Tensor:
         """Full forward over the whole sequence.
 
-        ``positions`` defaults to ``arange(L)``, which is correct here precisely
-        because there is no cache: the tokens fed in *are* the whole sequence. It
-        stays an argument because that is not true of the cached and paged models,
-        where the positions have to come from the caller.
+        ``positions`` defaults to ``arange(L)``, which is correct here because there is
+        no cache: the tokens fed in are the whole sequence. It remains an argument
+        because that does not hold for the cached and paged models, where positions come
+        from the caller.
         """
         _batch, length = input_ids.shape
         if positions is None:

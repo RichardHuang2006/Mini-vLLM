@@ -1,13 +1,12 @@
 """The logical-to-physical block table.
 
-The implementation maps positions with shifts and masks, so the tests compare it
-against a naive `//` and `%` reference. That is the whole point: the arithmetic is
-easy to write two ways, only one of them is fast, so the slow one gets to be the
-oracle.
+The implementation maps positions with shifts and masks, so the tests compare it against
+a naive `//` and `%` reference: the arithmetic has two equivalent forms, only one of them
+fast, so the slow one serves as the oracle.
 
-Block ids are deliberately non-monotonic throughout. Physical order matching logical
-order is precisely the case that hides an indirection bug, and after a few thousand
-allocations the pool hands out nothing so tidy.
+Block ids are non-monotonic throughout. Physical order matching logical order is the case
+that hides an indirection bug, and after a few thousand allocations the pool hands out
+nothing so ordered.
 """
 
 from __future__ import annotations
@@ -63,7 +62,7 @@ def test_construction_refuses_a_negative_block_id():
 
 
 def test_the_caller_cannot_alias_the_block_ids():
-    """A shared list would let a caller corrupt the mapping behind our back."""
+    """A shared list would let a caller mutate the mapping after construction."""
     ids = [5, 1]
     table = BlockTable(4, block_ids=ids, num_tokens=8)
 
@@ -279,9 +278,8 @@ def test_slot_mapping_round_trips_through_a_scatter():
     block_size, pool_blocks = 4, 8
     table = BlockTable(block_size, block_ids=[5, 1, 6], num_tokens=10)
 
-    # Sized by the *pool*, not the table: `physical_slot` indexes global storage, so
+    # Sized by the pool rather than the table: `physical_slot` indexes global storage, so
     # block id 6 needs slots 24-27 to exist even though the table holds three blocks.
-    # Conflating the two sizes is the trap `num_slots` warns about.
     cache = torch.zeros(pool_blocks * block_size, dtype=torch.int64)
     values = torch.arange(1, table.num_tokens + 1)  # token at position p holds p + 1
     cache.scatter_(0, table.slot_mapping(range(table.num_tokens)).long(), values)
@@ -383,7 +381,7 @@ def test_blocks_needed_for_is_sufficient_and_minimal(table: BlockTable, num_new:
     table.append_tokens(num_new)  # raises if the estimate was short
 
     if needed:
-        # Minimality only means something when blocks were asked for at all: a table
-        # that already had spare capacity keeps it, so `num_empty_slots` can exceed
-        # the block size when `needed` is zero.
+        # Minimality only applies when blocks were requested: a table that already had
+        # spare capacity keeps it, so `num_empty_slots` can exceed the block size when
+        # `needed` is zero.
         assert table.num_empty_slots < table.block_size

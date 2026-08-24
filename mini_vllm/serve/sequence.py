@@ -1,29 +1,27 @@
 """One request's state, from arrival to completion.
 
-The whole file exists to make two numbers distinguishable:
+Two lengths are tracked separately:
 
-* ``len(token_ids)`` — how many tokens the sequence *has*.
-* ``num_computed_tokens`` — how many the model has actually run through and whose
-  keys and values are therefore in the cache.
+* ``len(token_ids)`` — how many tokens the sequence has.
+* ``num_computed_tokens`` — how many have been through a forward pass and therefore
+  have keys and values in the cache.
 
-In a naive engine those are the same number and the distinction looks like
-bookkeeping for its own sake. It is not: their difference **is** chunked prefill. A
-sequence with 2000 prompt tokens and 512 computed is mid-prefill, and everything the
-scheduler needs to know to resume it — where RoPE positions start, how many tokens to
-feed, how long the causal mask's key axis is — follows from that one counter. Modelling
-it here is what keeps chunked prefill a scheduler change rather than a rewrite of this
-class.
+Their difference is chunked prefill. A sequence with 2000 prompt tokens and 512
+computed is mid-prefill, and everything needed to resume it — the RoPE position
+offset, the next chunk's token count, the causal mask's key-axis length — derives
+from that one counter, which keeps chunked prefill a scheduler concern rather than a
+change to this class.
 
-The status machine is here for a different reason: preemption. A sequence can go
-back to waiting after having run, and its already-computed tokens are then thrown
-away, which is a transition that has to be *deliberate* rather than reachable by
-accident from anywhere.
+The status machine exists for preemption: a sequence may return to the waiting queue
+after running, discarding its computed tokens, so that transition is validated
+against an explicit table rather than being reachable from any state.
 """
 
 from __future__ import annotations
 
 import enum
 import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from mini_vllm.block.block_table import BlockTable
@@ -33,13 +31,12 @@ __all__ = ["Sequence", "SequenceStatus"]
 
 
 class SequenceStatus(enum.Enum):
-    """Where a request is in its life.
+    """Where a request is in its life cycle.
 
-    ``PREEMPTED`` is distinct from ``WAITING`` even though both queue for
-    admission, because they are not the same situation: a preempted sequence has
-    output tokens already emitted to its caller and must be recomputed from its
-    prompt *plus* that output, while a waiting one has nothing behind it. Collapsing
-    the two loses the tokens the caller has already seen.
+    ``PREEMPTED`` is distinct from ``WAITING`` although both queue for admission: a
+    preempted sequence has output tokens already emitted to its caller and must be
+    recomputed over prompt *plus* that output, while a waiting one has nothing behind
+    it. Collapsing the two loses tokens the caller has already seen.
     """
 
     WAITING = "waiting"
@@ -48,17 +45,15 @@ class SequenceStatus(enum.Enum):
     FINISHED = "finished"
 
 
-# Which transitions are legal. Written as data rather than as `if` statements
-# scattered through the scheduler, so an illegal move is a single raise in one
-# place instead of a state that silently makes sense to nobody later.
+# Legal transitions, as data rather than as `if` statements spread through the
+# scheduler, so an illegal move raises from one place.
 _LEGAL_TRANSITIONS: dict[SequenceStatus, frozenset[SequenceStatus]] = {
     SequenceStatus.WAITING: frozenset({SequenceStatus.RUNNING, SequenceStatus.FINISHED}),
     SequenceStatus.RUNNING: frozenset(
         {SequenceStatus.PREEMPTED, SequenceStatus.FINISHED, SequenceStatus.WAITING}
     ),
     SequenceStatus.PREEMPTED: frozenset({SequenceStatus.RUNNING, SequenceStatus.FINISHED}),
-    # Terminal. A finished sequence's blocks are gone, so "resume" is not a thing
-    # that could be made to work — it is a bug in the caller.
+    # Terminal: a finished sequence's blocks have been freed, so it can never resume.
     SequenceStatus.FINISHED: frozenset(),
 }
 
@@ -76,9 +71,8 @@ class Sequence:
         token_ids          the concatenation — what the model has to attend over
         num_computed_tokens  how much of `token_ids` is already in the KV cache
 
-    Mutable by design, and mutated in exactly two places: the scheduler advances
-    `num_computed_tokens` and the engine appends sampled tokens. Everything else is
-    derived.
+    Mutated in exactly two places: the scheduler advances `num_computed_tokens` and
+    the engine appends sampled tokens. Everything else is derived.
     """
 
     prompt_token_ids: list[int]
@@ -94,10 +88,20 @@ class Sequence:
     num_computed_tokens: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
 
-    # The sequence's pages, set by the block manager and the single home for them: the
-    # manager reads and writes this field rather than keeping a registry of its own,
-    # because two places recording which blocks a sequence holds is two places that can
-    # disagree about when to free them.
+    # Speculative decoding: tokens the draft model has proposed but the target has not
+    # yet verified. Kept out of `output_token_ids` so a proposal cannot finish a
+    # sequence — a speculated end-of-text token would otherwise set `is_done` and
+    # return the request on a guess the target was about to reject.
+    proposed_token_ids: list[int] = field(default_factory=list)
+
+    # Parallel sampling: a forked branch records the id of the request it split from,
+    # so the engine can group a prompt's `n` completions back together. None for an
+    # ordinary request, which is its own group of one.
+    parent_id: int | None = None
+
+    # The sequence's pages, and the single home for them: the block manager reads and
+    # writes this field rather than keeping a registry of its own, so there is only one
+    # record of which blocks a sequence holds and when they may be freed.
     block_table: BlockTable | None = None
 
     def __post_init__(self) -> None:
@@ -110,11 +114,20 @@ class Sequence:
 
     @property
     def token_ids(self) -> list[int]:
-        """Prompt then output: the sequence the model actually attends over."""
-        return self.prompt_token_ids + self.output_token_ids
+        """Prompt, output, then any live proposals: what the model attends over.
+
+        Proposals are included because the verifying forward pass has to score them,
+        so they need positions, slots and KV like any other token. They do not become
+        output until :meth:`accept` records which survived.
+        """
+        return self.prompt_token_ids + self.output_token_ids + self.proposed_token_ids
 
     def __len__(self) -> int:
-        return len(self.prompt_token_ids) + len(self.output_token_ids)
+        return (
+            len(self.prompt_token_ids)
+            + len(self.output_token_ids)
+            + len(self.proposed_token_ids)
+        )
 
     @property
     def num_prompt_tokens(self) -> int:
@@ -134,10 +147,9 @@ class Sequence:
     def is_prefill(self) -> bool:
         """True while any prompt token has yet to be computed.
 
-        Note what this is *not*: it is not "no output tokens yet". A sequence is in
-        prefill exactly while its prompt is not fully computed, which is the
-        condition that survives chunking. The first decode step happens when
-        `num_computed_tokens == num_prompt_tokens`, whatever route got it there.
+        This is a statement about the prompt, not about the output being empty, which
+        is the form that survives chunking: the first decode step happens once
+        `num_computed_tokens == num_prompt_tokens`, however many chunks it took.
         """
         return self.num_computed_tokens < self.num_prompt_tokens
 
@@ -165,14 +177,100 @@ class Sequence:
     def append_token(self, token_id: int) -> None:
         """Record a sampled token.
 
-        Deliberately does *not* advance `num_computed_tokens`: the token has been
-        chosen but no forward pass has consumed it yet, so its key and value are not
-        in the cache. Conflating the two is how a decode step ends up skipping a
-        position, and the symptom is a repeated or dropped token rather than a crash.
+        Does not advance `num_computed_tokens`: the token has been chosen but no
+        forward pass has consumed it, so its key and value are not yet in the cache.
+        Conflating the two makes a decode step skip a position, which surfaces as a
+        repeated or dropped token rather than a crash.
         """
         if self.status is SequenceStatus.FINISHED:
             raise ValueError(f"sequence {self.seq_id} is finished and cannot take more tokens")
         self.output_token_ids.append(token_id)
+
+    @property
+    def num_proposed_tokens(self) -> int:
+        return len(self.proposed_token_ids)
+
+    def propose(self, token_ids: Iterable[int]) -> None:
+        """Attach a draft model's speculated tokens, pending verification.
+
+        They lengthen the sequence immediately, so the scheduler reserves slots for
+        them and the runner forwards them, but they stay out of the output until
+        :meth:`accept`.
+        """
+        if self.proposed_token_ids:
+            raise ValueError(
+                f"sequence {self.seq_id} already holds {len(self.proposed_token_ids)} "
+                "unverified proposals; accept or discard them first"
+            )
+        if self.is_prefill():
+            raise ValueError(
+                f"sequence {self.seq_id} is still in prefill; there is nothing to speculate "
+                "from until its prompt is computed"
+            )
+        self.proposed_token_ids = [int(token) for token in token_ids]
+
+    def discard_proposals(self) -> int:
+        """Drop the proposals without committing any, returning how many were dropped.
+
+        For paths that abandon a speculative step rather than verifying it: preemption,
+        or shutdown mid-flight.
+        """
+        dropped = len(self.proposed_token_ids)
+        self.proposed_token_ids = []
+        return dropped
+
+    def accept(self, token_ids: list[int], num_accepted: int) -> int:
+        """Commit a verified step's tokens, returning how many cache slots to give back.
+
+        ``token_ids`` is the rejection sampler's output: the accepted proposals followed
+        by one more token, the bonus token if nothing was rejected or the residual draw
+        if something was. ``num_accepted`` is how many leading tokens were surviving
+        proposals, which distinguishes them from that final token: the survivors are
+        already in the cache, having been computed by the verifying forward pass, while
+        the final token is not.
+
+        Hence the return value. The forward pass computed all ``k + 1`` positions but
+        only ``num_accepted + 1`` remain computed, so ``k - num_accepted`` slots go back
+        to the block manager. The sequence ends in the same state an ordinary decode
+        step leaves it: one uncommitted trailing token whose KV is not in the cache.
+
+        A stop token among the accepted tokens truncates here. Later tokens are dropped:
+        they were computed, but the sequence ended before them, so returning them would
+        be output the model never chose to produce.
+        """
+        num_proposed = len(self.proposed_token_ids)
+        if not 0 <= num_accepted <= num_proposed:
+            raise ValueError(
+                f"cannot accept {num_accepted} of {num_proposed} proposals"
+            )
+        if len(token_ids) != num_accepted + 1:
+            raise ValueError(
+                f"{num_accepted} accepted proposals should come with {num_accepted + 1} "
+                f"tokens (the accepted run plus one), got {len(token_ids)}"
+            )
+        if list(token_ids[:num_accepted]) != self.proposed_token_ids[:num_accepted]:
+            raise ValueError(
+                f"sequence {self.seq_id}: the accepted tokens are not the proposals that "
+                "were made; verification and proposal have gone out of step"
+            )
+
+        computed_before = self.num_computed_tokens
+        self.proposed_token_ids = []
+
+        # Append until a stop token or the length limit ends the sequence, counting the
+        # surviving proposals: only those are already in the cache.
+        kept_proposals = 0
+        for index, token in enumerate(token_ids):
+            self.output_token_ids.append(int(token))
+            if index < num_accepted:
+                kept_proposals += 1
+            if self.is_done():
+                break
+
+        # The forward pass computed the one previously-uncommitted token plus every
+        # proposal; what remains computed is that token plus the survivors.
+        self.num_computed_tokens = computed_before + 1 + kept_proposals
+        return num_proposed - kept_proposals
 
     def advance(self, num_tokens: int) -> None:
         """Record that `num_tokens` more tokens have been through the model."""
@@ -195,18 +293,43 @@ class Sequence:
             )
         self.status = status
 
+    def fork(self, first_output_token: int | None = None) -> Sequence:
+        """A new branch that shares this sequence's prompt, for parallel sampling.
+
+        Copies the prompt and the computed-token count, so the child starts with the
+        same prefix already in the cache; the physical pages are shared by the block
+        manager's `fork`, which copies no KV. The child takes its own first output
+        token, since `n > 1` means n independent continuations of one prompt. Passing
+        None leaves it with none, for a caller that will sample it separately.
+
+        The child does not copy the block table: that is the block manager's to set,
+        incrementing refcounts as it points the child at the same pages.
+        """
+        child = Sequence(
+            prompt_token_ids=list(self.prompt_token_ids),
+            sampling_params=self.sampling_params,
+            max_tokens=self.max_tokens,
+            eos_token_id=self.eos_token_id,
+            stop_token_ids=self.stop_token_ids,
+            parent_id=self.seq_id if self.parent_id is None else self.parent_id,
+        )
+        child.num_computed_tokens = self.num_computed_tokens
+        if first_output_token is not None:
+            child.output_token_ids = [int(first_output_token)]
+        child.set_status(SequenceStatus.RUNNING)
+        return child
+
     def reset_for_recompute(self) -> None:
         """Drop everything cached, keeping the tokens. Used when preempting.
 
-        Preemption by recomputation rather than by swapping to host memory: the
-        blocks go back to the pool and the sequence starts its prefill again, over
-        prompt *and* output this time. It costs the compute already spent, and it
-        keeps the engine free of a swap path — the trade the scheduler makes explicit.
+        Preemption is by recomputation rather than by swapping to host memory: blocks
+        go back to the pool and prefill restarts over prompt *and* output. That trades
+        the compute already spent for having no swap path in the engine.
 
-        Dropping the table is *not* the same as releasing the blocks, and this refuses
-        to do the first without the second. Forgetting the pointer to pages the pool
-        still believes are held is a leak that shows up much later, as an engine that
-        runs a few hundred requests and then cannot admit anything.
+        Dropping the table is not the same as releasing the blocks, and this refuses to
+        do the first without the second: losing the pointer to pages the pool still
+        counts as held leaks them, surfacing much later as an engine that admits
+        nothing after a few hundred requests.
         """
         if self.block_table is not None:
             raise ValueError(
@@ -215,6 +338,10 @@ class Sequence:
             )
         self.set_status(SequenceStatus.PREEMPTED)
         self.num_computed_tokens = 0
+        # Unverified proposals do not survive a preemption: their KV went back to the
+        # pool with the rest, and they were never part of the request, so keeping them
+        # would make the recomputed prefill longer than what the caller asked for.
+        self.proposed_token_ids = []
 
     def __repr__(self) -> str:
         return (

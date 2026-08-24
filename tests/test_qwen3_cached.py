@@ -1,12 +1,12 @@
 """The cached model against the uncached one.
 
-The cache is an optimization, so the bar is not "close" but **identical**: for the
-same tokens, the cached model must produce the same logits as the uncached `Qwen3`
-and the same greedy tokens as the uncached `generate_ids` loop. Anything less means
-it changed the model's behaviour, which is the one thing an optimization may not do.
+The cache is an optimization, so the bar is identity rather than closeness: for the same
+tokens, the cached model must produce the same logits as the uncached `Qwen3` and the same
+greedy tokens as the uncached `generate_ids` loop. Anything less means it changed the
+model's behaviour.
 
-Most of these run on `tiny_qwen3` and need no download. The `oracle` ones close the
-loop against `transformers.generate`.
+Most of these run on `tiny_qwen3` and need no download. The `oracle` ones close the loop
+against `transformers.generate`.
 """
 
 from __future__ import annotations
@@ -313,10 +313,9 @@ def test_caches_can_be_supplied_by_the_caller(pair):
 def test_every_claimed_kernel_is_callable():
     """A name in `CUDA_KERNELS` must be a kernel the extension actually exports.
 
-    The CUDA kernels turn these flags on one at a time, and the flag is what the
-    benchmark reports and what the dispatch trusts, so a flag flipped ahead of the
-    `.cu` would silently make the report a lie. Asserting the symbol exists keeps
-    them honest as the list grows.
+    The flags are turned on one at a time, and the flag is what the benchmark reports and
+    what the dispatch trusts, so a flag flipped ahead of the `.cu` would silently
+    misreport. Asserting the symbol exists holds the invariant as the list grows.
     """
     claimed = ops.cuda_kernel_names()
     if not claimed:

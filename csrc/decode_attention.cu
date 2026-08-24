@@ -10,17 +10,15 @@
 //   l = running sum of exp(score - m)
 //   O = running sum of exp(score - m) · v
 //
-// When a tile pushes the max from m_old to m_new, everything accumulated so far
-// was exponentiated against the wrong max, and is corrected by multiplying by
-// exp(m_old - m_new). The part worth internalizing is that **O is rescaled by
-// that same factor as l** — O is a sum of the same mis-scaled exponentials, just
-// weighted by v. Rescaling only l gives a distribution that still sums to one
-// (so nothing looks broken) over weights that are wrong, which reads as a model
-// that is fluent and confidently incorrect.
+// When a tile pushes the max from m_old to m_new, everything accumulated so far was
+// exponentiated against the wrong max and is corrected by multiplying by
+// exp(m_old - m_new). O is rescaled by that same factor as l, since O is a sum of the
+// same mis-scaled exponentials weighted by v. Rescaling only l yields a distribution that
+// still sums to one over weights that are wrong, which produces fluent but incorrect
+// output with no visible failure.
 //
-// Parallel decomposition: one block per (sequence, query head). Each block walks
-// the cache in tiles of kTileKeys. Within a tile the two phases parallelize along
-// different axes, which is not an accident:
+// Parallel decomposition: one block per (sequence, query head), each walking the cache in
+// tiles of kTileKeys. Within a tile the two phases parallelize along different axes:
 //
 //   scores  QKᵀ  reduces over D, so one warp owns a key and its 32 lanes stride
 //                over D — a coalesced 64-byte read per instruction.
@@ -28,18 +26,17 @@
 //                walks the tile — again coalesced, since neighbouring threads
 //                read neighbouring d.
 //
-// K and V are read exactly once each per block, so unlike the flash prefill
-// kernel there is nothing to gain by staging them in shared memory: with one
-// block per query head, no two dot products in a block share a key element.
+// K and V are read exactly once each per block, so unlike the flash prefill kernel there
+// is nothing to gain by staging them in shared memory: with one block per query head, no
+// two dot products in a block share a key element.
 //
-// One block per (sequence, head) is not enough blocks, though, and the benchmark
-// said so: 16 blocks of work for 36 SMs reached 24 GB/s of a 384 GB/s card and was
-// *slower than PyTorch* at S = 8192, because a batch of one has no parallelism
-// left to give. So the key axis is split too, flash-decoding style: each split
-// runs the recurrence over its own slice of the cache and writes its partial
-// `(m, l, O)`, and a second kernel merges them with exactly the same rescaling
-// the tile loop uses — the merge is the recurrence applied once more, at a coarser
-// grain. Short contexts take one split and skip the merge entirely.
+// One block per (sequence, head) does not fill the card. Measured: 16 blocks of work for
+// 36 SMs reached 24 GB/s of a 384 GB/s card and lost to PyTorch at S = 8192, because a
+// batch of one has no parallelism left to give. The key axis is therefore split as well,
+// flash-decoding style: each split runs the recurrence over its own slice of the cache and
+// writes its partial `(m, l, O)`, and a second kernel merges them with the same rescaling
+// the tile loop uses, the recurrence applied once more at a coarser grain. Short contexts
+// take one split and skip the merge.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -55,18 +52,17 @@ constexpr int kThreads = 128;  // four warps, so four keys are scored at a time
 constexpr int kTileKeys = 64;  // scores per tile; only 256 B of shared memory
 constexpr int kMaxHeadDim = 1024;
 
-// How the key axis is divided when one block per (sequence, head) is not enough
-// work to fill the card. The floor keeps a split large enough that its share of
-// the merge and launch overhead stays negligible; the ceiling keeps the merge's
-// scan over splits short enough to do in one pass without reducing.
+// How the key axis is divided when one block per (sequence, head) does not fill the
+// card. The floor keeps a split large enough that its share of the merge and launch
+// overhead stays negligible; the ceiling keeps the merge's scan over splits short
+// enough to do in one pass without reducing.
 constexpr int kMaxSplits = 32;
 constexpr int kMinKeysPerSplit = 512;
 constexpr int kBlocksPerSm = 4;
 
-// Where a tensor's (batch, head, position) axes live, so a cache slice narrowed
-// out of a larger buffer can be read in place. Copying it to make it contiguous
-// would mean duplicating the entire cache on every decode step, which is the
-// quadratic traffic the cache exists to avoid.
+// Where a tensor's (batch, head, position) axes live, so a cache slice narrowed out of a
+// larger buffer can be read in place. Copying it to make it contiguous would duplicate
+// the entire cache on every decode step, the quadratic traffic the cache exists to avoid.
 struct Strides {
   int64_t batch;
   int64_t head;
@@ -95,8 +91,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
   const int split = blockIdx.z;
   const int64_t kv_head = query_head / group_size;
 
-  // Splits are cut on a tile boundary so no split has to mask a partial tile in
-  // the middle of the cache, which would be a second, redundant edge case.
+  // Splits are cut on a tile boundary so no split masks a partial tile in the middle of
+  // the cache, which would be a second, redundant edge case.
   const int64_t tiles = (source_len + kTileKeys - 1) / kTileKeys;
   const int64_t tiles_per_split = (tiles + splits - 1) / splits;
   const int64_t begin = split * tiles_per_split * kTileKeys;
@@ -120,8 +116,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
   const int warp = thread / kWarpSize;
   constexpr int kWarps = kThreads / kWarpSize;
 
-  // The query is read S times, once per key, so it is worth promoting to shared
-  // memory in fp32 up front. It is the one thing in this kernel that is reused.
+  // The query is read S times, once per key, so it is promoted to shared memory in fp32
+  // up front. It is the only reused operand in this kernel.
   for (int d = thread; d < head_dim; d += kThreads) {
     query_shared[d] = static_cast<float>(query[d]);
     accumulator[d] = 0.0f;
@@ -178,8 +174,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
     // Also publishes every `scores[j]` written above to the P·V loop below.
     __syncthreads();
 
-    // On the first tile running_max is -inf, so the correction is exp(-inf) == 0
-    // and it zeroes an accumulator that is already zero. No special case needed.
+    // On the first tile running_max is -inf, so the correction is exp(-inf) == 0 and
+    // zeroes an accumulator that is already zero; no special case needed.
     const float correction = __expf(running_max - new_max);
     running_sum = running_sum * correction + reduced[1];
 
@@ -197,9 +193,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
     __syncthreads();
   }
 
-  // The division by `l` is deferred to the very end — that is the other half of
-  // why one pass suffices. Normalizing per tile would need the final sum, which
-  // is not known until the last key has been seen.
+  // The division by `l` is deferred to the end, the other half of why one pass suffices:
+  // normalizing per tile would need the final sum, unknown until the last key.
   if (partial_out == nullptr) {
     scalar_t* destination = out + sequence * out_strides.batch + query_head * out_strides.head;
     for (int d = thread; d < head_dim; d += kThreads) {
@@ -208,8 +203,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
     return;
   }
 
-  // Split path: hand the un-normalized state to the merge, which cannot divide
-  // by this split's `l` either — it needs all of them first.
+  // Split path: hand the un-normalized state to the merge, which needs every split's `l`
+  // before it can divide.
   const int64_t slot = (sequence * gridDim.x + query_head) * splits + split;
   if (thread == 0) {
     partial_max[slot] = running_max;
@@ -224,9 +219,8 @@ __global__ void decode_attention_kernel(const scalar_t* __restrict__ q,
 // exponentiated against its own local max, so the merge repeats the tile loop's
 // correction one level up: rescale by exp(m_split - m_global) and sum.
 //
-// `splits` is capped at 32, so every thread simply scans the array rather than
-// reducing over it — a block-wide reduction for 32 values would cost more in
-// barriers than it saves in arithmetic.
+// `splits` is capped at 32, so every thread scans the array rather than reducing over it;
+// a block-wide reduction for 32 values costs more in barriers than it saves in arithmetic.
 template <typename scalar_t>
 __global__ void decode_attention_merge_kernel(const float* __restrict__ partial_out,
                                               const float* __restrict__ partial_max,
@@ -256,8 +250,8 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial_
 
   float total_sum = 0.0f;
   for (int s = 0; s < splits; ++s) {
-    // A split that got no keys contributes exp(-inf) * 0 == 0, so an empty
-    // trailing split needs no special case here.
+    // A split that got no keys contributes exp(-inf) * 0 == 0, so an empty trailing
+    // split needs no special case.
     total_sum += __expf(maxima[s] - global_max) * sums[s];
   }
 
@@ -275,9 +269,9 @@ Strides strides_of(const at::Tensor& tensor) {
   return Strides{tensor.stride(0), tensor.stride(1), tensor.stride(2)};
 }
 
-// How many pieces to cut the cache into: enough blocks to fill the card, but
-// never so many that a split is smaller than kMinKeysPerSplit. A batch of one at
-// S = 128 stays at one split and runs exactly as it did before the split existed.
+// How many pieces to cut the cache into: enough blocks to fill the card, never so many
+// that a split is smaller than kMinKeysPerSplit. A batch of one at S = 128 stays at one
+// split and skips the merge.
 int splits_for(int64_t rows, int64_t source_len) {
   const int64_t affordable = (source_len + kMinKeysPerSplit - 1) / kMinKeysPerSplit;
   const int64_t wanted =
@@ -303,8 +297,8 @@ void launch_decode_attention(const at::Tensor& q,
   const auto stream = at::cuda::getCurrentCUDAStream();
   const auto scratch_options = q.options().dtype(at::kFloat);
 
-  // Empty rather than undefined tensors: the single-split path passes null
-  // pointers, which is what tells the kernel to normalize and store directly.
+  // Left undefined on the single-split path, which passes null pointers to tell the
+  // kernel to normalize and store directly.
   at::Tensor partial_out, partial_max, partial_sum;
   if (splits > 1) {
     partial_out = torch::empty({rows * splits * head_dim}, scratch_options);
@@ -408,15 +402,13 @@ torch::Tensor decode_attention(const torch::Tensor& q,
               kMaxHeadDim,
               "; the query and the accumulator both live in shared memory");
 
-  // Only the head dimension has to be contiguous. The batch, head and position
-  // axes are read through their strides, so a cache narrowed out of a larger
-  // buffer costs nothing.
+  // Only the head dimension must be contiguous. The batch, head and position axes are
+  // read through their strides, so a cache narrowed out of a larger buffer costs nothing.
   TORCH_CHECK(q.stride(3) == 1 && k.stride(3) == 1 && v.stride(3) == 1,
               "decode_attention: the head dimension must be contiguous");
 
-  // Deliberately not `empty_like`: for a 4-D tensor that can infer a
-  // channels-last layout from the input's strides, and the kernel writes through
-  // strides it was handed rather than assuming any particular one.
+  // Not `empty_like`: for a 4-D tensor that can infer a channels-last layout from the
+  // input's strides, and the kernel writes through the strides it was handed.
   at::Tensor out = torch::empty(q.sizes(), q.options());
 
   AT_DISPATCH_SWITCH(q.scalar_type(),

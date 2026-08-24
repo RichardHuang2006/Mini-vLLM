@@ -1,40 +1,37 @@
 // Attention over a paged KV cache: the dense-cache attention kernels with the gather
-// moved *inside*.
+// moved inside.
 //
-// Nothing about the mathematics changes. The online softmax recurrence is the one from
-// the dense-cache decode kernel and the causal offset is the one from the PyTorch
-// reference's causal mask. What changes is where a key comes from: instead of
-// `k[b][h][j][d]` in a contiguous per-sequence tensor,
+// The mathematics is unchanged — the same online softmax recurrence as the dense-cache
+// decode kernel, the same causal offset as the PyTorch reference's mask. Only key
+// addressing differs: instead of `k[b][h][j][d]` in a contiguous per-sequence tensor,
 //
 //   slot = block_tables[seq][j / P] * P + (j % P)
 //   key  = key_pool[slot][h][d]
 //
-// one integer division and one modulo per key, both of which reduce to a shift and a
-// mask because `P` is a power of two. That is the entire cost of non-contiguous
-// storage, and doing it here rather than on the host is the point: a host-side gather
-// would copy every sequence's whole cache into a contiguous temporary every iteration,
-// which is more traffic than the attention itself and is exactly what
-// `mini_vllm/paged_attention.py` does as the deliberately-slow oracle.
+// one integer division and one modulo per key, both reducing to a shift and a mask
+// because `P` is a power of two. That is the entire cost of non-contiguous storage.
+// Doing it here rather than on the host avoids copying every sequence's whole cache
+// into a contiguous temporary every iteration, which is more traffic than the attention
+// itself and is what `mini_vllm/paged_attention.py` does as the oracle.
 //
-// Two kernels, because decode and prefill remain different problems:
+// Two kernels, since decode and prefill remain different problems:
 //
 //   decode   L == 1. One block per (sequence, query head), walking the whole context
-//            in tiles with the online softmax recurrence. Memory-bound; the parallelism
-//            comes from the *sequence* axis, which a served batch supplies.
+//            in tiles with the online softmax recurrence. Memory-bound; parallelism
+//            comes from the sequence axis, which a served batch supplies.
 //   prefill  L > 1. One warp per query row, with K and V tiles staged in shared
 //            memory so the warps in a block share each gather, and causal masking
 //            applied as an index comparison against the diagonal shifted by S - L.
 //
-// Both take the ragged batch as it comes: `cu_seqlens_q` says where a sequence's
-// query rows start, `seq_lens` how many it has, `context_lens` how far back it may
-// look. A block for a sequence in the wrong phase returns immediately, so one launch
-// of each covers a mixed batch with no host-side branching and no synchronization to
-// find out which sequences are in which phase. The number of no-op blocks is bounded
-// by the batch size, which is at most a few dozen.
+// Both consume the ragged batch directly: `cu_seqlens_q` gives a sequence's first query
+// row, `seq_lens` its query count, `context_lens` how far back it may look. A block for
+// a sequence in the wrong phase returns immediately, so one launch of each covers a
+// mixed batch with no host-side branching and no synchronization to determine phases.
+// No-op blocks are bounded by the batch size, at most a few dozen.
 //
-// Query layout is `T x H_q x D` — the flattened token axis of `ForwardBatch`, not
-// `B x H x L x D`. A padded rectangle is what paging exists to avoid, and it would
-// reappear here if the kernel demanded one.
+// Query layout is `T x H_q x D`, the flattened token axis of `ForwardBatch`, rather than
+// `B x H x L x D`: demanding a rectangle here would reintroduce the padding paging
+// exists to avoid.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -53,13 +50,12 @@ constexpr int kPrefillWarps = 8;
 constexpr int kPrefillThreads = kPrefillWarps * kWarpSize;  // one warp per query row
 constexpr int kPrefillTileKeys = 16;                        // K and V tiles in shared memory
 
-// How many keys a warp scores before it touches the running softmax. One at a time is
-// the readable version and it is what this kernel did first; it also spends most of its
-// issue slots waiting. Each key costs a cross-lane reduction of the dot product — five
-// dependent shuffles, and nothing else in that warp can proceed until the last one
-// lands — plus a rescale of the whole accumulator and two exponentials. Scoring a group
-// first gives the scheduler that many independent reduction chains to interleave, and
-// lets one rescale and one `expf(running_max - new_max)` cover the group.
+// How many keys a warp scores before touching the running softmax. Scoring one at a time
+// stalls: each key costs a cross-lane reduction of the dot product (five dependent
+// shuffles, blocking the warp until the last lands) plus a rescale of the whole
+// accumulator and two exponentials. Scoring a group first gives the scheduler that many
+// independent reduction chains to interleave, and lets one rescale and one
+// `expf(running_max - new_max)` cover the group.
 //
 // Eight measured fastest of 1, 4, 8 and 16 (13.3, 8.4, 7.5 and 11.7 ms for a 512-query
 // chunk over a 2048-token context, one layer, bf16). The curve has an interior optimum
@@ -74,11 +70,10 @@ constexpr int kMaxLanesPerThread = 8;
 constexpr int kMaxHeadDim = kMaxLanesPerThread * kWarpSize;
 
 // Splitting the key axis, as the dense-cache decode kernel does. A served batch usually
-// supplies enough parallelism on the sequence axis to make this unnecessary — but
-// "usually" is not "always", and the case it misses is the one a laptop actually runs: a
-// single conversation with a long history. One sequence at S = 8192 is 16 blocks of work
-// for 36 SMs, which measured 16 GB/s of a 384 GB/s card and lost to the dense-gather
-// oracle it is supposed to replace.
+// supplies enough parallelism on the sequence axis to make this unnecessary; the case it
+// misses is a single conversation with a long history. One sequence at S = 8192 is 16
+// blocks of work for 36 SMs, which measured 16 GB/s of a 384 GB/s card and lost to the
+// dense-gather oracle it replaces.
 constexpr int kMaxSplits = 32;
 constexpr int kMinKeysPerSplit = 512;
 constexpr int kBlocksPerSm = 4;
@@ -92,12 +87,22 @@ __device__ __forceinline__ int64_t slot_of(const int32_t* __restrict__ table,
   return (block << block_shift) | (position & block_mask);
 }
 
+// FP8 requires no change to the inner loops. The scales are per-tensor scalars and
+// attention is linear in the keys (through the score) and in the values (through the
+// weighted sum), so a scalar factor on either can be hoisted. The key scale folds into
+// the softmax `scale` at the launch site: a stored key is `raw / k_scale`, so
+// `(q · stored) * (scale * k_scale)` is the logit the raw key would give. The value scale
+// rides on the output: a stored value is `raw / v_scale`, so the normalized accumulator
+// comes out `1 / v_scale` too small and one multiply at the end restores it. A `cache_t`
+// of `Float8_e4m3fn` then costs only its `operator float()` on load; for a bf16 pool
+// `cache_t == scalar_t` and both scales are 1.0.
+
 // ---------------------------------------------------------------------- decode
 
-template <typename scalar_t>
+template <typename scalar_t, typename cache_t>
 __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
-                                    const scalar_t* __restrict__ key_pool,
-                                    const scalar_t* __restrict__ value_pool,
+                                    const cache_t* __restrict__ key_pool,
+                                    const cache_t* __restrict__ value_pool,
                                     scalar_t* __restrict__ out,
                                     const int32_t* __restrict__ block_tables,
                                     const int32_t* __restrict__ cu_seqlens_q,
@@ -113,7 +118,8 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
                                     float* __restrict__ partial_max,
                                     float* __restrict__ partial_sum,
                                     const int splits,
-                                    const float scale) {
+                                    const float scale,
+                                    const float v_scale) {
   const int64_t sequence = blockIdx.y;
   if (seq_lens[sequence] != 1) {
     return;  // a prefill chunk; the other kernel has it
@@ -143,8 +149,8 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   float* scratch = scores + kDecodeTileKeys;
   float* reduced = scratch + kDecodeThreads / kWarpSize;
 
-  // The tile's physical slots, resolved once per key instead of once per key *and*
-  // once per dimension: the score loop and the P·V loop both need them.
+  // The tile's physical slots, resolved once per key rather than once per key and
+  // dimension: the score loop and the P·V loop both need them.
   __shared__ int64_t slots[kDecodeTileKeys];
 
   const int thread = threadIdx.x;
@@ -172,7 +178,7 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
 
     // --- QKᵀ: one warp per key, lanes striding over the head dimension.
     for (int j = warp; j < tile; j += kWarps) {
-      const scalar_t* key = key_pool + (slots[j] * num_kv_heads + kv_head) * head_dim;
+      const cache_t* key = key_pool + (slots[j] * num_kv_heads + kv_head) * head_dim;
       float dot = 0.0f;
       for (int64_t d = lane; d < head_dim; d += kWarpSize) {
         dot += query_shared[d] * static_cast<float>(key[d]);
@@ -228,15 +234,17 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   if (partial_out == nullptr) {
     scalar_t* destination = out + (row * num_query_heads + query_head) * head_dim;
     for (int64_t d = thread; d < head_dim; d += kDecodeThreads) {
-      destination[d] = static_cast<scalar_t>(accumulator[d] / running_sum);
+      // v_scale undoes the value quantization: the accumulator summed stored values,
+      // each 1/v_scale of the real one. It is 1.0 for a bf16 pool.
+      destination[d] = static_cast<scalar_t>(accumulator[d] * v_scale / running_sum);
     }
     return;
   }
 
-  // Split path: hand the un-normalized state to the merge, which cannot divide by
-  // this split's `l` either — it needs all of them first. A split that got no keys
-  // (a short sequence in a batch sized by a long one) reports -inf and 0, which the
-  // merge's `exp(m - m_global) * l` turns into exactly nothing.
+  // Split path: hand the un-normalized state to the merge, which needs every split's
+  // `l` before it can divide. A split that got no keys (a short sequence in a batch
+  // sized by a long one) reports -inf and 0, which the merge's `exp(m - m_global) * l`
+  // contributes nothing.
   const int64_t slot = (sequence * num_query_heads + query_head) * splits + split;
   if (thread == 0) {
     partial_max[slot] = running_max;
@@ -258,12 +266,13 @@ __global__ void paged_decode_merge_kernel(const float* __restrict__ partial_out,
                                           const int32_t* __restrict__ seq_lens,
                                           const int64_t num_query_heads,
                                           const int64_t head_dim,
-                                          const int splits) {
+                                          const int splits,
+                                          const float v_scale) {
   const int64_t sequence = blockIdx.y;
   if (seq_lens[sequence] != 1) {
-    // Its partials were never written, and its output row belongs to the prefill
-    // kernel. Writing here would overwrite a correct answer with uninitialized
-    // memory — the one way these two kernels could interfere with each other.
+    // Its partials were never written and its output row belongs to the prefill kernel.
+    // Writing here would overwrite a correct result with uninitialized memory, the one
+    // way these two kernels could interfere.
     return;
   }
 
@@ -297,16 +306,16 @@ __global__ void paged_decode_merge_kernel(const float* __restrict__ partial_out,
     for (int s = 0; s < splits; ++s) {
       total += __expf(maxima[s] - global_max) * partial_out[(base + s) * head_dim + d];
     }
-    destination[d] = static_cast<scalar_t>(total / total_sum);
+    destination[d] = static_cast<scalar_t>(total * v_scale / total_sum);
   }
 }
 
 // --------------------------------------------------------------------- prefill
 
-template <typename scalar_t>
+template <typename scalar_t, typename cache_t>
 __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
-                                     const scalar_t* __restrict__ key_pool,
-                                     const scalar_t* __restrict__ value_pool,
+                                     const cache_t* __restrict__ key_pool,
+                                     const cache_t* __restrict__ value_pool,
                                      scalar_t* __restrict__ out,
                                      const int32_t* __restrict__ block_tables,
                                      const int32_t* __restrict__ cu_seqlens_q,
@@ -318,7 +327,8 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
                                      const int64_t max_blocks,
                                      const int block_shift,
                                      const int block_mask,
-                                     const float scale) {
+                                     const float scale,
+                                     const float v_scale) {
   const int64_t sequence = blockIdx.z;
   const int query_len = seq_lens[sequence];
   if (query_len <= 1) {
@@ -341,16 +351,16 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
   const int local_row = rows_before + warp;
   const bool active = local_row < query_len;
 
-  // The causal offset. These `L` queries are the *last* `L` positions of `S`, so
-  // query `i` may see keys up to `S - L + i` — the PyTorch reference's causal mask, as
-  // a comparison instead of a tensor. Getting this wrong is the bug that prefills
-  // correctly and then decodes nonsense, or lets a chunk see its own future.
+  // The causal offset. These `L` queries are the last `L` positions of `S`, so query `i`
+  // may see keys up to `S - L + i`: the PyTorch reference's causal mask expressed as a
+  // comparison rather than a tensor. An incorrect offset lets a chunk attend to its own
+  // future, which prefills plausibly and then decodes nonsense.
   const int64_t offset = context - query_len;
   const int64_t visible = active ? offset + local_row + 1 : 0;
 
-  // Every warp in the block walks the same key tiles, because they share the staged
-  // gather. The bound is the furthest any row in this tile may look, which is
-  // block-uniform — it has to be, since the staging loop has barriers in it.
+  // Every warp in the block walks the same key tiles because they share the staged
+  // gather. The bound is the furthest any row in this tile may look, which must be
+  // block-uniform since the staging loop contains barriers.
   const int64_t last_row = min(static_cast<int64_t>(rows_before + kPrefillWarps), static_cast<int64_t>(query_len)) - 1;
   const int64_t block_visible = offset + last_row + 1;
 
@@ -384,13 +394,13 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
     const int tile = static_cast<int>(remaining < kPrefillTileKeys ? remaining : kPrefillTileKeys);
 
     // Stage the tile: one warp per key, lanes over the head dimension, so the gather
-    // reads consecutive addresses and every warp in the block then reuses it. This is
-    // the whole reason prefill stages and decode does not — decode has one query row
-    // per block and would read each key exactly once either way.
+    // reads consecutive addresses and every warp in the block reuses it. Prefill stages
+    // and decode does not because decode has one query row per block and would read each
+    // key exactly once either way.
     for (int j = warp; j < tile; j += kPrefillWarps) {
       const int64_t slot = slot_of(table, tile_start + j, block_shift, block_mask);
-      const scalar_t* key = key_pool + (slot * num_kv_heads + kv_head) * head_dim;
-      const scalar_t* value = value_pool + (slot * num_kv_heads + kv_head) * head_dim;
+      const cache_t* key = key_pool + (slot * num_kv_heads + kv_head) * head_dim;
+      const cache_t* value = value_pool + (slot * num_kv_heads + kv_head) * head_dim;
       for (int64_t d = lane; d < head_dim; d += kWarpSize) {
         key_tile[j * head_dim + d] = static_cast<float>(key[d]);
         value_tile[j * head_dim + d] = static_cast<float>(value[d]);
@@ -421,8 +431,8 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
           }
         }
         // Every lane needs every score: each holds its own slice of the accumulator and
-        // rescales it by the same factors. Four reductions issued together rather than
-        // one at a time is the whole of this loop's optimization.
+        // rescales it by the same factors. Issuing the reductions together rather than
+        // one at a time is this loop's optimization.
 #pragma unroll
         for (int u = 0; u < kPrefillKeysPerStep; ++u) {
           dots[u] = warp_all_reduce_sum(dots[u]) * scale;
@@ -465,7 +475,7 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
     for (int i = 0; i < lanes; ++i) {
       const int64_t d = i * kWarpSize + lane;
       if (d < head_dim) {
-        destination[d] = static_cast<scalar_t>(accumulator[i] / running_sum);
+        destination[d] = static_cast<scalar_t>(accumulator[i] * v_scale / running_sum);
       }
     }
   }
@@ -483,7 +493,7 @@ int splits_for(int64_t rows, int64_t context_len) {
   return static_cast<int>(splits < 1 ? 1 : (splits > kMaxSplits ? kMaxSplits : splits));
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename cache_t>
 void launch_paged_attention(const at::Tensor& q,
                             const at::Tensor& key_pool,
                             const at::Tensor& value_pool,
@@ -494,7 +504,12 @@ void launch_paged_attention(const at::Tensor& q,
                             const at::Tensor& seq_lens,
                             const int64_t max_query_len,
                             const int64_t max_context_len,
-                            const float scale) {
+                            const float scale,
+                            const float k_scale,
+                            const float v_scale) {
+  // Fold the key scale into the softmax scale, once, on the host: every logit is
+  // (q · stored_key) * effective_scale, and a stored key is the real one over k_scale.
+  const float effective_scale = scale * k_scale;
   const int64_t num_sequences = seq_lens.size(0);
   const int64_t num_query_heads = q.size(1);
   const int64_t head_dim = q.size(2);
@@ -524,11 +539,11 @@ void launch_paged_attention(const at::Tensor& q,
   const dim3 decode_grid(static_cast<unsigned>(num_query_heads),
                          static_cast<unsigned>(num_sequences),
                          static_cast<unsigned>(splits));
-  paged_decode_kernel<scalar_t>
+  paged_decode_kernel<scalar_t, cache_t>
       <<<decode_grid, kDecodeThreads, decode_floats * sizeof(float), stream>>>(
           q.data_ptr<scalar_t>(),
-          key_pool.data_ptr<scalar_t>(),
-          value_pool.data_ptr<scalar_t>(),
+          key_pool.data_ptr<cache_t>(),
+          value_pool.data_ptr<cache_t>(),
           out.data_ptr<scalar_t>(),
           block_tables.data_ptr<int32_t>(),
           cu_seqlens_q.data_ptr<int32_t>(),
@@ -544,7 +559,8 @@ void launch_paged_attention(const at::Tensor& q,
           splits > 1 ? partial_max.data_ptr<float>() : nullptr,
           splits > 1 ? partial_sum.data_ptr<float>() : nullptr,
           splits,
-          scale);
+          effective_scale,
+          v_scale);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   if (splits > 1) {
@@ -560,23 +576,24 @@ void launch_paged_attention(const at::Tensor& q,
             seq_lens.data_ptr<int32_t>(),
             num_query_heads,
             head_dim,
-            splits);
+            splits,
+            v_scale);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  // Skipped entirely for a pure-decode iteration, which is the common case: there is
-  // no prefill row for it to find, and `max_query_len` says so without a device read.
+  // Skipped for a pure-decode iteration, the common case: there is no prefill row to
+  // find, and `max_query_len` establishes that without a device read.
   if (max_query_len > 1) {
     const int64_t query_tiles = (max_query_len + kPrefillWarps - 1) / kPrefillWarps;
     const size_t prefill_floats = 2 * kPrefillTileKeys * head_dim;
     const dim3 prefill_grid(static_cast<unsigned>(query_tiles),
                             static_cast<unsigned>(num_query_heads),
                             static_cast<unsigned>(num_sequences));
-    paged_prefill_kernel<scalar_t>
+    paged_prefill_kernel<scalar_t, cache_t>
         <<<prefill_grid, kPrefillThreads, prefill_floats * sizeof(float), stream>>>(
             q.data_ptr<scalar_t>(),
-            key_pool.data_ptr<scalar_t>(),
-            value_pool.data_ptr<scalar_t>(),
+            key_pool.data_ptr<cache_t>(),
+            value_pool.data_ptr<cache_t>(),
             out.data_ptr<scalar_t>(),
             block_tables.data_ptr<int32_t>(),
             cu_seqlens_q.data_ptr<int32_t>(),
@@ -588,9 +605,61 @@ void launch_paged_attention(const at::Tensor& q,
             max_blocks,
             block_shift,
             block_mask,
-            scale);
+            effective_scale,
+            v_scale);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
+}
+
+// Pick the storage type from the pool's dtype once the activation type is fixed. A
+// full-precision pool must match the query exactly — no scale bridges them, so mixing
+// would be a reinterpret rather than a conversion — and an FP8 pool pairs only with a
+// reduced-precision query.
+//
+// The `if constexpr` bounds compile memory rather than runtime cost. Every branch is
+// instantiated whether or not it is reachable, so without it an fp32 query would pull in
+// an unreachable `<float, Float8_e4m3fn>` specialization of three heavy kernels. Together
+// with supporting e4m3 alone (e5m2 is a legal storage type that takes the PyTorch oracle
+// path) this holds the translation unit to five instantiations instead of nine, which is
+// what lets nvcc fit in memory here.
+template <typename scalar_t>
+void dispatch_by_cache(const at::Tensor& q,
+                       const at::Tensor& key_pool,
+                       const at::Tensor& value_pool,
+                       at::Tensor& out,
+                       const at::Tensor& block_tables,
+                       const at::Tensor& cu_seqlens_q,
+                       const at::Tensor& context_lens,
+                       const at::Tensor& seq_lens,
+                       const int64_t max_query_len,
+                       const int64_t max_context_len,
+                       const float scale,
+                       const float k_scale,
+                       const float v_scale) {
+  const auto pool_dtype = key_pool.scalar_type();
+  auto run = [&](auto cache_tag) {
+    using cache_t = decltype(cache_tag);
+    launch_paged_attention<scalar_t, cache_t>(q, key_pool, value_pool, out, block_tables,
+                                              cu_seqlens_q, context_lens, seq_lens,
+                                              max_query_len, max_context_len, scale, k_scale,
+                                              v_scale);
+  };
+  if (pool_dtype == q.scalar_type()) {
+    run(scalar_t{});
+    return;
+  }
+  if constexpr (!std::is_same_v<scalar_t, float>) {
+    if (pool_dtype == at::kFloat8_e4m3fn) {
+      run(at::Float8_e4m3fn{});
+      return;
+    }
+  }
+  TORCH_CHECK(false,
+              "paged_attention: cannot pair a ",
+              pool_dtype,
+              " cache with a ",
+              q.scalar_type(),
+              " query");
 }
 
 }  // namespace
@@ -604,7 +673,9 @@ torch::Tensor paged_attention(const torch::Tensor& q,
                               const torch::Tensor& seq_lens,
                               int64_t max_query_len,
                               int64_t max_context_len,
-                              double scale) {
+                              double scale,
+                              double k_scale,
+                              double v_scale) {
   TORCH_CHECK(q.is_cuda() && key_pool.is_cuda() && value_pool.is_cuda(),
               "paged_attention: q and the pools must be CUDA tensors");
   TORCH_CHECK(q.dim() == 3,
@@ -618,14 +689,20 @@ torch::Tensor paged_attention(const torch::Tensor& q,
   TORCH_CHECK(q.is_contiguous() && key_pool.is_contiguous() && value_pool.is_contiguous(),
               "paged_attention: q and the pools must be contiguous; the kernel walks them "
               "by slot arithmetic rather than by stride");
-  TORCH_CHECK(q.scalar_type() == key_pool.scalar_type() &&
-                  q.scalar_type() == value_pool.scalar_type(),
-              "paged_attention: q and the pools must share a dtype, got ",
-              q.scalar_type(),
-              ", ",
+  TORCH_CHECK(key_pool.scalar_type() == value_pool.scalar_type(),
+              "paged_attention: the key and value pools must share a dtype, got ",
               key_pool.scalar_type(),
               " and ",
               value_pool.scalar_type());
+  const bool pool_is_fp8 = key_pool.scalar_type() == at::kFloat8_e4m3fn;
+  TORCH_CHECK(key_pool.scalar_type() == q.scalar_type() || pool_is_fp8,
+              "paged_attention: the pools must either match q's dtype or be FP8 e4m3, got q ",
+              q.scalar_type(),
+              " and pools ",
+              key_pool.scalar_type());
+  TORCH_CHECK(!pool_is_fp8 || q.scalar_type() != at::kFloat,
+              "paged_attention: an FP8 cache pairs with a reduced-precision query "
+              "(bf16 or half), not fp32");
   TORCH_CHECK(q.scalar_type() != at::kDouble,
               "paged_attention: float64 is not supported; the accumulators here are fp32");
   TORCH_CHECK(q.size(2) == key_pool.size(3),
@@ -681,30 +758,34 @@ torch::Tensor paged_attention(const torch::Tensor& q,
                      "paged_attention",
                      AT_DISPATCH_CASE(at::ScalarType::Float,
                                       [&] {
-                                        launch_paged_attention<scalar_t>(q,
-                                                                        key_pool,
-                                                                        value_pool,
-                                                                        out,
-                                                                        block_tables,
-                                                                        cu_seqlens_q,
-                                                                        context_lens,
-                                                                        seq_lens,
-                                                                        max_query_len,
-                                                                        max_context_len,
-                                                                        static_cast<float>(scale));
+                                        dispatch_by_cache<scalar_t>(q,
+                                                                    key_pool,
+                                                                    value_pool,
+                                                                    out,
+                                                                    block_tables,
+                                                                    cu_seqlens_q,
+                                                                    context_lens,
+                                                                    seq_lens,
+                                                                    max_query_len,
+                                                                    max_context_len,
+                                                                    static_cast<float>(scale),
+                                                                    static_cast<float>(k_scale),
+                                                                    static_cast<float>(v_scale));
                                       })
                          AT_DISPATCH_CASE_REDUCED_FLOATING_TYPES([&] {
-                           launch_paged_attention<scalar_t>(q,
-                                                           key_pool,
-                                                           value_pool,
-                                                           out,
-                                                           block_tables,
-                                                           cu_seqlens_q,
-                                                           context_lens,
-                                                           seq_lens,
-                                                           max_query_len,
-                                                           max_context_len,
-                                                           static_cast<float>(scale));
+                           dispatch_by_cache<scalar_t>(q,
+                                                       key_pool,
+                                                       value_pool,
+                                                       out,
+                                                       block_tables,
+                                                       cu_seqlens_q,
+                                                       context_lens,
+                                                       seq_lens,
+                                                       max_query_len,
+                                                       max_context_len,
+                                                       static_cast<float>(scale),
+                                                       static_cast<float>(k_scale),
+                                                       static_cast<float>(v_scale));
                          }));
 
   return out;

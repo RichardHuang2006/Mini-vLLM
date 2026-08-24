@@ -1,14 +1,14 @@
 """Block pool allocation and reference counting.
 
-No GPU, no tensors, no model: every test here runs in microseconds, which is exactly
-why this layer is worth testing exhaustively. A refcount bug that escapes this file
-resurfaces in the benchmarks as an out-of-memory after four thousand requests, with
-nothing left to say which one of them leaked.
+No GPU, no tensors, no model: every test here runs in microseconds, which is why this
+layer is tested exhaustively. A refcount bug that escapes this file resurfaces in the
+benchmarks as an out-of-memory after four thousand requests, with nothing to identify
+which one leaked.
 
 The last section is a `hypothesis` state machine driving random allocate / incref /
-decref sequences against a plain dict. It is the part that finds what hand-written
-cases do not: hypothesis shrinks a failing sequence to the shortest one that still
-fails, so a violation arrives as a two-line reproduction.
+decref sequences against a plain dict, covering what hand-written cases miss. Hypothesis
+shrinks a failing sequence to the shortest one that still fails, so a violation arrives as
+a two-line reproduction.
 """
 
 from __future__ import annotations
@@ -209,7 +209,7 @@ def test_a_double_free_raises(pool: BlockPool):
 
 
 def test_increfing_a_free_block_raises(pool: BlockPool):
-    """Sharing a block nobody owns means a stale id escaped somewhere."""
+    """Sharing a block at reference count zero means a stale id escaped somewhere."""
     with pytest.raises(BlockPoolError, match="must be allocated before"):
         pool.incref(0)
 

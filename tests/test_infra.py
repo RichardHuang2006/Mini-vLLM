@@ -1,9 +1,8 @@
 """The test infrastructure itself is trustworthy.
 
-Testing the test helpers looks like navel-gazing right up until a helper that
-silently never fails lets a broken kernel through. `assert_allclose` is used by
-almost every test in the suite, so its failure behaviour matters as much as its
-success behaviour, and both directions are checked here.
+A helper that never fails lets a broken kernel through. `assert_allclose` is used by
+almost every test in the suite, so its failure behaviour matters as much as its success
+behaviour, and both directions are checked here.
 
 `torch.testing.assert_close` passes when `|a - b| <= atol + rtol * |b|`, and
 `assert_allclose` sets `atol == rtol == tolerance`, so on a tensor of ones the

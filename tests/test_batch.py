@@ -1,13 +1,12 @@
 """Forward batch metadata.
 
-Every field here is an index into another, and the failure mode of a wrong index
-is not an exception but a sequence attending over another sequence's tokens. So
-the tests are mostly invariants, and they are checked on construction rather than
-at use: this object is the entire contract between the scheduler and the GPU, and
-a batch that violates it should not be constructible.
+Every field here is an index into another, and a wrong index produces one sequence
+attending over another's tokens rather than an exception. The tests are therefore mostly
+invariants, checked on construction rather than at use: this object is the whole contract
+between the scheduler and the GPU, so a batch that violates it should not be
+constructible.
 
-A worked example is spelled out in `test_the_worked_example`, which is the one to
-read first.
+`test_the_worked_example` spells out a full instance and is the entry point.
 """
 
 from __future__ import annotations

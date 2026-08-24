@@ -1,9 +1,8 @@
 // axpby: y = a*x + b — the toolchain smoke test.
 //
-// This kernel is deliberately trivial. Its only job is to prove that the whole
-// extension pipeline works before anything depends on it: nvcc finds a CUDA
-// version matching torch, the sm_120 target compiles, pybind11 exposes the
-// symbol, and a launch on a real tensor produces the right numbers.
+// Trivial by design: it exercises the whole extension pipeline before anything depends on
+// it — nvcc finds a CUDA version matching torch, the sm_120 target compiles, pybind11
+// exposes the symbol, and a launch on a real tensor produces the right numbers.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -11,8 +10,8 @@
 
 namespace {
 
-// Accumulate in fp32 regardless of the storage dtype, half and bfloat16 inputs
-// included. Every kernel in csrc/ follows that rule.
+// Accumulate in fp32 regardless of the storage dtype, including half and bfloat16. Every
+// kernel in csrc/ follows that rule.
 template <typename scalar_t>
 __global__ void axpby_kernel(const scalar_t* __restrict__ x,
                              scalar_t* __restrict__ y,

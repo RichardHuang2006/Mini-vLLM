@@ -1,9 +1,8 @@
 // Pieces every kernel in csrc/ needs: 16-byte vector loads and warp reductions.
 //
-// Shared between the kernels only. Nothing here is shared with `mini_vllm/`,
-// because the PyTorch implementations there are the oracles these kernels are
-// diffed against, and an oracle that shared code with the thing it validates
-// would be comparing an implementation against itself.
+// Shared between the kernels only. Nothing here is shared with `mini_vllm/`: the PyTorch
+// implementations there are the oracles these kernels are diffed against, and an oracle
+// sharing code with what it validates would compare an implementation against itself.
 
 #pragma once
 
@@ -32,18 +31,17 @@ struct Scalar {
   scalar_t lane[1];
 };
 
-// A tensor view can start part way into its storage — `h[:, -1:, :]` is one the
-// model actually produces — so 16-byte alignment is a property of a particular
-// call rather than of the dtype, and has to be checked rather than assumed. A
-// misaligned 128-bit load does not degrade, it faults.
+// A tensor view can start part way into its storage — `h[:, -1:, :]` is one the model
+// produces — so 16-byte alignment is a property of a particular call rather than of the
+// dtype and must be checked. A misaligned 128-bit load faults rather than degrading.
 inline bool is_vector_aligned(const void* pointer) {
   return reinterpret_cast<uintptr_t>(pointer) % kBytesPerVector == 0;
 }
 
-// Enough threads to cover `units` one each, capped at the block limit. Rounding
-// up to a whole warp is required, not tidiness: the reductions below shuffle
-// with a full 32-lane mask, so a block of, say, 100 threads would leave the last
-// warp partially populated and its shuffle undefined.
+// Enough threads to cover `units` one each, capped at the block limit. Rounding up to a
+// whole warp is required: the reductions below shuffle with a full 32-lane mask, so a
+// block of 100 threads would leave the last warp partially populated and its shuffle
+// undefined.
 inline int threads_for(int64_t units) {
   const int64_t rounded = ((units + kWarpSize - 1) / kWarpSize) * kWarpSize;
   const int64_t clamped = rounded < kWarpSize ? kWarpSize : rounded;
@@ -62,11 +60,11 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
 
 // The butterfly variant: every lane comes back with the total, not just lane 0.
 //
-// Worth the separate function because the two are used for different things. A
-// reduction whose result one thread stores wants the cheaper `shfl_down` tree above;
-// a reduction whose result every lane then *computes with* — a score that the whole
-// warp uses to update its own slice of an accumulator, as the paged prefill kernel
-// does — would otherwise need a broadcast shuffle afterwards anyway.
+// Separate from the above because the two serve different uses. A reduction whose result
+// one thread stores wants the cheaper `shfl_down` tree; a reduction whose result every
+// lane computes with — a score the whole warp uses to update its own slice of an
+// accumulator, as the paged prefill kernel does — would otherwise need a broadcast
+// shuffle afterwards.
 __device__ __forceinline__ float warp_all_reduce_sum(float value) {
 #pragma unroll
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -86,19 +84,19 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
   return value;
 }
 
-// Both block reductions below share one contract, and getting it wrong is the
-// classic source of a kernel that is right at 32 threads and wrong at 256:
+// Both block reductions below share one contract; violating it yields a kernel that is
+// correct at 32 threads and wrong at 256:
 //
 //   * only thread 0's return value is meaningful — broadcast it through shared
 //     memory if the rest of the block needs it;
 //   * `scratch` must hold at least one float per warp;
-//   * two reductions in a row must be separated by a `__syncthreads()`, because
-//     warp 0 is still *reading* `scratch` after the function returns while the
-//     other warps are free to run ahead and overwrite it.
+//   * two reductions in a row must be separated by a `__syncthreads()`, since
+//     warp 0 is still reading `scratch` after the function returns while the
+//     other warps may run ahead and overwrite it.
 //
-// `scratch` is a parameter rather than a static `__shared__` array so a kernel
-// that reduces a max and a sum in the same iteration can reuse one buffer and
-// place those barriers itself.
+// `scratch` is a parameter rather than a static `__shared__` array so a kernel reducing a
+// max and a sum in the same iteration can reuse one buffer and place those barriers
+// itself.
 
 __device__ __forceinline__ float block_reduce_sum(float value, float* scratch) {
   const int lane = threadIdx.x % kWarpSize;
@@ -126,8 +124,8 @@ __device__ __forceinline__ float block_reduce_max(float value, float* scratch) {
   }
   __syncthreads();
 
-  // The identity for a max is -inf, not zero: a block whose scores are all
-  // negative would otherwise come back with a max of 0 from the unused lanes.
+  // The identity for a max is -inf, not zero: a block whose scores are all negative would
+  // otherwise return a max of 0 from the unused lanes.
   value = (threadIdx.x < static_cast<unsigned>(warps)) ? scratch[threadIdx.x] : -INFINITY;
   return warp == 0 ? warp_reduce_max(value) : -INFINITY;
 }

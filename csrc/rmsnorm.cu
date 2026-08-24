@@ -1,18 +1,16 @@
 // RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight, over the last dim.
 //
-// The oracle is `rms_norm` in mini_vllm/layer_norm.py, and this kernel is only
-// correct insofar as it agrees with it. Two details of that function are load
-// bearing and easy to get wrong here:
+// The oracle is `rms_norm` in mini_vllm/layer_norm.py; correctness here means agreeing
+// with it bit for bit. Two of its details are load bearing:
 //
 //   * the mean of squares accumulates in fp32 even when the tensor is bf16, and
-//   * the normalized value is rounded back to the input dtype *before* the
-//     weight multiply, which is what HuggingFace does.
+//   * the normalized value is rounded back to the input dtype before the weight
+//     multiply, matching HuggingFace.
 //
-// The shape of the kernel — one block per row, a warp-shuffle reduction for the
-// statistic, 16-byte vectorized loads — is the pattern the other elementwise
-// kernels in csrc/ reuse. The op is memory-bound, so the number worth reporting
-// is achieved bandwidth against the card's peak, not wall-clock;
-// `python -m mini_vllm.bench --mode kernels` prints it.
+// The structure — one block per row, a warp-shuffle reduction for the statistic, 16-byte
+// vectorized loads — is the pattern the other elementwise kernels in csrc/ reuse. The op
+// is memory-bound, so the figure of merit is achieved bandwidth against the card's peak
+// rather than wall-clock; `python -m mini_vllm.bench --mode kernels` prints it.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -40,11 +38,10 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
   chunk_t* row_out = reinterpret_cast<chunk_t*>(out + row * dim);
   const chunk_t* row_weight = reinterpret_cast<const chunk_t*>(weight);
 
-  // Normalizing needs every element twice: once for the statistic, once to
-  // scale. When the row fits in one chunk per thread — true for every width
-  // Qwen3 uses, `E` = 1024 and `D` = 128 — the first read is kept in registers
-  // and the second pass costs no memory traffic at all. Wider rows fall back to
-  // re-reading, which is an L1 hit rather than a trip to DRAM.
+  // Normalizing reads every element twice, once for the statistic and once to scale. When
+  // the row fits in one chunk per thread — true for every width Qwen3 uses, `E` = 1024 and
+  // `D` = 128 — the first read is held in registers and the second pass costs no memory
+  // traffic. Wider rows re-read, which is an L1 hit rather than a trip to DRAM.
   const bool resident = chunks <= static_cast<int64_t>(blockDim.x);
   chunk_t held;
 
@@ -77,10 +74,9 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
     chunk_t result;
 #pragma unroll
     for (int j = 0; j < kLanes; ++j) {
-      // The round to scalar_t here, before the weight multiply, is not
-      // incidental: it is where the oracle's `weight * normalized.to(dtype)`
-      // loses its low bits, and skipping it would leave this kernel very
-      // slightly *more* accurate than the reference it must match.
+      // The round to scalar_t before the weight multiply is where the oracle's
+      // `weight * normalized.to(dtype)` loses its low bits. Skipping it would leave this
+      // kernel slightly more accurate than the reference it must match.
       const float scaled = static_cast<float>(chunk.lane[j]) * scale;
       const scalar_t normalized = static_cast<scalar_t>(scaled);
       const float weighted = static_cast<float>(normalized) * static_cast<float>(weights.lane[j]);
@@ -129,10 +125,9 @@ torch::Tensor rmsnorm(const torch::Tensor& x, const torch::Tensor& weight, doubl
               " but weight has ",
               weight.size(0),
               " elements");
-  // fp64 is refused rather than accumulated in fp32 like the rest. Halving the
-  // precision of a tensor that asked for double, silently, is a worse outcome
-  // than not running: the PyTorch oracle handles it exactly and the model never
-  // uses it.
+  // fp64 is refused rather than accumulated in fp32 like the rest: silently halving the
+  // precision of a double tensor is worse than declining, the PyTorch oracle handles it
+  // exactly, and the model never uses it.
   TORCH_CHECK(x.scalar_type() != at::kDouble,
               "rmsnorm: float64 is not supported; this kernel accumulates in fp32, "
               "which would silently lose precision. Use the PyTorch path.");

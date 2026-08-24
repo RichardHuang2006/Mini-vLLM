@@ -1,9 +1,8 @@
 """RMSNorm.
 
-Qwen3 uses this in three places, and the third is easy to miss: before attention,
-before the MLP, and *inside* attention as QK-norm, applied over the head
-dimension of `q` and `k`. The same function serves all three; only the axis width
-differs.
+Qwen3 uses this in three places: before attention, before the MLP, and inside attention
+as QK-norm over the head dimension of `q` and `k`. The same function serves all three,
+differing only in the width of the reduced axis.
 
 Kept as the oracle for the CUDA RMSNorm kernel.
 """
@@ -24,18 +23,16 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.
         weight: dim
         out:    N.. x dim
 
-    Unlike LayerNorm there is no mean subtraction and no bias: the vector is
-    rescaled but not recentred, which is cheaper and works as well in practice.
+    Unlike LayerNorm there is no mean subtraction and no bias: the vector is rescaled
+    but not recentred.
 
-    **The reduction is fp32 even when ``x`` is bf16, and that is not optional.**
-    A bf16 sum of 1024 squares carries roughly three decimal digits, and the
-    error feeds straight into a multiplicative rescale of the whole residual
-    stream. Across 28 layers it moves greedy tokens, which presents as a vague
-    "the model is a bit wrong" rather than as a dtype bug.
+    The reduction is fp32 even when ``x`` is bf16, and that is required rather than
+    conservative. A bf16 sum of 1024 squares carries roughly three decimal digits, and
+    the error feeds a multiplicative rescale of the whole residual stream; across 28
+    layers it moves greedy tokens.
 
-    The cast back to the input dtype happens *before* the weight multiply, which
-    is what HuggingFace does. Matching that ordering keeps this exactly
-    comparable to the oracle rather than approximately.
+    The cast back to the input dtype happens before the weight multiply, matching
+    HuggingFace, so this is exactly rather than approximately comparable to the oracle.
     """
     input_dtype = x.dtype
 

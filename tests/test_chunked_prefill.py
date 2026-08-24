@@ -1,18 +1,18 @@
 """Chunked prefill and piggyback decoding.
 
-Two claims, and they fail in different ways:
+Two claims, failing in different ways:
 
-* **Splitting a prefill does not change it.** A 2000-token prompt fed in 512-token
-  chunks must produce what it produces in one pass. This is where a position or
-  mask error lives: the model sees a `(512, 1024)` query-by-key rectangle on the
-  second chunk, and if RoPE starts at 0 again, or the causal diagonal is not shifted
-  right by `S - L`, the logits are wrong in a way that still reads as fluent text.
-* **Mixing prefill and decode in one pass does not change either.** A chunk beside a
-  dozen single-token decodes is one ragged forward pass, and every sequence in it
-  must produce what it produces alone.
+* Splitting a prefill does not change it. A 2000-token prompt fed in 512-token chunks
+  must produce what it produces in one pass. Position and mask errors live here: the
+  model sees a `(512, 1024)` query-by-key rectangle on the second chunk, and if RoPE
+  restarts at 0 or the causal diagonal is not shifted right by `S - L`, the logits are
+  wrong while still reading as fluent text.
+* Mixing prefill and decode in one pass does not change either. A chunk beside a dozen
+  single-token decodes is one ragged forward pass, and every sequence in it must produce
+  what it produces alone.
 
-The policy tests run without a model, because that is where the scheduling arithmetic
-is; the identity tests carry the weight.
+The policy tests run without a model, since that is where the scheduling arithmetic is;
+the identity tests carry the correctness weight.
 """
 
 from __future__ import annotations
@@ -21,10 +21,9 @@ import pytest
 import torch
 from conftest import assert_allclose
 
-# This file extends the scheduler tests' harness rather than reimplementing it: the
-# engine loop, the greedy parameters and the single-sequence reference are exactly the
-# ones the continuous-batching tests use, and a chunked run has to match *that*
-# reference to mean anything.
+# This file extends the scheduler tests' harness rather than reimplementing it: the engine
+# loop, the greedy parameters and the single-sequence reference are the ones the
+# continuous-batching tests use, and a chunked run must match that same reference.
 from test_scheduler import GREEDY, WHOLE, alone, make, run_to_completion
 
 from mini_vllm.serve.scheduler import DenseModelRunner, Scheduler, SchedulerConfig
@@ -205,9 +204,9 @@ def test_the_batch_describes_each_sequence_at_its_own_length():
 
     batch = scheduler.schedule().batch()
 
-    # L differs per sequence (1 for a decode, 8 for the chunk) and S is larger than L
-    # for the decodes, whose prefixes are cached. Those two facts together are the
-    # entire reason the kernels take offsets instead of a shape.
+    # L differs per sequence (1 for a decode, 8 for the chunk) and S exceeds L for the
+    # decodes, whose prefixes are cached. Together those are why the kernels take offsets
+    # rather than a shape.
     assert batch.seq_lens.tolist() == [1, 1, 8]
     assert batch.context_lens.tolist() == [3, 3, 8]
     assert batch.cu_seqlens_q.tolist() == [0, 1, 2, 10]

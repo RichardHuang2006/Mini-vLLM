@@ -29,7 +29,16 @@ torch::Tensor paged_attention(const torch::Tensor& q,
                               const torch::Tensor& seq_lens,
                               int64_t max_query_len,
                               int64_t max_context_len,
-                              double scale);
+                              double scale,
+                              double k_scale,
+                              double v_scale);
+void kv_quantize_scatter(const torch::Tensor& key,
+                         const torch::Tensor& value,
+                         torch::Tensor key_pool,
+                         torch::Tensor value_pool,
+                         const torch::Tensor& slot_mapping,
+                         double k_scale,
+                         double v_scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
@@ -91,5 +100,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("seq_lens"),
         py::arg("max_query_len"),
         py::arg("max_context_len"),
-        py::arg("scale"));
+        py::arg("scale"),
+        py::arg("k_scale") = 1.0,
+        py::arg("v_scale") = 1.0);
+
+  m.def("kv_quantize_scatter",
+        &kv_quantize_scatter,
+        "fused quantize-and-scatter of a step's keys and values into an FP8 paged cache",
+        py::arg("key"),
+        py::arg("value"),
+        py::arg("key_pool"),
+        py::arg("value_pool"),
+        py::arg("slot_mapping"),
+        py::arg("k_scale"),
+        py::arg("v_scale"));
 }

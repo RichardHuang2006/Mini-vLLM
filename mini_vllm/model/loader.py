@@ -1,16 +1,13 @@
 """Read a Qwen3 checkpoint and rename its weights to this project's scheme.
 
-The interesting part of this file is not the file I/O, it is
-:func:`load_weights` asserting the name mapping is **total in both directions**:
-every tensor in the checkpoint is consumed, and every tensor the model needs is
-produced.
+The load-bearing part is :func:`load_weights` asserting the name mapping is total in both
+directions: every tensor in the checkpoint is consumed, and every tensor the model needs
+is produced.
 
-That matters more than it sounds. A weight left unmapped is not a crash — the
-model runs, and produces fluent, confident, wrong text, because one projection is
-quietly still at its random initialization. It is the worst class of bug in the
-project: no stack trace, no obviously broken output, and it looks like a subtle
-numerical problem for as long as you are willing to believe that. So the mapping
-is checked rather than trusted, and the shapes are checked against the config too.
+An unmapped weight does not crash. The model runs and produces fluent, confident, wrong
+text because one projection is still at its random initialization — no stack trace, no
+obviously broken output, and it presents as a subtle numerical problem. The mapping is
+therefore checked rather than trusted, along with every shape against the config.
 """
 
 from __future__ import annotations
@@ -34,10 +31,9 @@ DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 def _rope_theta(raw: dict) -> float:
     """Read the RoPE base, wherever this config generation happens to keep it.
 
-    Older configs put `rope_theta` at the top level; transformers 5.x nests it
-    under `rope_parameters` (and, for a while, `rope_scaling`). All three appear
-    in checkpoints in the wild, and the value is load-bearing — a wrong base
-    silently changes every position encoding.
+    Older configs put `rope_theta` at the top level; transformers 5.x nests it under
+    `rope_parameters`, and for a time under `rope_scaling`. All three appear in
+    checkpoints in the wild, and a wrong base silently changes every position encoding.
     """
     if raw.get("rope_theta") is not None:
         return float(raw["rope_theta"])
@@ -74,7 +70,7 @@ class ModelConfig:
 
     @property
     def q_projection_size(self) -> int:
-        """``H_q · D``, which is *not* ``E`` — it is twice it in Qwen3-0.6B."""
+        """``H_q · D``, which is not ``E``: it is twice ``E`` in Qwen3-0.6B."""
         return self.num_attention_heads * self.head_dim
 
     @property
@@ -93,8 +89,8 @@ class ModelConfig:
     def from_dict(cls, raw: dict) -> ModelConfig:
         hidden_size = raw["hidden_size"]
         num_heads = raw["num_attention_heads"]
-        # head_dim is explicit in Qwen3, but fall back to the usual assumption so
-        # this also reads configs that omit it.
+        # head_dim is explicit in Qwen3; fall back to the usual assumption so configs
+        # that omit it still load.
         head_dim = raw.get("head_dim") or hidden_size // num_heads
 
         stated_dtype = raw.get("torch_dtype") or raw.get("dtype") or "bfloat16"
@@ -122,9 +118,9 @@ class ModelConfig:
 
 # -------------------------------------------------------------- name mapping
 
-# The local names on the right. They are shortened where HF is verbose (`wq` rather
-# than `self_attn.q_proj.weight`) but the structure is deliberately unchanged, so
-# a checkpoint key and a local key remain recognisably the same thing.
+# Local names on the right, shortened where HF is verbose (`wq` rather than
+# `self_attn.q_proj.weight`) but structurally unchanged, so a checkpoint key and a local
+# key remain recognisably the same weight.
 GLOBAL_NAMES: dict[str, str] = {
     "model.embed_tokens.weight": "embedding",
     "model.norm.weight": "final_norm",
@@ -144,16 +140,15 @@ LAYER_NAMES: dict[str, str] = {
     "mlp.down_proj.weight": "mlp.down",
 }
 
-# Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings` is true,
-# and it is bitwise identical to the embedding. It is therefore deliberately
-# dropped rather than mapped: the model reads logits off the embedding via
-# `Embedding.as_linear`, and keeping a second 155M-parameter copy would waste
-# 300 MB of an 8 GB card to hold the same numbers twice.
+# Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings` is true, and it is
+# bitwise identical to the embedding. Dropped rather than mapped: the model reads logits
+# off the embedding via `Embedding.as_linear`, and a second 155M-parameter copy would
+# cost 300 MB of an 8 GB card for the same numbers.
 TIED_LM_HEAD = "lm_head.weight"
 
 
 def map_name(hf_name: str) -> str | None:
-    """Translate one checkpoint key to the local name, or None if it is deliberately dropped."""
+    """Translate one checkpoint key to the local name, or None if it is dropped."""
     if hf_name == TIED_LM_HEAD:
         return None
     if hf_name in GLOBAL_NAMES:
@@ -179,8 +174,8 @@ def expected_names(config: ModelConfig) -> set[str]:
 def expected_shape(name: str, config: ModelConfig) -> tuple[int, ...]:
     """The shape a given weight must have, derived from the config.
 
-    Checked on load so a config that disagrees with the checkpoint fails here
-    rather than as a confusing matmul error deep in the forward pass.
+    Checked on load so a config that disagrees with the checkpoint fails here rather than
+    as a matmul error deep in the forward pass.
     """
     leaf = name.split(".")[-1]
     shapes: dict[str, tuple[int, ...]] = {
@@ -232,8 +227,8 @@ def shard_files(model_path: Path) -> list[Path]:
 def iter_weights(model_path: Path, device: str = "cpu") -> Iterator[tuple[str, torch.Tensor]]:
     """Yield ``(checkpoint_name, tensor)`` pairs, one shard at a time.
 
-    safetensors memory-maps the file, so tensors are paged in as they are read
-    rather than the whole 1.2 GB being materialized at once.
+    safetensors memory-maps the file, so tensors are paged in as they are read rather
+    than materializing the whole 1.2 GB at once.
     """
     for shard in shard_files(model_path):
         with safe_open(shard, framework="pt", device=device) as handle:

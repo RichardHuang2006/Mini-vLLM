@@ -1,14 +1,13 @@
 """Greedy, temperature, top-k and top-p sampling.
 
-Everything here is **vectorized across the batch with per-row parameters**, which
-is the one design constraint that matters. A server batches whatever requests
-happen to arrive together, and they will not agree on temperature: row 0 may be
-greedy while row 1 wants `temperature=1.2, top_p=0.9`. Looping over rows to honour
-that would put a Python loop inside the decode step — the single hottest path in
-the engine — so instead every row is masked and scaled in parallel, and greedy is
-handled as `temperature == 0` rather than as a separate code path.
+Everything here is vectorized across the batch with per-row parameters. A server batches
+whatever requests arrive together and they will not agree on temperature: row 0 may be
+greedy while row 1 wants `temperature=1.2, top_p=0.9`. Looping over rows would put a
+Python loop inside the decode step, the hottest path in the engine, so every row is
+masked and scaled in parallel and greedy is handled as `temperature == 0` rather than as
+a separate code path.
 
-The cost is one sort of the vocabulary axis per step, which is what makes per-row
+The cost is one sort along the vocabulary axis per step, which is what makes per-row
 top-k and top-p expressible as pure tensor ops.
 """
 
@@ -34,6 +33,11 @@ class SamplingParams:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
+    # How many independent completions to draw for one prompt. `n > 1` is parallel
+    # sampling: the prompt is prefilled once and the n branches share its KV through a
+    # forked block table, diverging in physical memory only when one of them writes,
+    # which is where copy-on-write applies on the serving path.
+    n: int = 1
 
     def __post_init__(self) -> None:
         if self.temperature < 0:
@@ -42,6 +46,8 @@ class SamplingParams:
             raise ValueError(f"top_k must be >= 0, got {self.top_k}")
         if not 0.0 < self.top_p <= 1.0:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
+        if self.n < 1:
+            raise ValueError(f"n must be >= 1, got {self.n}")
 
     @property
     def is_greedy(self) -> bool:
@@ -78,13 +84,12 @@ def sampling_probabilities(
 
         logits: B x V   ->   probabilities: B x V   (fp32, rows sum to 1)
 
-    Exposed separately from :func:`sample` because it is what makes the sampler
-    testable: a truncation rule is much easier to verify by inspecting the
-    distribution it produces than by drawing from it. Greedy rows come back as a
-    one-hot row.
+    Exposed separately from :func:`sample` because it makes the sampler testable: a
+    truncation rule is easier to verify by inspecting the distribution it produces than
+    by drawing from it. Greedy rows come back one-hot.
 
     Temperature is applied first, then top-k and top-p together on the scaled
-    distribution — the truncation has to see the same probabilities the draw will.
+    distribution, so the truncation sees the same probabilities the draw will.
     """
     if logits.ndim != 2:
         raise ValueError(f"expected B x V logits, got shape {tuple(logits.shape)}")
@@ -105,14 +110,13 @@ def sampling_probabilities(
     effective_k = torch.where(top_k == 0, torch.full_like(top_k, vocab), top_k)
     keep = rank < effective_k
 
-    # top-p: keep a token when the probability mass strictly *before* it is still
-    # below p. That yields the smallest prefix whose total reaches p, and includes
-    # the boundary token that crosses it rather than stopping short of p.
+    # top-p: keep a token while the probability mass strictly before it is below p. That
+    # gives the smallest prefix whose total reaches p, including the boundary token that
+    # crosses it rather than stopping short.
     mass_before = probabilities.cumsum(dim=-1) - probabilities
     keep &= mass_before < top_p
 
-    # The most likely token is always kept, so no row can be fully masked however
-    # small p is.
+    # The most likely token is always kept, so no row is fully masked however small p is.
     keep[:, 0] = True
 
     truncated = probabilities * keep
@@ -141,8 +145,8 @@ def sample(
 
         logits: B x V   ->   tokens: B   (int64)
 
-    Pass a ``generator`` to make a draw reproducible without disturbing global
-    RNG state, which is what lets a server replay one request.
+    Pass a ``generator`` to make a draw reproducible without disturbing global RNG
+    state, which is what lets a server replay one request.
     """
     probabilities = sampling_probabilities(logits, params)
     return torch.multinomial(probabilities, num_samples=1, generator=generator).squeeze(1)

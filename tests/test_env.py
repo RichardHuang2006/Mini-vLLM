@@ -1,9 +1,8 @@
 """The environment and the CUDA extension pipeline are usable.
 
-The CUDA kernels and the serving layer both assume a working `csrc/` build, so this
-file's job is to fail loudly and early if the toolchain is not what the rest of the
-project expects, rather than letting a version mismatch surface later while a real
-kernel is also being debugged.
+The CUDA kernels and the serving layer both assume a working `csrc/` build, so this file
+fails early if the toolchain is not what the rest of the project expects, rather than
+letting a version mismatch surface later alongside a kernel bug.
 """
 
 from __future__ import annotations
@@ -149,9 +148,8 @@ def test_hello_handles_awkward_inputs():
     empty = torch.empty(0, device="cuda")
     assert module.hello(empty, 1.0, 0.0).numel() == 0
 
-    # A transposed view is non-contiguous; the kernel must not read it as if it
-    # were dense. Every kernel in this project takes .contiguous() for exactly
-    # this reason, and this asserts it actually happens.
+    # A transposed view is non-contiguous and must not be read as dense. Every kernel here
+    # calls .contiguous() for that reason, and this asserts it happens.
     strided = torch.randn(64, 32, device="cuda").t()
     got = module.hello(strided, 3.0, 1.0)
     torch.testing.assert_close(got, 3.0 * strided + 1.0)

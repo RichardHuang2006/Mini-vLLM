@@ -1,17 +1,15 @@
 """Decode attention (online softmax) against the `mini_vllm.attention` oracle.
 
-The oracle materializes the whole `1 x S` score row and reads it twice. This
-kernel never materializes it, carrying `(m, l, O)` in FP32 registers instead, so
-the tests here are aimed squarely at the recurrence:
+The oracle materializes the whole `1 x S` score row and reads it twice. This kernel never
+materializes it, carrying `(m, l, O)` in FP32 registers instead, so the tests target the
+recurrence:
 
-* **tile boundaries** — every off-by-one in the rescaling hides in a partial
-  final tile, so `S` is tested at, one below, and one above multiples of 64;
-* **the rescaling factor itself** — `test_survives_a_late_spike` constructs a
-  sequence whose maximum arrives in the *last* tile, which is the case that
-  rescales every accumulator that came before it and the case that a kernel
-  rescaling only `l` and not `O` passes at low precision and fails here;
-* **saturation** — logits large enough that a non-shifted softmax would return
-  `inf/inf`.
+* Tile boundaries: off-by-one errors in the rescaling hide in a partial final tile, so `S`
+  is tested at, one below, and one above multiples of 64.
+* The rescaling factor: `test_survives_a_late_spike` constructs a sequence whose maximum
+  arrives in the last tile, rescaling every accumulator before it. A kernel that rescales
+  `l` but not `O` passes at low precision and fails here.
+* Saturation: logits large enough that a non-shifted softmax would return `inf/inf`.
 """
 
 from __future__ import annotations

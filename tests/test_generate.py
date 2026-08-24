@@ -1,9 +1,9 @@
 """Greedy generation against `transformers.generate`.
 
-The acceptance criterion is token identity, not similarity: greedy decoding is
-deterministic, so agreeing with HF for 32 steps means every logit that mattered
-agreed on its argmax. When it does fail, it fails by diverging at one step and
-then never recovering, which `assert_tokens_equal` reports by index.
+The acceptance criterion is token identity rather than similarity: greedy decoding is
+deterministic, so agreeing with HF for 32 steps means every logit that mattered agreed on
+its argmax. Failures diverge at one step and never recover, which `assert_tokens_equal`
+reports by index.
 """
 
 from __future__ import annotations
@@ -27,10 +27,9 @@ PROMPTS = [
     "def fibonacci(n):",
 ]
 
-# Diverges from HF at generation step 14 in bf16, and does so legitimately: both
-# models produce the same top two logits (18.0 and 17.875) and disagree only about
-# their order. See `test_a_bf16_divergence_is_only_ever_a_near_tie`, which asserts
-# that rather than taking it on trust.
+# Diverges from HF at generation step 14 in bf16, legitimately: both models produce the
+# same top two logits (18.0 and 17.875) and disagree only on their order. Asserted by
+# `test_a_bf16_divergence_is_only_ever_a_near_tie`.
 NEAR_TIE_PROMPT = "Once upon a time"
 
 
@@ -139,7 +138,7 @@ def test_reads_both_of_qwens_stop_tokens():
 
 @pytest.fixture(scope="module")
 def real():
-    """Ours and HF's, sharing bf16 weights, plus the tokenizer."""
+    """The `mini_vllm` and HF models sharing bf16 weights, plus the tokenizer."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     path = resolve_model_path()
@@ -188,15 +187,15 @@ def test_matches_transformers_generate(real, prompt):
 
 @pytest.mark.oracle
 def test_a_bf16_divergence_is_only_ever_a_near_tie(real):
-    """When bf16 greedy decoding *does* disagree with HF, prove it is representational.
+    """When bf16 greedy decoding disagrees with HF, establish that the cause is
+    representational.
 
-    Token identity is the right criterion for greedy decoding, but it has one
-    honest limit in bf16: when the top two logits land on adjacent representable
-    values, their order is decided by rounding, and both answers are equally
-    correct. Rather than quietly dropping such a prompt, this pins down what a
-    legitimate disagreement has to look like — the same two candidates, no more
-    than a couple of ULP apart. An actual bug satisfies neither condition: it
-    picks a token the other model does not rank highly at all.
+    Token identity is the right criterion for greedy decoding, with one limit in bf16: when
+    the top two logits land on adjacent representable values their order is decided by
+    rounding and both answers are equally correct. Rather than excluding such a prompt,
+    this pins down what a legitimate disagreement must look like — the same top two tokens,
+    no more than a couple of ULP apart. A bug satisfies neither condition, picking a token
+    the other model does not rank highly.
     """
     ours, theirs, tokenizer, device = real
     ids = tokenizer(NEAR_TIE_PROMPT, return_tensors="pt").input_ids.to(device)
@@ -207,8 +206,8 @@ def test_a_bf16_divergence_is_only_ever_a_near_tie(real):
 
     index = next(i for i in range(min(got.shape[1], expected.shape[1])) if got[0, i] != expected[0, i])
 
-    # Both models agreed on everything up to `index`, so feed that shared prefix
-    # and compare the two distributions that actually disagreed.
+    # Both models agreed on everything up to `index`, so feed that shared prefix and
+    # compare the two distributions that disagreed.
     prefix = expected[:, :index]
     with torch.no_grad():
         our_logits = ours(prefix)[0, -1].float()

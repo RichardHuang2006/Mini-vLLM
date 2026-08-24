@@ -1,18 +1,17 @@
 """JIT build and load of the CUDA sources in ``csrc/``.
 
-Every hand-written kernel, and every part of the serving layer that runs one,
-reaches the GPU through here, so this module owns one awkward problem:
-``torch.utils.cpp_extension`` refuses to compile when nvcc's CUDA *major* version
-differs from the one torch was built against, and on this machine they differ
-(torch is a cu130 build; the system nvcc is 12.8).
+Every hand-written kernel reaches the GPU through here, along with the toolchain
+problem that comes with it: ``torch.utils.cpp_extension`` refuses to compile when
+nvcc's CUDA major version differs from the one torch was built against, and on
+this machine they differ (torch is a cu130 build, the system nvcc is 12.8).
 
-The fix is to ignore the system toolkit and use the CUDA 13 compiler that ships
-as pip wheels. Those wheels are scattered, though: nvcc and its nvvm backend in
-one, the runtime headers and libraries in another, the CCCL headers that
+The resolution is to ignore the system toolkit and use the CUDA 13 compiler
+shipped as pip wheels. Those wheels are split across packages — nvcc and its nvvm
+backend in one, runtime headers and libraries in another, the CCCL headers that
 ``cuda_fp16.h`` pulls in (``nv/target``) in a third — and pip may install them
-into different site-packages trees, so no single directory looks like a CUDA
-installation. So this module assembles a symlink tree that does, under
-``build/``, and points CUDA_HOME at it.
+into different site-packages trees, so no single directory resembles a CUDA
+installation. This module assembles a symlink tree that does, under ``build/``,
+and points CUDA_HOME at it.
 """
 
 from __future__ import annotations
@@ -36,9 +35,20 @@ TOOLKIT_DIR = BUILD_DIR / "cuda_toolkit"
 
 EXT_NAME = "mini_vllm_C"
 
-# Blackwell, the RTX 5070 Laptop of record (compute capability 12.0). Targeting
-# the single architecture this project runs on keeps compiles fast.
+# Blackwell, the RTX 5070 Laptop of record (compute capability 12.0). Targeting a single
+# architecture keeps compiles fast.
 CUDA_ARCH = "sm_120"
+
+# Translation units to compile at once. Ninja defaults to one job per core, which is wrong
+# here: nvcc on a template-heavy kernel peaks well past a gigabyte, this machine has 16
+# cores, and WSL2 gives the VM about half the host's RAM. Sixteen concurrent jobs exhaust
+# it and the build is OOM-killed, which presents as a crash with no failing test. Four
+# fits the budget and costs little wall clock given the small number of sources.
+DEFAULT_MAX_JOBS = 4
+
+# Memory budget for one nvcc invocation, used to lower the job count on a machine with
+# less memory than this one rather than assuming 15 GB.
+BYTES_PER_JOB = 2 * 1024**3
 
 _extension: Any = None
 
@@ -81,13 +91,13 @@ def _nvidia_wheel_roots() -> list[Path]:
 
 
 class WheelToolkit:
-    """The pieces of a CUDA toolkit as pip actually scatters them.
+    """The pieces of a CUDA toolkit as pip scatters them.
 
-    There is no guarantee any single directory holds a usable toolkit. On this
-    machine nvcc and nvvm come from one site-packages tree, the runtime headers
-    and libraries from another, and the CCCL headers that ``cuda_fp16.h``
-    includes (``nv/target``) from a third wheel in yet another tree. So the
-    include and library search paths are lists, and get merged.
+    No single directory is guaranteed to hold a usable toolkit. On this machine nvcc and
+    nvvm come from one site-packages tree, the runtime headers and libraries from another,
+    and the CCCL headers that ``cuda_fp16.h`` includes (``nv/target``) from a third wheel
+    in a fourth tree. The include and library search paths are therefore lists, merged
+    downstream.
     """
 
     def __init__(self, compiler_root: Path, include_dirs: list[Path], lib_dirs: list[Path]) -> None:
@@ -116,8 +126,8 @@ def _find_wheel_toolkit(major: int) -> WheelToolkit | None:
     include_dirs = [c / "include" for c in candidates if (c / "include").is_dir()]
     lib_dirs = [c / "lib" for c in candidates if (c / "lib").is_dir()]
 
-    # Sort the tree holding cuda_runtime.h first so it wins any name collision
-    # during the merge; it is the authoritative copy of the core headers.
+    # Sort the tree holding cuda_runtime.h first so it wins name collisions during the
+    # merge; it is the authoritative copy of the core headers.
     include_dirs.sort(key=lambda d: not (d / "cuda_runtime.h").is_file())
     if not include_dirs or not (include_dirs[0] / "cuda_runtime.h").is_file():
         return None
@@ -144,9 +154,8 @@ def _relink(link: Path, target: Path) -> None:
 def _ensure_real_dir(path: Path) -> None:
     """Make ``path`` a real directory, replacing a symlink left by an older layout.
 
-    Without this, ``mkdir(exist_ok=True)`` on a path that is currently a symlink
-    to a wheel's include directory would silently succeed, and the symlinks would
-    then be scattered *inside site-packages*.
+    ``mkdir(exist_ok=True)`` on a path that is currently a symlink to a wheel's include
+    directory succeeds, which would scatter the symlinks inside site-packages.
     """
     if path.is_symlink():
         path.unlink()
@@ -164,9 +173,9 @@ def synthesize_cuda_home(toolkit: WheelToolkit, dest: Path = TOOLKIT_DIR) -> Pat
         dest/lib64/   -> merged symlinks from every wheel lib dir, plus sonames
         dest/lib      -> dest/lib64
 
-    ``bin`` is linked as a whole directory on purpose: nvcc locates its nvvm
-    backend relative to the real path of the binary, so linking the individual
-    executables would leave it unable to find ``cicc``.
+    ``bin`` is linked as a whole directory because nvcc locates its nvvm backend relative
+    to the real path of the binary; linking individual executables leaves it unable to
+    find ``cicc``.
     """
     dest.mkdir(parents=True, exist_ok=True)
     _relink(dest / "bin", toolkit.compiler_root / "bin")
@@ -255,6 +264,39 @@ def resolve_cuda_home() -> tuple[Path, str]:
 # --------------------------------------------------------------------- loading
 
 
+def _available_bytes() -> int | None:
+    """RAM the machine will give a compile, or None if it does not report it.
+
+    ``MemAvailable`` rather than ``MemFree``: the page cache is reclaimable, so counting
+    only free memory would throttle the build needlessly.
+    """
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def max_jobs() -> int:
+    """How many compiler processes to run at once, respecting an explicit override.
+
+    ``MAX_JOBS`` is the variable ``torch.utils.cpp_extension`` reads, so an explicit
+    setting passes through untouched.
+    """
+    override = os.environ.get("MAX_JOBS")
+    if override:
+        return max(1, int(override))
+
+    jobs = min(DEFAULT_MAX_JOBS, os.cpu_count() or 1)
+    available = _available_bytes()
+    if available is not None:
+        jobs = min(jobs, max(1, available // BYTES_PER_JOB))
+    return max(1, jobs)
+
+
 def _sources() -> list[str]:
     """Every translation unit in csrc/, bindings first."""
     sources = sorted(CSRC_DIR.glob("*.cpp")) + sorted(CSRC_DIR.glob("*.cu"))
@@ -274,13 +316,16 @@ def load_extension(verbose: bool = False) -> Any:
 
     home, _how = resolve_cuda_home()
 
-    # Both of these matter. The environment variables are what nvcc and any
-    # subprocess see; the module attribute is what torch itself consults, and it
-    # is captured once at import time, so setting only the environment would be
-    # silently ignored whenever cpp_extension was imported before this point.
+    # Both are required. The environment variables are what nvcc and any subprocess see;
+    # the module attribute is what torch consults, and it is captured once at import time,
+    # so setting only the environment is ignored when cpp_extension was imported earlier.
     os.environ["CUDA_HOME"] = str(home)
     os.environ["CUDA_PATH"] = str(home)
     os.environ["PATH"] = f"{home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    # Bound the compile before torch reads it; otherwise ninja fills every core and the
+    # build is OOM-killed instead of failing for a diagnosable reason.
+    os.environ["MAX_JOBS"] = str(max_jobs())
 
     from torch.utils import cpp_extension
 
@@ -301,8 +346,8 @@ def load_extension(verbose: bool = False) -> Any:
 def rebuild(verbose: bool = True) -> Any:
     """Discard the build cache and compile from scratch.
 
-    `make ext`. Worth reaching for whenever a kernel edit appears to have no
-    effect, which is usually a stale object file rather than a wrong kernel.
+    Exposed as `make ext`. The usual cause of a kernel edit having no effect is a stale
+    object file rather than a wrong kernel.
     """
     global _extension
     _extension = None

@@ -1,22 +1,17 @@
 """The RMSNorm kernel against the PyTorch RMSNorm it replaces.
 
-The oracle is `mini_vllm.layer_norm.rms_norm`, which its own tests already checked
-against HuggingFace. So this file never asks "is this the right formula" — that is
-settled — only "does the kernel compute the same thing the settled formula does".
-That is the whole differential-testing idea, and it is why the slow path is never
-deleted.
+The oracle is `mini_vllm.layer_norm.rms_norm`, already checked against HuggingFace by its
+own tests. This file therefore asks only whether the kernel computes what that settled
+formula computes, which is why the slow path is kept.
 
-Three classes of test earn their place here, because they are the three ways a
-kernel of this shape goes wrong:
+Three classes of test, matching the three ways a kernel of this shape fails:
 
-* **Widths.** The vectorized path needs the width to be a multiple of the vector
-  width and the pointers 16-byte aligned; every awkward width must still be right
-  through the fallback.
-* **The reduction.** A block-wide sum has to survive rows narrower than a warp and
-  rows wider than one chunk per thread, and it has to accumulate in fp32.
-* **The seam.** A correct kernel that the model never actually calls is worth
-  nothing, so the last section asserts the dispatch really routes to it and that
-  the model's greedy output does not move.
+* Widths. The vectorized path needs the width to be a multiple of the vector width and the
+  pointers 16-byte aligned; awkward widths must still be correct through the fallback.
+* The reduction. A block-wide sum must survive rows narrower than a warp and rows wider
+  than one chunk per thread, accumulating in fp32.
+* The seam. A correct kernel the model never calls has no effect, so the last section
+  asserts the dispatch routes to it and that the model's greedy output does not move.
 """
 
 from __future__ import annotations
@@ -87,8 +82,8 @@ def test_matches_the_oracle(kernel, dtype, dim):
 def test_normalizes_over_the_last_dimension_only(kernel, shape):
     """Leading dimensions are just rows: `N.. x dim` must behave like `prod(N..)` rows.
 
-    The 4-D case is the shape QK-norm passes in — `B x L x H x D` — so this is
-    the real call, not a generalization for its own sake.
+    The 4-D case is the shape QK-norm passes in, `B x L x H x D`, so it covers a real call
+    site rather than a hypothetical one.
     """
     dim = QWEN3_HEAD_DIM
     x = torch.randn(*shape, dim, device="cuda", dtype=torch.bfloat16)
@@ -395,10 +390,9 @@ def test_real_model_generates_the_same_text(dtype):
                 generate_ids_cached(torch_path, ids, max_tokens=32),
             )
         else:
-            # 28 layers, not the tiny model's 4, so the bound is the full-forward
-            # one: a single bf16 rounding difference amplifies to ~1.9% here, which
-            # is the same order as the fp32-vs-HuggingFace drift and a long way
-            # below the 14% a genuinely broken model shows.
+            # 28 layers rather than the tiny model's 4, so the bound is the full-forward
+            # one: a single bf16 rounding difference amplifies to ~1.9%, the same order as
+            # the fp32-vs-HuggingFace drift and far below the 14% a broken model shows.
             assert_relative_error_below(
                 cuda_path(ids, cuda_path.create_kv_cache()),
                 torch_path(ids, torch_path.create_kv_cache()),

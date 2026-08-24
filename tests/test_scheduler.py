@@ -1,16 +1,15 @@
 """Continuous batching.
 
-Two kinds of test, and the split matters:
+Two kinds of test:
 
-* **Policy**, with no model and no GPU — admission under a budget, the iteration
-  boundary, preemption. These are the interesting cases and they run in
-  milliseconds, which is only possible because `Scheduler` holds no tensors.
-* **Identity**, with a real (tiny) model — the invariant that a scheduling decision
-  changes timing and never output. A sequence run beside fifteen others, or
-  preempted and recomputed, must produce the tokens it produces alone.
+* Policy, with no model and no GPU: admission under a budget, the iteration boundary,
+  preemption. These run in milliseconds because `Scheduler` holds no tensors.
+* Identity, with a real (tiny) model: a scheduling decision changes timing and never
+  output. A sequence run beside fifteen others, or preempted and recomputed, must produce
+  the tokens it produces alone.
 
-The second kind is what makes the first kind worth anything: a scheduler that
-passes every policy test and perturbs one token is broken.
+The second kind is what gives the first its value: a scheduler that passes every policy
+test and perturbs one token is broken.
 """
 
 from __future__ import annotations
@@ -30,16 +29,14 @@ from mini_vllm.serve.scheduler import (
 from mini_vllm.serve.sequence import Sequence, SequenceStatus
 
 
-# Every identity test is greedy on purpose. `SamplingParams()` defaults to
-# temperature 1.0, and comparing two random draws would fail for reasons that have
-# nothing to do with scheduling — the claim being tested is that the *logits* a
-# sequence sees do not depend on what else is in the batch, and greedy decoding is
-# how that becomes an exact assertion rather than a distributional one.
+# Every identity test is greedy. `SamplingParams()` defaults to temperature 1.0, and
+# comparing two random draws would fail for reasons unrelated to scheduling. The claim
+# under test is that the logits a sequence sees do not depend on what else is in the
+# batch, and greedy decoding turns that into an exact assertion.
 GREEDY = SamplingParams(temperature=0.0)
 
-# Chunking off, for the tests that are about admission under a tight budget rather
-# than about splitting. Spelled as kwargs so each use reads as a deviation from the
-# default the engine actually ships with.
+# Chunking off, for the tests about admission under a tight budget rather than splitting.
+# Spelled as kwargs so each use reads as a deviation from the engine's default.
 WHOLE = {"enable_chunked_prefill": False}
 
 

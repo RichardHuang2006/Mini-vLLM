@@ -1,15 +1,15 @@
 """The RoPE kernel against the PyTorch rotation it replaces.
 
-The oracle is `mini_vllm.positional_encoding.apply_rope`, itself already checked
-against HuggingFace's own rotary embedding. So the question here is only whether
-the fused kernel gathers the same table rows and applies the same rotation.
+The oracle is `mini_vllm.positional_encoding.apply_rope`, already checked against
+HuggingFace's rotary embedding. The question here is only whether the fused kernel gathers
+the same table rows and applies the same rotation.
 
-Position bookkeeping is what the kernel can get wrong, and it fails quietly: a
-rotation by the wrong angle produces a plausible tensor, not an error. So the
-tests lean on *positions the model will really pass* — a prefill's `arange`, a
-decode step at a large offset, and positions that do not start at zero — plus the
-one invariant the KV cache depends on: rotating a token at position `p` must give
-the same answer whether it arrives in a prefill or as a single decode token.
+Position bookkeeping is the failure mode, and it fails silently: a rotation by the wrong
+angle produces a plausible tensor rather than an error. The tests therefore use positions
+the model actually passes — a prefill's `arange`, a decode step at a large offset, and
+positions that do not start at zero — plus the invariant the KV cache depends on: rotating
+a token at position `p` gives the same answer whether it arrives in a prefill or as a
+single decode token.
 """
 
 from __future__ import annotations
@@ -73,9 +73,8 @@ def test_matches_the_oracle(kernel, dtype, head_dim):
 def test_matches_the_oracle_across_shapes(kernel, rope, shape):
     """`B x L x H x D`, including the two the engine actually runs.
 
-    `(1, 1, 16)` is a decode step and `(1, 128, 16)` a prefill; the others exist
-    to keep the index arithmetic honest when the head count is not a power of two
-    or the batch is not one.
+    `(1, 1, 16)` is a decode step and `(1, 128, 16)` a prefill; the others exercise the
+    index arithmetic when the head count is not a power of two or the batch is not one.
     """
     batch, length, heads = shape
     x = torch.randn(batch, length, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)

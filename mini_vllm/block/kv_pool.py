@@ -7,19 +7,17 @@ One pre-allocated pool, partitioned into fixed-size pages of `P` tokens.
     keys:   num_layers x num_blocks x P x H_k x D
     values: num_layers x num_blocks x P x H_k x D
 
-Allocated **once**, at startup, and never grown. That is the whole point of paging as
-a memory strategy: a `cudaMalloc` in the middle of a decode step would stall every
-sequence in flight, and a pool that can be exhausted but not fragmented is a
-scheduling problem rather than a memory-manager problem.
+Allocated once at startup and never grown: a `cudaMalloc` in the middle of a decode step
+would stall every sequence in flight, and a pool that can be exhausted but not
+fragmented turns memory pressure into a scheduling problem.
 
-Two operations, and the asymmetry between them is the design:
+Two asymmetric operations:
 
-* :meth:`write` scatters this iteration's new keys and values into whatever slots the
-  block tables say, in one indexed copy per layer. Physical order is irrelevant.
-* :meth:`gather` collects one sequence's cache back into a contiguous tensor, which is
-  **not** what the engine wants to do — it is the slow, obviously-correct path that the
-  paged attention kernel is diffed against. Doing this gather for real would copy the
-  entire cache every iteration and defeat the purpose.
+* :meth:`write` scatters this iteration's new keys and values into the slots the block
+  tables name, one indexed copy per layer. Physical order is irrelevant.
+* :meth:`gather` collects one sequence's cache back into a contiguous tensor. This is
+  the slow reference path the paged attention kernel is diffed against, not a serving
+  path: doing it for real would copy the entire cache every iteration.
 """
 
 from __future__ import annotations
@@ -32,10 +30,10 @@ __all__ = ["PagedKvPool"]
 class PagedKvPool:
     """Pre-allocated paged storage for every layer's keys and values.
 
-    The layer axis is part of one tensor rather than a list of per-layer tensors so
-    the whole cache is a single allocation whose size is knowable up front —
-    :meth:`bytes_for` is what an engine uses to pick `num_blocks` from a memory
-    budget, and it would not be answerable if layers were allocated separately.
+    The layer axis is part of one tensor rather than a list of per-layer tensors, so the
+    whole cache is a single allocation whose size is knowable up front. That is what
+    makes :meth:`bytes_for` answerable, which is how an engine picks `num_blocks` from a
+    memory budget.
     """
 
     def __init__(
@@ -47,6 +45,9 @@ class PagedKvPool:
         head_dim: int,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str = "cpu",
+        kv_dtype: torch.dtype | None = None,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
     ) -> None:
         for name, value in (
             ("num_layers", num_layers),
@@ -65,12 +66,25 @@ class PagedKvPool:
         self.block_size = block_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        # `dtype` is the activation dtype: what keys and values arrive as and what a
+        # gather returns. `kv_dtype` is the storage dtype, identical unless the cache is
+        # quantized. Separating them is what FP8 amounts to here: the model still
+        # computes in bf16 and only the resident cache shrinks.
         self.dtype = dtype
+        self.kv_dtype = kv_dtype or dtype
+        self.is_fp8 = self.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        # Static scales, one per tensor. A key or value is divided by its scale before
+        # the cast down and multiplied back after, which is how e4m3's ±448 range is
+        # made to cover activations outside it. Qwen3's post-norm, post-RoPE keys are
+        # near unit scale, so 1.0 is a safe default; the hook exists for models whose
+        # are not.
+        self.k_scale = float(k_scale)
+        self.v_scale = float(v_scale)
         self.device = torch.device(device)
 
         shape = (num_layers, num_blocks, block_size, num_kv_heads, head_dim)
-        self.keys = torch.zeros(shape, dtype=dtype, device=self.device)
-        self.values = torch.zeros(shape, dtype=dtype, device=self.device)
+        self.keys = torch.zeros(shape, dtype=self.kv_dtype, device=self.device)
+        self.values = torch.zeros(shape, dtype=self.kv_dtype, device=self.device)
 
     # ------------------------------------------------------------------- sizing
 
@@ -83,13 +97,18 @@ class PagedKvPool:
         head_dim: int,
         dtype: torch.dtype,
     ) -> int:
-        """How much GPU memory a pool of this shape would take, keys and values."""
+        """How much GPU memory a pool of this shape would take, keys and values.
+
+        ``dtype`` is the storage dtype: pass ``torch.float8_e4m3fn`` to size an FP8 pool,
+        where a page of the same geometry costs half as much and the engine fits twice
+        as many.
+        """
         elements = num_layers * num_blocks * block_size * num_kv_heads * head_dim
         return 2 * elements * torch.empty((), dtype=dtype).element_size()
 
     @property
     def num_slots(self) -> int:
-        """Token slots per layer — the range `physical_slot` addresses."""
+        """Token slots per layer: the range `physical_slot` addresses."""
         return self.num_blocks * self.block_size
 
     # -------------------------------------------------------------------- access
@@ -104,9 +123,9 @@ class PagedKvPool:
     def flat(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         """One layer's pools flattened to `num_slots x H_k x D`.
 
-        The layout `slot_mapping` indexes into: `block_id * P + offset` is a flat slot
-        number precisely because the block and offset axes are adjacent and
-        contiguous, so this view is free.
+        The layout `slot_mapping` indexes into. `block_id * P + offset` is a flat slot
+        number because the block and offset axes are adjacent and contiguous, so this
+        view is free.
         """
         shape = (self.num_slots, self.num_kv_heads, self.head_dim)
         return self.keys[layer].view(shape), self.values[layer].view(shape)
@@ -127,18 +146,17 @@ class PagedKvPool:
             slot_mapping: int32 [T]     where each token goes, from the block tables
             key, value:   [T, H_k, D]   flattened across sequences
 
-        `T` spans the whole ragged batch — a prefill chunk's tokens and a dozen
-        decode steps' single tokens in one call — because the slots are already
-        absolute. Nothing here needs to know which sequence a token belonged to,
-        which is exactly the property that makes one launch enough.
+        `T` spans the whole ragged batch — a prefill chunk's tokens and a dozen decode
+        steps' single tokens in one call — because the slots are already absolute. Nothing
+        here needs to know which sequence a token belongs to, which is what makes one
+        launch sufficient.
 
-        The slot *values* are not checked here, and that is a deliberate reversal of
-        this file's usual habit. This is the innermost call in the engine — 28 layers
-        per iteration, every iteration — and `slot_mapping.max()` on a CUDA tensor is a
-        device-to-host read, which waits for everything queued behind it. Two of them per
-        layer measured 7 ms per iteration, a third of the model's time, to re-check
-        integers that `BlockManager.slots` already bounds-checked on the host while they
-        were still integers. Shapes are checked because that costs nothing.
+        Slot values are not checked here. This is the innermost call in the engine, 28
+        layers per iteration, and `slot_mapping.max()` on a CUDA tensor is a
+        device-to-host read that waits for everything queued behind it: two per layer
+        measured 7 ms per iteration, a third of the model's time, to re-check integers
+        `BlockManager.slots` already bounds-checked on the host. Shapes are checked
+        because that is free.
         """
         self._check_layer(layer)
         if key.shape != value.shape:
@@ -150,9 +168,26 @@ class PagedKvPool:
             raise ValueError(f"expected keys shaped {expected}, got {tuple(key.shape)}")
 
         flat_keys, flat_values = self.flat(layer)
-        index = slot_mapping.to(device=flat_keys.device, dtype=torch.int64)
-        flat_keys.index_copy_(0, index, key.to(flat_keys.dtype))
-        flat_values.index_copy_(0, index, value.to(flat_values.dtype))
+        if self.is_fp8:
+            # The fused kernel quantizes and scatters in one pass; off the GPU it falls
+            # back to the two-pass PyTorch that serves as its oracle. Either way the
+            # trailing dimensions must match the pool's, which the reshape enforces.
+            from mini_vllm.kernels import ops
+
+            ops.quantize_scatter(
+                key.reshape(-1, self.num_kv_heads, self.head_dim),
+                value.reshape(-1, self.num_kv_heads, self.head_dim),
+                flat_keys,
+                flat_values,
+                slot_mapping,
+                self.k_scale,
+                self.v_scale,
+                use_cuda=self.device.type == "cuda",
+            )
+        else:
+            index = slot_mapping.to(device=flat_keys.device, dtype=torch.int64)
+            flat_keys.index_copy_(0, index, key.to(flat_keys.dtype))
+            flat_values.index_copy_(0, index, value.to(flat_values.dtype))
 
     # -------------------------------------------------------------------- gather
 
@@ -168,10 +203,9 @@ class PagedKvPool:
 
             returns: 1 x H_k x num_tokens x D, keys and values
 
-        The shape is the one the readable reference implementation's attention takes,
-        so this is what makes a paged cache testable against a dense one. It is a
-        **copy** — the gather every real paged kernel exists to avoid — and is here
-        only as the oracle.
+        The shape the reference attention implementation takes, which is what makes a
+        paged cache testable against a dense one. It is a copy — the gather paged kernels
+        exist to avoid — and is present only as the oracle.
         """
         self._check_layer(layer)
         needed = -(-num_tokens // self.block_size)  # ceiling division
@@ -182,22 +216,27 @@ class PagedKvPool:
 
         index = torch.tensor(list(block_ids[:needed]), dtype=torch.int64, device=self.device)
         gathered = []
-        for pool in (self.keys[layer], self.values[layer]):
+        for pool, scale in ((self.keys[layer], self.k_scale), (self.values[layer], self.v_scale)):
             blocks = pool.index_select(0, index)  # needed x P x H_k x D
             flat = blocks.reshape(-1, self.num_kv_heads, self.head_dim)[:num_tokens]
-            gathered.append(flat.permute(1, 0, 2).unsqueeze(0).contiguous())
+            contiguous = flat.permute(1, 0, 2).unsqueeze(0).contiguous()
+            if self.is_fp8:
+                # Dequantize back to the activation dtype: the oracle attention runs in
+                # the model's precision, so the cast and the scale are undone here rather
+                # than leaving FP8 in the math.
+                contiguous = (contiguous.float() * scale).to(self.dtype)
+            gathered.append(contiguous)
         return gathered[0], gathered[1]
 
     # ---------------------------------------------------------------------- copy
 
     def copy_block(self, source: int, destination: int) -> None:
-        """Duplicate one page across every layer — the copy in copy-on-write.
+        """Duplicate one page across every layer: the copy in copy-on-write.
 
-        Every layer at once, because a block id means the same page in all of them:
-        the block table is per sequence, not per sequence and layer. Copying one
-        layer's page and not the others would leave a sequence attending over a
-        prefix that is correct in layer 0 and stale in layer 1, which reads as a
-        model that has subtly forgotten its prompt.
+        Every layer at once, because a block id names the same page in all of them — the
+        block table is per sequence, not per sequence and layer. Copying one layer's page
+        and not the others would leave a sequence attending over a prefix that is correct
+        in layer 0 and stale in layer 1.
         """
         for block_id in (source, destination):
             if not 0 <= block_id < self.num_blocks:
@@ -205,16 +244,20 @@ class PagedKvPool:
         if source == destination:
             return
 
-        self.keys[:, destination].copy_(self.keys[:, source])
-        self.values[:, destination].copy_(self.values[:, source])
+        # Copy raw bytes: a uint8 view is dtype-agnostic and works for every storage
+        # type this pool can hold, FP8 included.
+        keys, values = self.keys.view(torch.uint8), self.values.view(torch.uint8)
+        keys[:, destination].copy_(keys[:, source])
+        values[:, destination].copy_(values[:, source])
 
     def _check_layer(self, layer: int) -> None:
         if not 0 <= layer < self.num_layers:
             raise ValueError(f"layer {layer} is outside a pool of {self.num_layers} layers")
 
     def __repr__(self) -> str:
+        stored = f"{self.kv_dtype} <- {self.dtype}" if self.is_fp8 else f"{self.dtype}"
         return (
             f"PagedKvPool(layers={self.num_layers}, blocks={self.num_blocks}, "
             f"block_size={self.block_size}, heads={self.num_kv_heads}, dim={self.head_dim}, "
-            f"{self.dtype}, {self.device.type})"
+            f"{stored}, {self.device.type})"
         )

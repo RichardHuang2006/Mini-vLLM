@@ -1,14 +1,12 @@
 """Sequence state.
 
-No GPU and no model: this is integer bookkeeping, which is precisely why it is
-worth testing exhaustively here rather than discovering it through a scheduler bug
-later. The two things the tests are really about:
+No GPU and no model: integer bookkeeping, tested exhaustively here rather than surfacing
+later as a scheduler bug. Two things carry the file:
 
-* `num_computed_tokens` versus `len(sequence)`, whose difference is chunked
-  prefill and whose conflation is the bug that produces a duplicated or skipped
-  token at every chunk boundary;
-* the status machine, where the transition that matters is preemption — the only
-  way a sequence goes backwards.
+* `num_computed_tokens` versus `len(sequence)`, whose difference is chunked prefill and
+  whose conflation duplicates or skips a token at every chunk boundary;
+* the status machine, where the transition that matters is preemption, the only way a
+  sequence goes backwards.
 """
 
 from __future__ import annotations

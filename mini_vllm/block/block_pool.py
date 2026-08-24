@@ -1,29 +1,29 @@
 """The physical block pool: allocation and reference counting.
 
 The bottom of the paged memory hierarchy. The pool knows nothing about sequences,
-tokens, or tensors: it hands out integer ids and counts how many holders each one has.
-Everything above it — block tables, copy-on-write, admission control — is built from
-those two operations, and none of it needs a GPU to be tested, which is why paging
-starts here rather than in a kernel.
+tokens, or tensors: it hands out integer ids and counts holders. Block tables,
+copy-on-write and admission control are all built on those two operations, none of
+which needs a GPU to test.
 
-Reference counting is what makes sharing possible without copying. Forking a sequence
-or reusing a cached prefix increments counts instead of duplicating a page of K and V,
-and a block returns to circulation exactly when its last holder lets go.
+Reference counting is what allows sharing without copying: forking a sequence or
+reusing a cached prefix increments counts instead of duplicating a page of K and V, and
+a block returns to circulation when its last holder releases it.
 
-Two decisions worth recording, because both are the less obvious choice:
+Two non-obvious choices:
 
-* The free list is **FIFO, not LIFO**. Recycling the most recently freed block has
-  better cache locality, but it also means a use-after-free usually reads back the
-  data it just released and *looks correct*. Cycling the whole pool makes that class
-  of bug fail loudly, which is worth more here than the locality.
-* :class:`OutOfBlocks` is a **typed exception, not a `None` return**. Exhaustion is
+* The free list is FIFO rather than LIFO. Recycling the most recently freed block has
+  better cache locality, but it also means a use-after-free usually reads back the data
+  it just released and appears correct. Cycling the whole pool makes that class of bug
+  fail loudly, which is worth more than the locality.
+* :class:`OutOfBlocks` is a typed exception rather than a `None` return. Exhaustion is
   the condition that drives admission control and preemption in the block manager, so
-  the caller has to handle it; a sentinel return is too easy to drop on the floor.
+  the caller must handle it; a sentinel return is easy to ignore.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Callable
 from typing import NamedTuple
 
 __all__ = ["Block", "BlockPool", "BlockPoolError", "OutOfBlocks"]
@@ -36,19 +36,19 @@ class BlockPoolError(RuntimeError):
 class OutOfBlocks(BlockPoolError):
     """The pool is exhausted.
 
-    Unlike the other errors here this is an expected runtime *condition* rather than
-    a bug: it is the signal to preempt or to leave a request waiting. It inherits
-    from `BlockPoolError` so a caller can catch everything from the pool at once, but
-    it is caught on its own in the scheduler.
+    Unlike the other errors here this is an expected runtime condition rather than a
+    bug: it signals to preempt or to leave a request waiting. It inherits from
+    `BlockPoolError` so a caller can catch everything from the pool at once, but the
+    scheduler catches it on its own.
     """
 
 
 class Block(NamedTuple):
     """A read-only view of one block's state, for tests and debugging.
 
-    The pool does not store these — it stores a flat list of counts, because a pool
-    holds tens of thousands of blocks and an object per block would be pure overhead.
-    This is what you get when you ask about one.
+    The pool does not store these; it stores a flat list of counts, since a pool holds
+    tens of thousands of blocks and an object per block would be pure overhead. One of
+    these is materialized on request.
     """
 
     block_id: int
@@ -68,9 +68,8 @@ class BlockPool:
         incref(id)              add a holder (fork, prefix reuse)
         decref(id) -> bool      drop a holder; True if that freed the block
 
-    The pool is sized once at startup, because the whole point of paging is that GPU
-    memory is reserved up front and then partitioned — growing it later would mean a
-    cudaMalloc in the middle of a decode step.
+    Sized once at startup: paging reserves GPU memory up front and partitions it, so
+    growing the pool later would mean a cudaMalloc inside a decode step.
     """
 
     def __init__(self, num_blocks: int) -> None:
@@ -80,6 +79,13 @@ class BlockPool:
         self._num_blocks = num_blocks
         self._ref_counts = [0] * num_blocks
         self._free: deque[int] = deque(range(num_blocks))
+
+        # Prefix caching, inert unless a manager wires it up. `_cached[id]` is True while
+        # a block is registered in the prefix tree, free or held, since a held block
+        # stays matchable; `on_evict` is how the pool tells the tree to release a block
+        # it is about to repurpose.
+        self._cached = [False] * num_blocks
+        self.on_evict: Callable[[int], None] | None = None
 
     # ---------------------------------------------------------------- inspection
 
@@ -112,8 +118,8 @@ class BlockPool:
         """Take one block from the free list at reference count 1.
 
         Raises:
-            OutOfBlocks: if nothing is free. The caller's move is to preempt a
-                running sequence or to stop admitting, not to retry.
+            OutOfBlocks: if nothing is free. The caller should preempt a running
+                sequence or stop admitting rather than retry.
         """
         if not self._free:
             raise OutOfBlocks(
@@ -122,16 +128,23 @@ class BlockPool:
             )
 
         block_id = self._free.popleft()
+        # A block carrying cached KV is being repurposed: unlink it from the prefix tree
+        # first, so a later match cannot return a page now holding another sequence's
+        # tokens. FIFO over the free list is LRU over cache entries, so the free list
+        # already supplies the right eviction order.
+        if self._cached[block_id]:
+            if self.on_evict is not None:
+                self.on_evict(block_id)
+            self._cached[block_id] = False
         self._ref_counts[block_id] = 1
         return block_id
 
     def allocate_many(self, count: int) -> list[int]:
         """Take `count` blocks, or none at all.
 
-        All-or-nothing because a half-allocated sequence is worse than a rejected
-        one: the caller would have to unwind, and the unwinding is exactly the code
-        path that leaks blocks when it is wrong. Whatever was taken goes back before
-        the exception leaves.
+        All-or-nothing: a half-allocated sequence forces the caller to unwind, and the
+        unwind path is where block leaks come from. Anything taken is returned before
+        the exception propagates.
         """
         if count < 0:
             raise ValueError(f"cannot allocate {count} blocks")
@@ -157,8 +170,8 @@ class BlockPool:
 
         Returns:
             True if this call freed the block, False if holders remain. Copy-on-write
-            needs that distinction: a write to a block with holders left has to copy,
-            and a write to one it just released does not.
+            needs the distinction: a write to a block with holders left must copy, a
+            write to one just released need not.
         """
         self._check_id(block_id)
         if self._ref_counts[block_id] == 0:
@@ -177,15 +190,54 @@ class BlockPool:
         """Drop a holder on each, returning how many blocks that freed."""
         return sum(self.decref(block_id) for block_id in block_ids)
 
+    # -------------------------------------------------------------- prefix cache
+
+    def mark_cached(self, block_id: int) -> None:
+        """Record that a block is now registered in the prefix tree.
+
+        Called after the cache inserts a finishing sequence's full blocks. The reference
+        count is unchanged: caching does not add a holder, it makes the page matchable
+        while still reclaimable.
+        """
+        self._check_id(block_id)
+        self._cached[block_id] = True
+
+    def is_cached(self, block_id: int) -> bool:
+        self._check_id(block_id)
+        return self._cached[block_id]
+
+    def acquire_cached(self, block_id: int) -> None:
+        """Take a matched block for a new holder, from wherever it currently sits.
+
+        A prefix-cache hit is not a fresh allocation: the block exists and already holds
+        the right KV, so this adds a holder rather than taking a page from the free list.
+        A cached block at reference count zero comes off the free list here; one already
+        held by a running sequence is a plain incref. Either way it stays in the tree,
+        matchable by the next request.
+        """
+        self._check_id(block_id)
+        if self._ref_counts[block_id] == 0:
+            # A cached free block: pull it off the free list by hand. It stays cached,
+            # so a later reuse of the same page still evicts its node.
+            self._free.remove(block_id)
+            self._ref_counts[block_id] = 1
+        else:
+            self._ref_counts[block_id] += 1
+
+    def is_free_cached(self, block_id: int) -> bool:
+        """A cached block at reference count zero. Reusing it consumes a free page while
+        matching a held one does not, a distinction admission control accounts for."""
+        self._check_id(block_id)
+        return self._cached[block_id] and self._ref_counts[block_id] == 0
+
     # --------------------------------------------------------------- consistency
 
     def check_consistency(self) -> None:
         """Assert the free list and the reference counts still agree.
 
-        Cheap enough to call from test teardown, which is where it earns its keep: a
-        refcount bug is caught by the test that introduced it rather than surfacing
-        as an out-of-memory three steps later, when the leak is thousands of
-        iterations old and belongs to whoever ran last.
+        Cheap enough to call from test teardown, where it attributes a refcount bug to
+        the test that introduced it rather than letting it surface as an out-of-memory
+        thousands of iterations later.
         """
         free = list(self._free)
 

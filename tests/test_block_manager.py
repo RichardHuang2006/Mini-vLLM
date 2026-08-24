@@ -2,17 +2,16 @@
 
 Three groups:
 
-* **Bookkeeping** — capacity, growth, admission control. Integers, no tensors.
-* **Copy-on-write** — the claim that forking an N-block sequence allocates zero blocks,
-  and that writing afterwards copies exactly one page and leaves the other branch's
-  mapping untouched.
-* **Equivalence** — paged attention over a deliberately *shuffled* block table produces
-  what a plain dense cache produces. That shuffle is the real test of the indirection:
-  a wrong gather still passes when physical order happens to match logical order,
-  which it does for the first sequence a fresh pool ever serves.
+* Bookkeeping: capacity, growth, admission control. Integers, no tensors.
+* Copy-on-write: forking an N-block sequence allocates zero blocks, and a subsequent
+  write copies exactly one page while leaving the other branch's mapping untouched.
+* Equivalence: paged attention over a shuffled block table produces what a dense cache
+  produces. The shuffle is what tests the indirection, since a wrong gather still passes
+  when physical order matches logical order, as it does for the first sequence a fresh
+  pool serves.
 
-Every test that allocates ends with a leak check. A leaked block is invisible until
-the pool runs dry thousands of iterations later, in whichever test ran last.
+Every test that allocates ends with a leak check. A leaked block is invisible until the
+pool runs dry thousands of iterations later, in whichever test ran last.
 """
 
 from __future__ import annotations

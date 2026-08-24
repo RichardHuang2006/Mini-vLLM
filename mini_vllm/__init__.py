@@ -7,11 +7,10 @@
     llm = LLM()
     print(llm.generate("The capital of France is", max_tokens=16)[0].text)
 
-`LLM` lives in `mini_vllm.serve.engine`, which is where it belongs but not how it
-should be spelled: the module path is an implementation detail of an engine assembled
-from a scheduler, a block manager and a paged model, and the caller needs none of that.
-Imported lazily so that `import mini_vllm.basics` in a test of the readable reference
-implementation does not drag in transformers and a model loader.
+`LLM` is defined in `mini_vllm.serve.engine` and re-exported here: the module path is an
+implementation detail of an engine assembled from a scheduler, a block manager and a
+paged model. The import is lazy so that `import mini_vllm.basics`, in tests of the
+reference implementation, does not pull in transformers and the model loader.
 """
 
 from __future__ import annotations

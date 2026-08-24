@@ -1,12 +1,11 @@
 """The fused SwiGLU kernel against `silu(gate) * up`.
 
-The op is trivial arithmetic, so the interesting content is not "is the formula
-right" but **where the rounding happens**. PyTorch evaluates three separate
-elementwise ops and each one lands back in the input dtype; a kernel that carried
-fp32 through to the store would be slightly *more* accurate than its own oracle,
-and a differential test cannot distinguish "better" from "wrong". Matching the
-rounding points instead makes the comparison exact — which is why the headline
-test here asserts `torch.equal` rather than a tolerance.
+The op is trivial arithmetic, so what matters is where the rounding happens. PyTorch
+evaluates three separate elementwise ops, each landing back in the input dtype; a kernel
+carrying fp32 through to the store would be slightly more accurate than its own oracle,
+and a differential test cannot distinguish more accurate from wrong. Matching the rounding
+points makes the comparison exact, which is why the headline test asserts `torch.equal`
+rather than a tolerance.
 """
 
 from __future__ import annotations

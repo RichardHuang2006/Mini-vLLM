@@ -1,16 +1,15 @@
 """Executing a scheduler decision against the paged cache.
 
-The replacement for `DenseModelRunner`, and the difference between them is one line
-of shape. The dense runner loops over the scheduled sequences and runs a forward pass
-each, because a `B x H x S x D` cache cannot hold two sequences of different lengths.
-This one builds a single ragged `ForwardBatch` and runs **one** pass for the whole
-iteration — a 512-token prefill chunk and eleven decode steps together.
+The replacement for `DenseModelRunner`. The dense runner issues one forward pass per
+scheduled sequence, since a `B x H x S x D` cache cannot hold two sequences of
+different lengths. This one builds a single ragged `ForwardBatch` and runs one pass for
+the whole iteration: a 512-token prefill chunk and eleven decode steps together.
 
-The order inside `execute` is not arbitrary. Blocks are reserved *before* the batch is
-built, because `slot_mapping` is a list of physical addresses and there is nothing to
-address until the pages exist. The scheduler has already asked `can_allocate`, so the
-reservation here is expected to succeed; if it raises, the scheduler and the pool have
-disagreed and that is worth surfacing rather than smoothing over.
+Ordering inside `execute` matters. Blocks are reserved before the batch is built,
+because `slot_mapping` holds physical addresses and there is nothing to address until
+the pages exist. The scheduler has already checked capacity, so the reservation is
+expected to succeed; a failure means the scheduler and the pool have disagreed, and it
+propagates rather than being absorbed.
 """
 
 from __future__ import annotations
@@ -34,18 +33,24 @@ class PagedModelRunner:
         self.manager = manager
         self.device = torch.device(device) if device else manager.kv.device
 
-    def execute(self, output: SchedulerOutput) -> torch.Tensor:
+    def execute(self, output: SchedulerOutput, all_rows: bool = False) -> torch.Tensor:
         """One forward pass over the whole scheduled batch.
 
         ::
 
             returns: num_scheduled x V   (each sequence's last computed position)
+                     total_tokens  x V   when `all_rows`
+
+        `all_rows` is for speculative verification, which needs the target's
+        distribution at every proposed position rather than only the last. Off
+        otherwise: the LM head is a `V`-wide matmul and a prefill chunk's interior rows
+        have no use for it.
         """
         for sequence, count in output.scheduled:
             self.manager.allocate(sequence, count)
 
         batch = self.build(output)
-        return self.model(batch)
+        return self.model(batch, all_rows=all_rows)
 
     def build(self, output: SchedulerOutput) -> ForwardBatch:
         """The batch for an already-reserved iteration. Split out for the tests."""
@@ -55,10 +60,10 @@ class PagedModelRunner:
         """One token per scheduled sequence, honouring per-row sampling parameters.
 
         Rows belonging to a chunk that has not reached the end of its prompt are
-        sampled and then discarded by `Scheduler.commit`. That is one wasted row of an
-        already-batched sample rather than a branch in the hot path — and the
-        alternative, slicing the logits down to the finishing sequences first, costs a
-        device synchronization to find out which those are.
+        sampled and then discarded by `Scheduler.commit`: one wasted row of an
+        already-batched sample instead of a branch in the hot path. Slicing the logits
+        down to the finishing sequences first would cost a device synchronization to
+        determine which those are.
         """
         params = [sequence.sampling_params for sequence, _ in output.scheduled]
         if all(parameter.is_greedy for parameter in params):

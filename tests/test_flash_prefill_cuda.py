@@ -1,20 +1,18 @@
 """Flash prefill against the `mini_vllm.attention` oracle.
 
-Prefill adds one thing decode did not have: a mask. So most of these tests are
-about the diagonal, because that is where the two failure modes live, and they are
-not symmetric.
+Prefill adds a mask, which decode does not have, so most of these tests concern the
+diagonal. Its two failure modes are asymmetric:
 
-* Masking **too much** loses information and shows up as a tolerance failure —
-  loud, and caught by any comparison.
-* Masking **too little** lets a token attend to its own future. That is silent:
-  the output is a perfectly well-formed convex combination, prefill logits look
-  plausible, and the only symptom is a model that generates worse text than it
-  should. `test_a_query_cannot_see_its_own_future` checks it directly rather than
-  through a tolerance, by perturbing a later key and asserting an earlier query's
-  output does not move at all.
+* Masking too much loses information and surfaces as a tolerance failure, caught by any
+  comparison.
+* Masking too little lets a token attend to its own future. That is silent: the output is
+  a well-formed convex combination, prefill logits look plausible, and the only symptom is
+  degraded generation. `test_a_query_cannot_see_its_own_future` checks it directly rather
+  than through a tolerance, by perturbing a later key and asserting an earlier query's
+  output does not move.
 
-The tile is 16 wide, so lengths are tested at 16, 17, 31, 32 and 33 — one token past a
-tile boundary in both directions.
+The tile is 16 wide, so lengths are tested at 16, 17, 31, 32 and 33, one token past a tile
+boundary in both directions.
 """
 
 from __future__ import annotations

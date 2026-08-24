@@ -1,6 +1,6 @@
 """The contract between the scheduler and the GPU.
 
-One forward pass, one `ForwardBatch`. It describes a **ragged** batch: sequences of
+One forward pass, one `ForwardBatch`. It describes a ragged batch: sequences of
 different lengths, some prefilling and some decoding, flattened into a single token
 axis with offsets rather than padded into a rectangle.
 
@@ -12,17 +12,17 @@ axis with offsets rather than padded into a rectangle.
       seq_lens      [300, 1, 1]          new tokens per sequence   (L)
       context_lens  [300, 512, 47]       total attended tokens     (S)
 
-Why flattened and not padded: padding a 300-token prefill next to two decode steps
-into a `3 x 300` rectangle is 598 wasted token-slots of compute, and the waste
-grows with the length spread — the same argument paging makes about memory. The
-paged attention kernels read `cu_seqlens_q` and `context_lens` and serve the whole
-ragged batch in one launch with no host-side per-sequence branching, so this object
-is shaped for them rather than reshaped later.
+Flattened rather than padded: padding a 300-token prefill beside two decode steps into
+a `3 x 300` rectangle wastes 598 token-slots of compute, and the waste grows with the
+length spread — the argument paging makes about memory, applied to compute. The paged
+attention kernels read `cu_seqlens_q` and `context_lens` and serve the whole ragged
+batch in one launch with no host-side per-sequence branching, so this object is built
+in their layout rather than reshaped later.
 
-`seq_lens` and `context_lens` are separate for the same reason `Sequence` separates
-`num_computed_tokens` from `len(sequence)`: `L` is how many tokens this pass
-computes and `S` is how many it attends over. They differ whenever a prefix is
-already cached, which is every decode step and every chunk after the first.
+`seq_lens` and `context_lens` are separate for the reason `Sequence` separates
+`num_computed_tokens` from `len(sequence)`: `L` is how many tokens this pass computes,
+`S` how many it attends over. They differ whenever a prefix is already cached, which
+is every decode step and every chunk after the first.
 """
 
 from __future__ import annotations
@@ -37,8 +37,9 @@ from mini_vllm.serve.sequence import Sequence
 
 __all__ = ["ForwardBatch"]
 
-# What an unused block-table entry holds. See the field's comment: a kernel bounded by
-# `context_lens` never reads it, so a read is a bug worth making impossible to miss.
+# What an unused block-table entry holds. A kernel bounded by `context_lens` never
+# reads it, so a read is a bug, and -1 is an impossible block id rather than a silent
+# alias for block 0.
 PADDING_BLOCK = -1
 
 
@@ -56,15 +57,15 @@ def _check_metadata(
 ) -> None:
     """Check one batch's metadata for consistency, in plain integers.
 
-    Integers rather than tensors, and that is the whole reason this is a function.
-    Every one of these checks is a comparison against another field, so run on device
-    tensors they would each cost a device-to-host read — and a read of a CUDA tensor
-    waits for everything already queued on the stream, which is the previous iteration's
-    twenty-eight layers. That would put half a dozen pipeline drains on the critical path
-    of every iteration to re-learn numbers the scheduler had as `int` a moment earlier.
+    Integers rather than tensors, which is why this is a free function. Each check
+    compares one field against another, so on device tensors each would cost a
+    device-to-host read, and reading a CUDA tensor waits for everything queued on the
+    stream — the previous iteration's twenty-eight layers. That would put several
+    pipeline drains on every iteration's critical path to recover numbers the scheduler
+    already held as `int`.
 
-    So the checks live here, the builder calls them with what it already knows, and
-    `ForwardBatch.__post_init__` calls them for a batch assembled by hand.
+    The builder therefore calls this with what it already knows, and
+    `ForwardBatch.__post_init__` calls it for a batch assembled by hand.
     """
     if not num_sequences:
         raise ValueError("a forward batch needs at least one sequence")
@@ -85,10 +86,9 @@ def _check_metadata(
             "they index the same tokens"
         )
 
-    # The offsets must actually describe the token axis they index into. This is the
-    # invariant that catches a scheduler that admitted a sequence but forgot to extend
-    # the flattened ids, which would otherwise read whatever tokens happen to sit at the
-    # end of the batch.
+    # The offsets must describe the token axis they index into. This catches a scheduler
+    # that admitted a sequence but did not extend the flattened ids, which would
+    # otherwise read whatever tokens sit at the end of the batch.
     if offsets[0] != 0:
         raise ValueError("cu_seqlens_q must start at 0")
     if offsets[-1] != num_tokens:
@@ -98,9 +98,9 @@ def _check_metadata(
     if lengths != seq_lens:
         raise ValueError(f"cu_seqlens_q differences {lengths} disagree with seq_lens {seq_lens}")
 
-    # S >= L is not a convention, it is causality: a pass cannot compute more tokens than
-    # it is allowed to attend over, and a kernel handed S < L would mask every query in
-    # the overhang down to nothing.
+    # S >= L follows from causality: a pass cannot compute more tokens than it may
+    # attend over, and a kernel given S < L masks every query in the overhang to
+    # nothing.
     if any(context < length for context, length in zip(context_lens, seq_lens, strict=True)):
         raise ValueError(
             f"context_lens {context_lens} must be >= seq_lens {seq_lens} elementwise"
@@ -122,10 +122,10 @@ def _check_metadata(
 def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> torch.Tensor:
     """Stack per-sequence block tables into one rectangle, right-padded.
 
-    Rectangular because the kernel indexes it as `block_tables[seq, logical_block]`,
-    and a ragged tensor of pointers would put a second indirection inside the inner
-    loop. The width is the widest table in *this* batch, not the longest a sequence
-    could ever be, so a batch of short sequences carries a small tensor.
+    Rectangular because the kernel indexes it as `block_tables[seq, logical_block]`;
+    a ragged tensor of pointers would add a second indirection inside the inner loop.
+    The width is the widest table in this batch rather than the maximum sequence
+    length, so a batch of short sequences carries a small tensor.
     """
     widest = max((len(table) for table in tables), default=0)
     padded = [list(table) + [PADDING_BLOCK] * (widest - len(table)) for table in tables]
@@ -136,11 +136,10 @@ def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> to
 class ForwardBatch:
     """Everything the model and the kernels need for one ragged forward pass.
 
-    A validated dataclass rather than a bag of tensors, because every field is an
-    index into another one and the failure mode of getting that wrong is silently
-    wrong text rather than an exception. The invariants are checked once, here, on
-    construction — which is cheap next to a forward pass and is what makes the rest
-    of the serving layer debuggable.
+    A validated dataclass rather than a bag of tensors: every field indexes another
+    one, and getting that wrong yields silently wrong text rather than an exception.
+    The invariants are checked once at construction, which is cheap next to a forward
+    pass.
     """
 
     input_ids: torch.Tensor  # int64 [total_tokens], flattened across sequences
@@ -151,40 +150,38 @@ class ForwardBatch:
     seq_ids: tuple[int, ...]
     sampling_params: tuple[SamplingParams, ...]
 
-    # Paging metadata, filled in from the block manager. Optional because the dense
-    # runner has no use for them and the pure-scheduling tests should not have to build
-    # a block manager to construct a batch.
+    # Paging metadata from the block manager. Optional: the dense runner has no use for
+    # it, and pure-scheduling tests should not need a block manager to build a batch.
     #
     #   slot_mapping  int32 [total_tokens]        where each new K/V is written
     #   block_tables  int32 [num_sequences, max]  right-padded with -1
     #
-    # The padding value is -1 rather than 0 on purpose: a kernel bounds its walk by
-    # `context_lens` and never reads the padding, so a read that *does* happen is a
-    # bug, and -1 makes it a visibly impossible block id instead of a quiet read of
-    # whatever sequence owns block 0.
+    # Padding is -1 rather than 0 so an out-of-bounds read is visible: a kernel bounds
+    # its walk by `context_lens` and never reads the padding, so a read that does
+    # happen is a bug rather than a quiet read of whichever sequence owns block 0.
     slot_mapping: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
     # The longest `L` and `S` in the batch. They size the prefill kernel's grid and the
-    # decode kernel's split count, so they have to be host integers: reading them off
-    # `seq_lens` would synchronize, and 28 layers each asking would synchronize 28 times
-    # per iteration. `from_scheduled` fills them from the lists it built the batch out
-    # of; left unset, they are worked out once here.
+    # decode kernel's split count, so they must be host integers: reading them off
+    # `seq_lens` synchronizes, and 28 layers asking means 28 syncs per iteration.
+    # `from_scheduled` fills them from the lists it built the batch from; left unset,
+    # they are computed once here.
     max_query_len: int | None = None
     max_context_len: int | None = None
 
-    # Set by `from_scheduled`, which checked the same invariants against its own Python
-    # integers. See `_check_metadata` for why that distinction is worth a field.
+    # Set by `from_scheduled`, which already checked the same invariants against its own
+    # Python integers. See `_check_metadata` for why that is worth a field.
     checked: bool = False
 
     def __post_init__(self) -> None:
         if not self.checked:
             count = len(self.seq_ids)
             offsets = self.cu_seqlens_q.tolist()
-            # Whether each row holds *enough* blocks for its context is not checkable
-            # here — that needs the block size, which belongs to the manager — and the
-            # attention path checks it against the pool it is about to read. What is
-            # checkable is that a sequence with a context has any pages at all.
+            # Whether a row holds enough blocks for its context needs the block size,
+            # which belongs to the manager, and the attention path checks it against
+            # the pool it is about to read. Checkable here: a sequence with a context
+            # holds at least one page.
             tables = [] if self.block_tables is None else self.block_tables.tolist()
             _check_metadata(
                 num_sequences=count,
@@ -207,8 +204,8 @@ class ForwardBatch:
             object.__setattr__(self, "max_query_len", int(self.seq_lens.max()))
         if self.max_context_len is None:
             object.__setattr__(self, "max_context_len", int(self.context_lens.max()))
-        # Arithmetic on the device, so no synchronization: the row indices stay on the
-        # GPU, which is where `index_select` wants them anyway.
+        # Computed on the device, so no synchronization: the row indices stay on the
+        # GPU, where `index_select` wants them.
         object.__setattr__(self, "_last_row_indices", self.cu_seqlens_q[1:].to(torch.int64) - 1)
 
     # ---------------------------------------------------------------- properties
@@ -217,9 +214,9 @@ class ForwardBatch:
     def last_row_indices(self) -> torch.Tensor:
         """Row of each sequence's last computed token, in the flattened token axis.
 
-        Where the LM head is applied, and where a sampled token comes from. For a
-        decode step it is the sequence's only row; for a prefill chunk, the end of the
-        chunk — which is why a mid-prompt chunk's logits are computed and discarded.
+        Where the LM head is applied and where a sampled token comes from: the only
+        row for a decode step, the end of the chunk for a prefill, which is why a
+        mid-prompt chunk's logits are computed and discarded.
         """
         return self._last_row_indices  # type: ignore[attr-defined]
 
@@ -235,15 +232,14 @@ class ForwardBatch:
     def is_pure_decode(self) -> bool:
         """Every sequence contributes exactly one token.
 
-        The common case by far, and the one worth knowing about: it means the batch
-        is a rectangle after all, so the decode kernel's `B x H x 1 x D` shape
-        applies without any ragged handling.
+        The common case: the batch is a rectangle, so the decode kernel's
+        `B x H x 1 x D` shape applies with no ragged handling.
         """
         return bool((self.seq_lens == 1).all())
 
     @property
     def num_prefill_tokens(self) -> int:
-        """Tokens belonging to sequences contributing more than one — the chunk work."""
+        """Tokens belonging to sequences contributing more than one: the chunk work."""
         return int(self.seq_lens[self.seq_lens > 1].sum().item())
 
     def slice_of(self, index: int) -> slice:
@@ -270,18 +266,18 @@ class ForwardBatch:
         """Build from `(sequence, tokens to compute now)` pairs, in one pass.
 
         The token count is the scheduler's decision, not the sequence's: a 2000-token
-        prompt admitted under a 512-token budget contributes 512 here and remembers
-        the rest through `num_computed_tokens`. That is the whole of chunked prefill
-        as far as this object is concerned: chunking changes the caller, not this.
+        prompt admitted under a 512-token budget contributes 512 here and carries the
+        rest in `num_computed_tokens`. Chunking therefore changes the caller, not this
+        object.
 
         Positions start at each sequence's `num_computed_tokens`, which is why RoPE
-        takes an explicit position tensor: a chunk's tokens are at positions 512..1023,
-        and nothing in the tensor shapes says so.
+        takes an explicit position tensor: a chunk's tokens sit at positions 512..1023
+        and nothing in the tensor shapes records that.
 
-        Pass `manager` (a `BlockManager`) to fill in the paging metadata as well. It
-        is optional so that a scheduling test can build a batch without a pool, and
-        typed loosely to keep `serve` from importing `block` — the dependency runs the
-        other way, since the manager needs `Sequence`.
+        Pass `manager` (a `BlockManager`) to fill in the paging metadata. Optional so a
+        scheduling test can build a batch without a pool, and typed loosely to keep
+        `serve` from importing `block`; the dependency runs the other way, since the
+        manager needs `Sequence`.
         """
         input_ids: list[int] = []
         positions: list[int] = []

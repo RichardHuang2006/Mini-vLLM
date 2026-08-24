@@ -1,8 +1,8 @@
 """The dense KV cache.
 
-The oracle is `torch.cat`: whatever order tokens arrive in, the cache must hold
-exactly what concatenating them all at once would have produced. That is the whole
-correctness claim, and it is what lets the cached model trust the cache.
+The oracle is `torch.cat`: whatever order tokens arrive in, the cache must hold exactly
+what concatenating them all at once produces. That is the entire correctness claim, and
+what lets the cached model rely on the cache.
 """
 
 from __future__ import annotations
@@ -58,11 +58,11 @@ def test_first_update_returns_what_it_was_given():
 
 
 def test_returned_offset_is_the_write_position_not_the_new_length():
-    """The distinction that keeps the causal mask honest.
+    """The distinction the causal mask depends on.
 
-    `S == offset + L` must hold, so `offset` is the length *before* the call. If
-    this returned the post-call length instead, a mask built as `(L, offset + L)`
-    would be `L` columns too wide and a token could attend past its own position.
+    `S == offset + L` must hold, so `offset` is the length before the call. Returning the
+    post-call length instead would make a mask built as `(L, offset + L)` `L` columns too
+    wide, letting a token attend past its own position.
     """
     cache = DenseKvCache()
     cache.update_and_fetch(*kv(7))

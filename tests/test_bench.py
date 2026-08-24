@@ -1,9 +1,9 @@
 """The benchmark harness.
 
-A benchmark cannot be tested for the numbers it produces, so these test the things
-that make the numbers trustworthy: that prefill and decode are separated, that a
-throttled GPU is flagged rather than quietly reported, and that the whole thing
-runs end to end on `tiny_qwen3`.
+A benchmark cannot be tested on the numbers it produces, so these cover what makes those
+numbers trustworthy: that prefill and decode are separated, that a throttled GPU is
+flagged rather than reported as a result, and that the harness runs end to end on
+`tiny_qwen3`.
 """
 
 from __future__ import annotations
@@ -226,12 +226,12 @@ def test_clock_sampler_is_safe_without_a_gpu():
 
 
 def test_report_states_which_ops_ran_as_kernels():
-    """"My kernel made no difference" is usually "my kernel never ran".
+    """A kernel that made no measurable difference has usually not run at all.
 
     Every op has a kernel, so with the flag on the report says `cuda` for all of them
-    *except* the ones the benchmark says are not yet worth preferring — and for those
-    it has to give the reason, since "kernel exists, kernel unused, nobody said so" is
-    the failure this whole report exists to catch.
+    except the ones the benchmark records as not yet worth preferring, and for those it
+    must give the reason. A kernel that exists but goes unused without being reported is
+    the failure this report exists to catch.
     """
     from mini_vllm.kernels import ops
 

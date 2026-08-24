@@ -1,10 +1,8 @@
 """The full model against HuggingFace.
 
-Structured so a failure localizes itself. The tiny-model tests walk outwards from
-the embedding, through each block, to the logits, so the first failing test names
-the layer that broke rather than reporting "the logits are wrong". That is
-forward-hook debugging written down as tests instead of as something to remember to
-do under pressure.
+Structured so a failure localizes itself. The tiny-model tests walk outwards from the
+embedding, through each block, to the logits, so the first failing test names the layer
+that broke rather than reporting that the logits are wrong.
 """
 
 from __future__ import annotations
@@ -206,14 +204,14 @@ def test_runs_on_the_gpu(tiny_qwen3, device):
 def real_models():
     """Loads Qwen3-0.6B at a requested dtype, at most once per dtype.
 
-    Two dtypes because they prove different things, and neither alone is enough:
+    Two dtypes, establishing different things:
 
-    * **fp32** isolates *arithmetic*. With rounding out of the way the `mini_vllm`
-      logits and HF's agree to ~1e-6 relative, so a tight assertion there is a real
-      proof that the forward pass is the same function.
-    * **bf16** is what the model actually runs in, so it is what has to work —
-      but 28 layers of it drift a few percent from HF purely by rounding, and no
-      elementwise tolerance can tell that apart from a bug.
+    * fp32 isolates the arithmetic. With rounding removed the `mini_vllm` logits and HF's
+      agree to ~1e-6 relative, so a tight assertion there shows the forward pass is the
+      same function.
+    * bf16 is what the model runs in and therefore what must work, but 28 layers of it
+      drift a few percent from HF purely by rounding, and no elementwise tolerance
+      distinguishes that from a bug.
     """
     from transformers import AutoModelForCausalLM
 
