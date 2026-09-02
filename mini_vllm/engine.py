@@ -1,80 +1,331 @@
-"""The engine, and the one import a caller needs.
+"""The engine: request admission, the iteration loop, and the one import a
+caller needs.
 
-::
+What this file teaches
+    How the pieces become a serving engine, in three layers:
 
-    from mini_vllm import LLM
+    1. *Reference generation loops* — `generate_ids` (recompute everything,
+       quadratic) and `generate_ids_cached` (prefill once, then one token per
+       step). These are the oracles the engine is diffed against; the serving
+       path never calls `transformers.generate()`, which exists in the tests
+       and benchmarks purely as an external correctness and speed reference.
+    2. `PagedModelRunner` — executes one scheduler decision as one ragged
+       forward pass: reserve pages, build the batch, forward, sample.
+    3. `LLM` — the public API: `add_request`, `step()`, `generate`,
+       `generate_stream`, with prefix caching, FP8 KV, CUDA kernels,
+       parallel sampling, and speculative decoding wired in.
 
-    llm = LLM()
-    for completion in llm.generate(["The capital of France is"], max_tokens=32):
-        print(completion.text)
+    What each piece contributes to one iteration:
 
-Wiring only. What each piece contributes to one iteration:
+    * `scheduler.Scheduler` decides which sequences run and how many tokens
+      each contributes.
+    * `cache.BlockManager` backs that decision with pages, and refuses it
+      when it cannot.
+    * `PagedModelRunner` turns it into a single ragged forward pass.
+    * `model.Qwen3Paged` runs the 28 layers against the pool.
+    * `ops.sample` picks a token per sequence; the tokenizer turns them back
+      into text.
 
-* `Scheduler` decides which sequences run and how many tokens each contributes.
-* `BlockManager` backs that decision with pages, and refuses it when it cannot.
-* `PagedModelRunner` turns it into a single ragged forward pass.
-* `Qwen3Paged` runs the 28 layers against the pool.
-* `sample` picks a token per sequence; the tokenizer turns them back into text.
+Inputs and outputs
+    Prompts (strings or token-id lists) and `config.SamplingParams` in;
+    `Completion`s or a stream of `StreamUpdate`s out.
 
-`step()` advances every request in flight by exactly one iteration. There is no
-per-request loop in this file: the unit of execution is an iteration, not a request.
+Read next
+    `speculative.py` — the draft/verify loop `step()` switches to when
+    `num_speculative_tokens > 0`.
 
-:meth:`LLM.generate` is implemented on top of :meth:`LLM.generate_stream` rather than
-beside it, so the batch API is the streaming API drained, and the two cannot drift
-apart token for token.
+One invariant
+    `step()` advances every request in flight by exactly one iteration; there
+    is no per-request loop anywhere in this file. And `generate` is
+    implemented *on top of* `generate_stream` rather than beside it, so the
+    batch API is the streaming API drained and the two cannot drift apart
+    token for token.
+
+Runnable example
+    python -m mini_vllm.engine "The capital of France is" --max-tokens 32
+    python -m mini_vllm.engine "Explain KV caching" --stream --temperature 0.8
 """
 
 from __future__ import annotations
 
+import argparse
+import json
 import time
 from collections.abc import Iterable, Iterator, Sequence as SequenceABC
 from dataclasses import dataclass, replace
+from typing import NamedTuple
 
 import torch
 
-from mini_vllm.block.block_manager import BlockManager
-from mini_vllm.block.kv_pool import PagedKvPool
-from mini_vllm.generate import eos_token_ids_for
-from mini_vllm.model.loader import DEFAULT_MODEL_ID, load_weights, resolve_model_path
-from mini_vllm.model.qwen3_paged import Qwen3Paged
-from mini_vllm.sampler import SamplingParams, sample
-from mini_vllm.serve.runner import PagedModelRunner
-from mini_vllm.serve.scheduler import Scheduler, SchedulerConfig
-from mini_vllm.serve.sequence import Sequence
-from mini_vllm.spec.proposer import DraftProposer
-from mini_vllm.spec.spec_decode import SpeculativeDecoder
+from mini_vllm.cache import BlockManager, PagedKvPool
+from mini_vllm.config import (
+    CPU_BLOCKS,
+    DEFAULT_MODEL_ID,
+    EngineConfig,
+    SamplingParams,
+)
+from mini_vllm.model import Qwen3, Qwen3Cached, Qwen3Paged, load_weights, resolve_model_path
+from mini_vllm.ops import sample
+from mini_vllm.scheduler import Scheduler, Sequence
+from mini_vllm.speculative import DraftProposer, SpeculativeDecoder
 
-__all__ = ["LLM", "Completion", "EngineStats", "StreamUpdate"]
+__all__ = [
+    "Loaded",
+    "eos_token_ids_for",
+    "load",
+    "generate_ids",
+    "generate_ids_cached",
+    "PagedModelRunner",
+    "Completion",
+    "StreamUpdate",
+    "EngineStats",
+    "LLM",
+]
 
-# Fraction of the memory still free after the weights are resident that goes to the KV
-# pool. Not 0.9: activations for a 2048-token batch, the logits tensor at 151k
-# vocabulary, and cuBLAS workspaces all come out of the remainder, and a pool sized to
-# the last byte turns a long prompt into an out-of-memory error rather than a queued
-# request.
-DEFAULT_KV_FRACTION = 0.5
-
-# Blocks to allocate when there is no device memory to measure. Enough for a handful of
-# short sequences, which is all a CPU run is ever going to want.
-CPU_BLOCKS = 512
-
-# KV cache storage precision as a caller names it. "auto" keeps the model dtype; "fp8"
-# halves the resident cache at the cost of a rounding on every stored key and value,
-# dequantized inside the attention kernel. e4m3 is the only format offered because it
-# is the only one the kernels accelerate; see `ops.FP8_KERNEL_DTYPE`.
-_KV_CACHE_DTYPES: dict[str, torch.dtype | None] = {
-    "auto": None,
-    "fp8": torch.float8_e4m3fn,
-    "fp8_e4m3": torch.float8_e4m3fn,
-}
+DEFAULT_MAX_TOKENS = 32
 
 
-def _resolve_kv_dtype(name: str) -> torch.dtype | None:
-    """Turn a `kv_cache_dtype` string into a storage dtype, or None for the model's."""
-    if name not in _KV_CACHE_DTYPES:
-        raise ValueError(
-            f"unknown kv_cache_dtype {name!r}; expected one of {sorted(_KV_CACHE_DTYPES)}"
+# ==================================================== reference generation
+#
+# The slow, obviously correct generation loops. `generate_ids` re-runs all 28 layers
+# over the entire prefix every step, so generating token 100 redoes the work of tokens
+# 0-99 for the hundredth time — quadratic in the output length. `generate_ids_cached`
+# is the cached version, kept beside it because the two must produce identical tokens:
+# the evidence that caching is a pure optimization rather than a change of behaviour.
+# The engine below is in turn diffed against these.
+
+
+class Loaded(NamedTuple):
+    """A model, its tokenizer, and the stop tokens that go with them."""
+
+    model: Qwen3 | Qwen3Cached
+    tokenizer: object
+    eos_token_ids: tuple[int, ...]
+    pad_token_id: int
+
+
+def eos_token_ids_for(model_path) -> tuple[int, ...]:
+    """The stop tokens, read from `generation_config.json`.
+
+    Qwen3 lists two (`<|im_end|>` and `<|endoftext|>`), hence a tuple rather than a
+    single id: honouring only `tokenizer.eos_token_id` misses one and generates past the
+    end of a turn.
+    """
+    config_path = model_path / "generation_config.json"
+    if not config_path.is_file():
+        return ()
+
+    stated = json.loads(config_path.read_text()).get("eos_token_id")
+    if stated is None:
+        return ()
+    return (stated,) if isinstance(stated, int) else tuple(stated)
+
+
+def load(
+    model: str = DEFAULT_MODEL_ID,
+    device: str = "cuda",
+    cached: bool = True,
+    use_cuda_kernels: bool = False,
+) -> Loaded:
+    """Load a reference model, tokenizer and stop tokens together.
+
+    ``cached=False`` gives the uncached model, which exists to be compared
+    against rather than used.
+    """
+    from transformers import AutoTokenizer
+
+    path = resolve_model_path(model)
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
+    if cached:
+        loaded_model: Qwen3 | Qwen3Cached = Qwen3Cached.from_pretrained(
+            path, device=device, use_cuda=use_cuda_kernels
         )
-    return _KV_CACHE_DTYPES[name]
+    else:
+        loaded_model = Qwen3.from_pretrained(path, device=device)
+
+    return Loaded(
+        model=loaded_model,
+        tokenizer=AutoTokenizer.from_pretrained(path),
+        eos_token_ids=eos_token_ids_for(path),
+        pad_token_id=json.loads((path / "generation_config.json").read_text()).get(
+            "pad_token_id", 0
+        ),
+    )
+
+
+@torch.no_grad()
+def generate_ids(
+    model: Qwen3,
+    input_ids: torch.Tensor,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    eos_token_ids: SequenceABC[int] = (),
+    pad_token_id: int | None = None,
+) -> torch.Tensor:
+    """Greedy decode with no cache, returning the prompt plus generated tokens.
+
+    ::
+
+        input_ids: B x L      ->  B x (L + generated)
+
+    Stops once every row has produced a stop token. Rows that finish early are filled
+    with ``pad_token_id`` to keep the batch rectangular, matching HuggingFace. It is also
+    why the serving layer abandons rectangular batches: with 16 sequences of widely
+    differing lengths, most of a padded batch is wasted work.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
+
+    stop_tokens = set(eos_token_ids)
+    if pad_token_id is None:
+        pad_token_id = next(iter(stop_tokens), 0)
+
+    tokens = input_ids
+    finished = torch.zeros(tokens.shape[0], dtype=torch.bool, device=tokens.device)
+
+    for _ in range(max_tokens):
+        # The whole prefix, recomputed every step.
+        logits = model(tokens)[:, -1, :]
+        next_tokens = logits.argmax(dim=-1)
+
+        next_tokens = torch.where(finished, torch.full_like(next_tokens, pad_token_id), next_tokens)
+        tokens = torch.cat([tokens, next_tokens.unsqueeze(1)], dim=1)
+
+        for stop in stop_tokens:
+            finished |= next_tokens == stop
+        if bool(finished.all()):
+            break
+
+    return tokens
+
+
+@torch.no_grad()
+def generate_ids_cached(
+    model: Qwen3Cached,
+    input_ids: torch.Tensor,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    eos_token_ids: SequenceABC[int] = (),
+    pad_token_id: int | None = None,
+    caches: list | None = None,
+) -> torch.Tensor:
+    """Greedy decode with a KV cache: prefill once, then one token per step.
+
+    ::
+
+        prefill: the whole prompt at offset 0   -> first token, cache holds len(prompt)
+        decode:  one token at offset = prev_len -> next token, cache grows by 1
+
+    Structurally identical to the naive loop except that it feeds `next_tokens` back in
+    rather than the whole sequence. The caches carry the position, so nothing here tracks
+    an offset by hand.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
+
+    stop_tokens = set(eos_token_ids)
+    if pad_token_id is None:
+        pad_token_id = next(iter(stop_tokens), 0)
+
+    if caches is None:
+        caches = model.create_kv_cache()
+
+    tokens = input_ids
+    finished = torch.zeros(tokens.shape[0], dtype=torch.bool, device=tokens.device)
+    step_input = input_ids
+
+    for _ in range(max_tokens):
+        # Only the tokens the model has not seen: the whole prompt on the first pass,
+        # then one per step.
+        logits = model(step_input, caches, last_only=True)[:, -1, :]
+        next_tokens = logits.argmax(dim=-1)
+
+        next_tokens = torch.where(finished, torch.full_like(next_tokens, pad_token_id), next_tokens)
+        tokens = torch.cat([tokens, next_tokens.unsqueeze(1)], dim=1)
+        step_input = next_tokens.unsqueeze(1)
+
+        for stop in stop_tokens:
+            finished |= next_tokens == stop
+        if bool(finished.all()):
+            break
+
+    return tokens
+
+
+# ========================================================= the paged runner
+
+
+class PagedModelRunner:
+    """Runs one iteration: reserve pages, build the ragged batch, forward, sample.
+
+    The replacement for `scheduler.DenseModelRunner`. The dense runner issues one
+    forward pass per scheduled sequence, since a `B x H x S x D` cache cannot hold two
+    sequences of different lengths. This one builds a single ragged `ForwardBatch` and
+    runs one pass for the whole iteration: a 512-token prefill chunk and eleven decode
+    steps together.
+
+    Ordering inside `execute` matters. Blocks are reserved before the batch is built,
+    because `slot_mapping` holds physical addresses and there is nothing to address
+    until the pages exist. The scheduler has already checked capacity, so the
+    reservation is expected to succeed; a failure means the scheduler and the pool have
+    disagreed, and it propagates rather than being absorbed.
+    """
+
+    def __init__(self, model, manager: BlockManager, device: torch.device | str | None = None):
+        self.model = model
+        self.manager = manager
+        self.device = torch.device(device) if device else manager.kv.device
+
+    def execute(self, output, all_rows: bool = False) -> torch.Tensor:
+        """One forward pass over the whole scheduled batch.
+
+        ::
+
+            returns: num_scheduled x V   (each sequence's last computed position)
+                     total_tokens  x V   when `all_rows`
+
+        `all_rows` is for speculative verification, which needs the target's
+        distribution at every proposed position rather than only the last. Off
+        otherwise: the LM head is a `V`-wide matmul and a prefill chunk's interior rows
+        have no use for it.
+        """
+        for sequence, count in output.scheduled:
+            self.manager.allocate(sequence, count)
+
+        batch = self.build(output)
+        return self.model(batch, all_rows=all_rows)
+
+    def build(self, output):
+        """The batch for an already-reserved iteration. Split out for the tests."""
+        from mini_vllm.scheduler import ForwardBatch
+
+        return ForwardBatch.from_scheduled(output.scheduled, self.device, manager=self.manager)
+
+    def sample_tokens(
+        self,
+        output,
+        logits: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> list[int]:
+        """One token per scheduled sequence, honouring per-row sampling parameters.
+
+        Rows belonging to a chunk that has not reached the end of its prompt are
+        sampled and then discarded by `Scheduler.commit`: one wasted row of an
+        already-batched sample instead of a branch in the hot path. Slicing the logits
+        down to the finishing sequences first would cost a device synchronization to
+        determine which those are.
+        """
+        params = [sequence.sampling_params for sequence, _ in output.scheduled]
+        if all(parameter.is_greedy for parameter in params):
+            return logits.argmax(dim=-1).tolist()
+        return sample(logits, params, generator=generator).tolist()
+
+    def free(self, sequence: Sequence) -> None:
+        """Return a finished sequence's pages to the pool."""
+        self.manager.free(sequence)
+
+
+# ========================================================== the public API
 
 
 @dataclass(frozen=True)
@@ -151,7 +402,13 @@ class LLM:
         llm = LLM("Qwen/Qwen3-0.6B")
         completions = llm.generate(prompts, max_tokens=64)
 
-    Two constructor defaults decide how many requests can be in flight:
+    Configuration is one `config.EngineConfig`. Keyword arguments are a convenience
+    that builds one::
+
+        LLM("Qwen/Qwen3-0.6B", enable_prefix_caching=True, kv_cache_dtype="fp8")
+        LLM(config=EngineConfig(num_speculative_tokens=4))    # the same thing
+
+    Two defaults decide how many requests can be in flight:
 
     * `num_blocks` defaults to as many pages as fit in `kv_fraction` of the memory free
       once the weights are loaded. At 16 tokens a page and Qwen3-0.6B's 8 KV heads over
@@ -163,74 +420,69 @@ class LLM:
 
     def __init__(
         self,
-        model: str = DEFAULT_MODEL_ID,
-        device: str = "cuda",
-        dtype: torch.dtype | None = None,
-        num_blocks: int | None = None,
-        block_size: int = 16,
-        max_batched_tokens: int = 2048,
-        max_sequences: int = 32,
-        chunk_size: int = 512,
-        enable_chunked_prefill: bool = True,
-        prefill_priority: bool = False,
-        enable_prefix_caching: bool = False,
-        kv_cache_dtype: str = "auto",
-        num_speculative_tokens: int = 0,
-        draft_model: str | None = None,
-        num_draft_layers: int | None = None,
-        draft_blocks: int | None = None,
-        use_cuda_kernels: bool = True,
-        kv_fraction: float = DEFAULT_KV_FRACTION,
+        model: str | None = None,
+        config: EngineConfig | None = None,
+        **overrides,
     ) -> None:
         from transformers import AutoTokenizer
 
+        if config is None:
+            if model is not None:
+                overrides["model"] = model
+            config = EngineConfig(**overrides)
+        elif model is not None or overrides:
+            raise ValueError("pass either config= or keyword arguments, not both")
+        self.engine_config = config
+
+        device = config.device
         if device == "cuda" and not torch.cuda.is_available():
             device = "cpu"
         self.device = torch.device(device)
 
-        path = resolve_model_path(model)
-        weights, config = load_weights(path, device=device)
-        if dtype is not None and dtype != config.dtype:
+        path = resolve_model_path(config.model)
+        weights, model_config = load_weights(path, device=device)
+        if config.dtype is not None and config.dtype != model_config.dtype:
             # Serving is bf16; fp32 is for tests that need an exact answer. In bf16 the
             # top two logits of a Qwen3 step are often one rounding apart, so greedy
             # decoding has genuine ties and two correct implementations break them
-            # differently; `test_engine.py` uses fp32 to remove that ambiguity.
-            weights = {name: tensor.to(dtype) for name, tensor in weights.items()}
-            config = replace(config, dtype=dtype)
-        self.config = config
+            # differently; the engine tests use fp32 to remove that ambiguity.
+            weights = {name: tensor.to(config.dtype) for name, tensor in weights.items()}
+            model_config = replace(model_config, dtype=config.dtype)
+        self.config = model_config
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.stop_token_ids = eos_token_ids_for(path) or (self.tokenizer.eos_token_id,)
 
-        self.kv_dtype = _resolve_kv_dtype(kv_cache_dtype)
+        self.kv_dtype = config.kv_dtype
+        num_blocks = config.num_blocks
         if num_blocks is None:
             num_blocks = self.blocks_that_fit(
-                config, block_size, self.device, kv_fraction, self.kv_dtype
+                model_config, config.block_size, self.device, config.kv_fraction, self.kv_dtype
             )
         self.manager = BlockManager(
             num_blocks=num_blocks,
-            block_size=block_size,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,
-            dtype=config.dtype,
+            block_size=config.block_size,
+            num_layers=model_config.num_hidden_layers,
+            num_kv_heads=model_config.num_key_value_heads,
+            head_dim=model_config.head_dim,
+            dtype=model_config.dtype,
             device=self.device,
-            enable_prefix_caching=enable_prefix_caching,
+            enable_prefix_caching=config.enable_prefix_caching,
             kv_dtype=self.kv_dtype,
         )
 
-        self.model = Qwen3Paged(config, weights, self.manager, use_cuda=use_cuda_kernels)
-        self.scheduler = Scheduler(
-            SchedulerConfig(
-                max_batched_tokens=max_batched_tokens,
-                max_sequences=max_sequences,
-                chunk_size=chunk_size,
-                enable_chunked_prefill=enable_chunked_prefill,
-                prefill_priority=prefill_priority,
-            ),
-            manager=self.manager,
-        )
+        self.model = Qwen3Paged(model_config, weights, self.manager, use_cuda=config.use_cuda_kernels)
+        self.scheduler = Scheduler(config.scheduler_config(), manager=self.manager)
         self.runner = PagedModelRunner(self.model, self.manager, self.device)
         self.stats = EngineStats()
+
+        # A seeded generator makes stochastic sampling replayable without touching
+        # global RNG state. None (the default) leaves sampling on the global RNG;
+        # greedy decoding is deterministic either way.
+        self.generator = (
+            torch.Generator(device=self.device).manual_seed(config.seed)
+            if config.seed is not None
+            else None
+        )
 
         # Parallel sampling bookkeeping. `_forked` remembers which group leaders have
         # already spawned their branches, so a request forks exactly once — at the
@@ -239,21 +491,9 @@ class LLM:
         self._forked: set[int] = set()
         self._newly_forked: list[Sequence] = []
 
-        self.spec = (
-            self._build_speculation(
-                num_speculative_tokens, draft_model, num_draft_layers, draft_blocks
-            )
-            if num_speculative_tokens > 0
-            else None
-        )
+        self.spec = self._build_speculation(config) if config.num_speculative_tokens > 0 else None
 
-    def _build_speculation(
-        self,
-        num_speculative_tokens: int,
-        draft_model: str | None,
-        num_draft_layers: int | None,
-        draft_blocks: int | None,
-    ) -> SpeculativeDecoder:
+    def _build_speculation(self, config: EngineConfig) -> SpeculativeDecoder:
         """Stand up the draft model and the KV pool it needs of its own.
 
         Two kinds of draft, chosen by available memory.
@@ -276,9 +516,9 @@ class LLM:
         the same tokens has different KV, so a second pool is built here at the draft's
         layer count rather than the target's.
         """
-        if draft_model is not None:
+        if config.draft_model is not None:
             weights, draft_config = load_weights(
-                resolve_model_path(draft_model), device=str(self.device)
+                resolve_model_path(config.draft_model), device=str(self.device)
             )
             if draft_config.dtype != self.config.dtype:
                 weights = {name: tensor.to(self.config.dtype) for name, tensor in weights.items()}
@@ -295,18 +535,21 @@ class LLM:
             kv_heads, head_dim = draft_config.num_key_value_heads, draft_config.head_dim
         else:
             draft_config = None
-            layers = num_draft_layers or self.config.num_hidden_layers
+            layers = config.num_draft_layers or self.config.num_hidden_layers
             kv_heads, head_dim = self.config.num_key_value_heads, self.config.head_dim
 
         # The draft caches the target's tokens plus up to `k` speculative ones, so it
         # needs a few pages more than the target rather than the same number. They are
         # cheap pages: the pool is only the draft's layer count deep, so a four-layer
         # draft against twenty-eight pays a seventh of the bytes per page.
-        proposal_pages = -(-num_speculative_tokens // self.manager.block_size) + 1
-        default_blocks = self.manager.num_blocks + self.scheduler.config.max_sequences * proposal_pages
+        k = config.num_speculative_tokens
+        proposal_pages = -(-k // self.manager.block_size) + 1
+        default_blocks = (
+            self.manager.num_blocks + self.scheduler.config.max_sequences * proposal_pages
+        )
 
         draft_manager = BlockManager(
-            num_blocks=draft_blocks or default_blocks,
+            num_blocks=config.draft_blocks or default_blocks,
             block_size=self.manager.block_size,
             num_layers=layers,
             num_kv_heads=kv_heads,
@@ -316,15 +559,11 @@ class LLM:
             kv_dtype=self.kv_dtype,
         )
         if draft_config is not None:
-            drafter = Qwen3Paged(
-                draft_config, weights, draft_manager, use_cuda=self.model.use_cuda
-            )
+            drafter = Qwen3Paged(draft_config, weights, draft_manager, use_cuda=self.model.use_cuda)
         else:
             drafter = self.model.self_draft(layers, draft_manager)
 
-        proposer = DraftProposer(
-            drafter, draft_manager, num_speculative_tokens=num_speculative_tokens
-        )
+        proposer = DraftProposer(drafter, draft_manager, num_speculative_tokens=k)
         return SpeculativeDecoder(proposer, self.model, self.manager, runner=self.runner)
 
     # ------------------------------------------------------------------- sizing
@@ -435,7 +674,7 @@ class LLM:
 
         output = self.scheduler.schedule()
         logits = self.runner.execute(output)
-        tokens = self.runner.sample_tokens(output, logits)
+        tokens = self.runner.sample_tokens(output, logits, generator=self.generator)
         finished = self.scheduler.commit(output, tokens)
 
         emitted = [
@@ -501,10 +740,10 @@ class LLM:
             0, torch.tensor(last_rows, device=logits.device, dtype=torch.int64)
         )
 
-        verified_pairs = spec.verify(output.scheduled, proposals, logits)
+        verified_pairs = spec.verify(output.scheduled, proposals, logits, generator=self.generator)
         verified = {sequence.seq_id for sequence, _ in verified_pairs}
 
-        tokens = self.runner.sample_tokens(output, last_row_logits)
+        tokens = self.runner.sample_tokens(output, last_row_logits, generator=self.generator)
         finished = self.scheduler.commit(output, tokens, verified=verified)
 
         emitted: list[tuple[Sequence, int]] = []
@@ -565,7 +804,7 @@ class LLM:
                 if params.is_greedy:
                     token = int(parent_logits.argmax(dim=-1))
                 else:
-                    token = int(sample(parent_logits, params))
+                    token = int(sample(parent_logits, params, generator=self.generator))
                 child = sequence.fork(first_output_token=token)
                 self.manager.fork(sequence, child)
                 self.scheduler.running.append(child)
@@ -737,9 +976,7 @@ class LLM:
         else:
             params = list(sampling_params)
             if len(params) != len(prompt_list):
-                raise ValueError(
-                    f"got {len(params)} sampling params for {len(prompt_list)} prompts"
-                )
+                raise ValueError(f"got {len(params)} sampling params for {len(prompt_list)} prompts")
         return [
             self.add_request(prompt, parameter, max_tokens, ignore_eos)
             for prompt, parameter in zip(prompt_list, params, strict=True)
@@ -759,6 +996,8 @@ class LLM:
                 self.scheduler.waiting.remove(sequence)
             if sequence in self.scheduler.finished:
                 self.scheduler.finished.remove(sequence)
+            if self.spec is not None:
+                self.spec.release(sequence)
             self.manager.free(sequence)
 
     def __repr__(self) -> str:
@@ -767,3 +1006,59 @@ class LLM:
             f"{self.manager.num_blocks} blocks of {self.manager.block_size} "
             f"= {self.kv_cache_bytes / 2**30:.2f} GiB of KV cache)"
         )
+
+
+# ============================================================== CLI demo
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate with the Mini-vLLM engine.",
+        epilog='example: python -m mini_vllm.engine "The capital of France is" --stream',
+    )
+    parser.add_argument("prompt", nargs="?", default="The capital of France is")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--model", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--temperature", type=float, default=0.0, help="0 means greedy")
+    parser.add_argument("--stream", action="store_true", help="print tokens as they arrive")
+    parser.add_argument("--prefix-caching", action="store_true")
+    parser.add_argument("--kv-cache-dtype", default="auto", choices=["auto", "fp8"])
+    parser.add_argument("--speculative-tokens", type=int, default=0)
+    parser.add_argument("--no-cuda-kernels", action="store_true")
+    args = parser.parse_args()
+
+    print(f"loading {args.model} ...")
+    llm = LLM(
+        args.model,
+        enable_prefix_caching=args.prefix_caching,
+        kv_cache_dtype=args.kv_cache_dtype,
+        num_speculative_tokens=args.speculative_tokens,
+        use_cuda_kernels=not args.no_cuda_kernels,
+    )
+    print(llm)
+    params = SamplingParams(temperature=args.temperature)
+
+    started = time.perf_counter()
+    if args.stream:
+        print(f"\n{args.prompt}", end="", flush=True)
+        for update in llm.generate_stream(args.prompt, params, max_tokens=args.max_tokens):
+            print(update.text, end="", flush=True)
+        print()
+        generated = llm.stats.generated_tokens
+    else:
+        completion = llm.generate(args.prompt, params, max_tokens=args.max_tokens)[0]
+        print(f"\n{args.prompt}\033[1m{completion.text}\033[0m")
+        generated = completion.num_tokens
+    elapsed = time.perf_counter() - started
+
+    print(f"\n{generated} tokens in {elapsed:.2f}s ({generated / max(elapsed, 1e-9):.1f} tok/s)")
+    if llm.spec is not None:
+        stats = llm.spec.stats
+        print(
+            f"speculation: acceptance {stats.acceptance_rate:.3f}, "
+            f"{stats.tokens_per_step:.2f} tokens per target pass"
+        )
+
+
+if __name__ == "__main__":
+    main()
