@@ -34,7 +34,7 @@ MODEL_TOLERANCE = 2e-2
 # measured rather than estimated. On real text these logits sit 1.7% from HuggingFace's,
 # reproducibly to five digits, while the subtlest broken model worth catching (Qwen2's
 # `rope_theta` instead of Qwen3's) sits at 14%. This limit is ~3x above the first and ~3x
-# below the second, and `test_qwen3.py` asserts both sides of that gap so it cannot stop
+# below the second, and `test_model.py` asserts both sides of that gap so it cannot stop
 # discriminating unnoticed.
 #
 # Measure on real text. Random token ids are chaotically amplified through 28 layers:
@@ -54,6 +54,10 @@ BF16_DRIFT_LIMIT = 0.05
 # For the real 28-layer checkpoint use `BF16_DRIFT_LIMIT`: the same single rounding
 # compounds to ~1.9% by the last layer, which reflects depth rather than a defect.
 KERNEL_DRIFT_LIMIT = 1e-2
+
+# e4m3 keeps 3 mantissa bits (~2^-3 relative), so an FP8 round trip sits comfortably
+# under this.
+FP8_MAX_ERROR = 0.07
 
 SEED = 1234
 
@@ -179,8 +183,7 @@ def assert_relative_error_below(
 
     error = relative_error(actual, expected)
     assert error < limit, (
-        f"relative error {error:.4f} exceeds {limit} "
-        f"(‖actual − expected‖ / ‖expected‖). {msg}"
+        f"relative error {error:.4f} exceeds {limit} (‖actual − expected‖ / ‖expected‖). {msg}"
     )
 
 
@@ -239,7 +242,7 @@ TEST_NUM_BLOCKS = 256
 
 
 def _require_real_weights() -> None:
-    from mini_vllm.model.loader import resolve_model_path
+    from mini_vllm.model import resolve_model_path
 
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
@@ -285,8 +288,8 @@ def make_tiny_qwen3(**overrides: Any):
     """Build a randomly-initialized Qwen3 small enough to test against.
 
     This is HuggingFace's Qwen3 rather than ours, which is the right way round:
-    it is the *oracle*, and `mini_vllm.model.qwen3.Qwen3` is checked against it
-    using these same random weights, no download required.
+    it is the *oracle*, and `mini_vllm.model.Qwen3` is checked against it using
+    these same random weights, no download required.
     """
     from transformers import Qwen3Config, Qwen3ForCausalLM
 
@@ -313,7 +316,7 @@ def config_from_hf(hf_model) -> Any:
     """
     from dataclasses import replace
 
-    from mini_vllm.model.loader import ModelConfig
+    from mini_vllm.config import ModelConfig
 
     config = ModelConfig.from_dict(hf_model.config.to_dict())
     return replace(config, dtype=next(hf_model.parameters()).dtype)
@@ -325,7 +328,7 @@ def weights_from_hf(hf_model) -> dict[str, torch.Tensor]:
     Sharing rather than copying removes weight transfer from the set of possible causes of
     a failing comparison.
     """
-    from mini_vllm.model.loader import map_name
+    from mini_vllm.model import map_name
 
     weights = {}
     for hf_name, tensor in hf_model.state_dict().items():
@@ -337,6 +340,24 @@ def weights_from_hf(hf_model) -> dict[str, torch.Tensor]:
 
 def qwen3_from_hf(hf_model):
     """Build a `mini_vllm` `Qwen3` from a HuggingFace `Qwen3ForCausalLM`, weights shared."""
-    from mini_vllm.model.qwen3 import Qwen3
+    from mini_vllm.model import Qwen3
 
     return Qwen3(config_from_hf(hf_model), weights_from_hf(hf_model))
+
+
+def tiny_kv_manager(**overrides: Any):
+    """A small paged pool with real KV storage, for cache tests that need tensors.
+
+    16 blocks of 4 tokens, one layer, one KV head, head dim 8 — small enough that a
+    prefix spans several blocks and exhaustion is reachable in a few allocations.
+    """
+    from mini_vllm.cache import BlockManager
+
+    defaults: dict[str, Any] = {
+        "num_blocks": 16,
+        "block_size": 4,
+        "num_layers": 1,
+        "num_kv_heads": 1,
+        "head_dim": 8,
+    }
+    return BlockManager(**(defaults | overrides))
