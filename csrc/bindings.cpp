@@ -5,7 +5,6 @@
 
 #include <torch/extension.h>
 
-torch::Tensor hello(const torch::Tensor& x, double a, double b);
 torch::Tensor rmsnorm(const torch::Tensor& x, const torch::Tensor& weight, double eps);
 torch::Tensor rope(const torch::Tensor& x,
                    const torch::Tensor& positions,
@@ -42,13 +41,6 @@ void kv_quantize_scatter(const torch::Tensor& key,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "Mini-vLLM hand-written CUDA kernels";
-
-  m.def("hello",
-        &hello,
-        "y = a*x + b, elementwise (toolchain smoke kernel)",
-        py::arg("x"),
-        py::arg("a"),
-        py::arg("b"));
 
   m.def("rmsnorm",
         &rmsnorm,
