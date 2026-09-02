@@ -467,7 +467,7 @@ Configuration can also be passed as one object: `LLM(config=EngineConfig(...))`.
 
 This branch is a consolidation of a larger implementation (71 Python files, 927
 tests) into a learning-first layout, preserving every capability and its tests. The
-original is kept intact on the local `full-engine` branch, including its README with
+original is kept intact on the `full-engine` branch, including its README with
 the originally measured benchmark tables. Nothing was removed in the consolidation:
 features were merged file-by-file with their differential tests, and the full suite
 above re-validates each one on this branch.
