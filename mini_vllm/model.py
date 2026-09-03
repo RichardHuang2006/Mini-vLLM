@@ -1,53 +1,10 @@
-"""Qwen3, three ways: loading, the dense oracle, the cached fork, the paged fork.
+"""Qwen3, three ways: the dense oracle, the cached fork, and the paged fork.
 
-What this file teaches
-    The complete path from a checkpoint on disk to logits, and how one model
-    grows an inference engine's cache hierarchy without changing its math:
-
-    1. *Loading* — name mapping, shape checking, and safetensors I/O. The
-       mapping is verified total in both directions, because an unfilled
-       weight produces fluent, confident, wrong text rather than an error.
-    2. `Qwen3` — the dense reference: no cache, whole sequence recomputed
-       every call, pure `ops.py`. Slowest and most trustworthy.
-    3. `Qwen3Cached` — the same model over a per-sequence dense KV cache,
-       with the position `offset` machinery chunked prefill needs.
-    4. `Qwen3Paged` — the model the engine runs: one ragged token axis, keys
-       and values written straight into the paged pool, attention through the
-       block table.
-
-    The forward pass a reader should be able to trace in each variant:
-    token embedding → Q/K/V projection → QK normalization → RoPE → KV-cache
-    write → attention → output projection → SwiGLU MLP → final normalization
-    → vocabulary projection.
-
-Inputs and outputs
-    `load_weights` returns ``(weights, ModelConfig)`` with local names. The
-    dense and cached models take ``B x L`` token ids; the paged model takes a
-    `scheduler.ForwardBatch`. All return logits over the 151,936-token
-    vocabulary.
-
-Read next
-    `cache.py` if you have not read it yet (the paged model writes into it),
-    then `scheduler.py` for who decides what the paged model runs.
-
-One invariant
-    The three variants are one model. `Qwen3` is diffed against HuggingFace
-    transformers, `Qwen3Cached` against `Qwen3`, and `Qwen3Paged` against
-    `Qwen3Cached`, greedy-token-identical in every case — so every fast path
-    is ultimately justified by agreeing with the checkpoint's own reference.
-    `Qwen3`'s attention path calls `ops.py` directly with no dispatch layer;
-    the cached and paged models route every op through `kernels.py` with a
-    `use_cuda` flag. The shared `Qwen3MLP` is constructed with
-    `use_cuda=False` in the dense model, and `kernels.swiglu` with
-    `use_cuda=False` is by construction the `ops.py` expression
-    ``silu(gate) * up`` — the HF differential test pins the whole stack
-    either way.
-
-Two Qwen3-specific details absent from Qwen2.5, both of which produce fluent
-nonsense rather than errors when omitted:
-
-* QK-norm: an RMSNorm over the head dimension of `q` and `k`, before RoPE.
-* GQA: 8 key/value heads serving 16 query heads.
+The weight loader, then three variants of one model -- Qwen3 recomputes
+everything, Qwen3Cached keeps a dense KV cache, and Qwen3Paged writes into
+cache.py's pool over a ragged token axis. Each is diffed against the last,
+greedy-token-identical, so every fast path is ultimately justified by agreeing
+with HuggingFace.
 """
 
 from __future__ import annotations
@@ -86,7 +43,8 @@ __all__ = [
 ]
 
 
-# ================================================================== the loader
+# --- 1. The loader -----------------------------------------------------------
+
 #
 # The load-bearing part is `load_weights` asserting the name mapping is total in both
 # directions: every tensor in the checkpoint is consumed, and every tensor the model
@@ -152,10 +110,9 @@ def expected_names(config: ModelConfig) -> set[str]:
 
 
 def expected_shape(name: str, config: ModelConfig) -> tuple[int, ...]:
-    """The shape a given weight must have, derived from the config.
-
-    Checked on load so a config that disagrees with the checkpoint fails here rather than
-    as a matmul error deep in the forward pass.
+    """The shape a given weight must have, derived from the config. Checked on load so
+    a config that disagrees with the checkpoint fails here, not as a matmul error
+    deep in the forward pass.
     """
     leaf = name.split(".")[-1]
     shapes: dict[str, tuple[int, ...]] = {
@@ -202,10 +159,9 @@ def shard_files(model_path: Path) -> list[Path]:
 
 
 def iter_weights(model_path: Path, device: str = "cpu") -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield ``(checkpoint_name, tensor)`` pairs, one shard at a time.
-
-    safetensors memory-maps the file, so tensors are paged in as they are read rather
-    than materializing the whole 1.2 GB at once.
+    """Yield (checkpoint_name, tensor) pairs, one shard at a time. safetensors
+    memory-maps the file, so tensors page in as they are read rather than
+    materializing the whole 1.2 GB at once.
     """
     for shard in shard_files(model_path):
         with safe_open(shard, framework="pt", device=device) as handle:
@@ -219,8 +175,7 @@ def load_weights(
     device: str = "cpu",
 ) -> tuple[dict[str, torch.Tensor], ModelConfig]:
     """Load a checkpoint into the local naming scheme, verifying the mapping is total.
-
-    Returns the weights keyed by the local names, plus the config they were checked
+    Returns the weights keyed by local names, plus the config they were checked
     against.
     """
     model_path = resolve_model_path(model)
@@ -257,8 +212,7 @@ def load_weights(
     return weights, config
 
 
-# ================================================================ shared pieces
-
+# --- 2. Shared pieces --------------------------------------------------------
 
 def _layer_weights(weights: dict[str, torch.Tensor], layer: int) -> dict[str, torch.Tensor]:
     """One layer's weights, with the ``layers.N.`` prefix stripped."""
@@ -284,12 +238,9 @@ def _model_common(
 
 
 class _AttentionWeights:
-    """The six attention tensors, bound identically by all three variants.
-
-    ::
-
-        wq: (H_q·D) x E      wk, wv: (H_k·D) x E      wo: E x (H_q·D)
-        q_norm, k_norm: D    (the QK-norm scales, one per head element)
+    """The six attention tensors, bound identically by all three variants:
+    wq (H_q*D x E), wk and wv (H_k*D x E), wo (E x H_q*D), and the QK-norm scales
+    q_norm and k_norm (D each, one per head element).
     """
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor], rope: RoPE) -> None:
@@ -304,13 +255,9 @@ class _AttentionWeights:
 
 
 class Qwen3MLP:
-    """SwiGLU: ``down(silu(gate(x)) * up(x))``, shared by all three variants.
-
-    Two parallel projections up to `intermediate`, gated against each other, then one
-    back down. The projections are ordinary matmuls that cuBLAS handles well; the
-    elementwise product is what the fused SwiGLU kernel replaces, to avoid a second
-    pass over the wide activation. With ``use_cuda=False`` (the dense oracle's setting)
-    the dispatch is exactly ``silu(gate) * up`` from `ops.py`.
+    """SwiGLU: down(silu(gate(x)) * up(x)), shared by all three variants. The
+    projections are ordinary matmuls cuBLAS handles well; the elementwise product is
+    what the fused kernel replaces, to avoid a second pass over the wide activation.
     """
 
     def __init__(self, weights: dict[str, torch.Tensor], use_cuda: bool = False) -> None:
@@ -324,15 +271,11 @@ class Qwen3MLP:
         return linear(gated, self.down)
 
 
-# ========================================================= 1. the dense oracle
-
+# --- 3. The dense oracle -----------------------------------------------------
 
 class Qwen3Attention(_AttentionWeights):
-    """Grouped-query attention with QK-norm and RoPE. No cache, pure `ops.py`.
-
-    ::
-
-        x, out:  B x L x E
+    """Grouped-query attention with QK-norm and RoPE, x and out both B x L x E. No
+    cache, pure ops.py.
     """
 
     def __call__(
@@ -368,15 +311,13 @@ class Qwen3Attention(_AttentionWeights):
 
 
 class Qwen3Block:
-    """One pre-norm transformer block of the dense oracle.
-
-    ::
+    """One pre-norm transformer block of the dense oracle:
 
         h   = x + attention(rmsnorm(x))
         out = h + mlp(rmsnorm(h))
 
-    Pre-norm rather than post-norm: the residual path from input to output is
-    unnormalized, which keeps activations stable through 28 layers.
+    Pre-norm leaves the residual path unnormalized, which keeps activations stable
+    through 28 layers.
     """
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor], rope: RoPE) -> None:
@@ -399,18 +340,12 @@ class Qwen3Block:
 
 class Qwen3:
     """The full dense model: embedding, blocks, final norm, tied LM head.
+    input_ids [B, L] -> logits [B, L, V].
 
-    No cache and no custom kernels: one forward pass over a whole sequence,
-    recomputing the entire prefix every step. This is the reference implementation.
-    `Qwen3Cached` adds a KV cache and is diffed against it; `Qwen3Paged` pages the
-    cache and is diffed against that; so every fast path in the project is ultimately
-    justified by agreeing with this class, which is itself diffed against HuggingFace
-    transformers.
-
-    ::
-
-        input_ids: B x L      (int64)
-        logits:    B x L x V
+    No cache and no custom kernels -- one pass over a whole sequence, recomputing
+    the entire prefix every step. Qwen3Cached is diffed against this and Qwen3Paged
+    against that, so every fast path is ultimately justified by agreeing with this
+    class, itself diffed against HuggingFace.
     """
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]) -> None:
@@ -433,12 +368,9 @@ class Qwen3:
         positions: torch.Tensor | None = None,
         mask: torch.Tensor | str | None = "causal",
     ) -> torch.Tensor:
-        """Full forward over the whole sequence.
-
-        ``positions`` defaults to ``arange(L)``, which is correct here because there is
-        no cache: the tokens fed in are the whole sequence. It remains an argument
-        because that does not hold for the cached and paged models, where positions come
-        from the caller.
+        """Full forward over the whole sequence. positions defaults to arange(L), correct
+        here because there is no cache, but it stays an argument because that does not
+        hold for the cached and paged models.
         """
         _batch, length = input_ids.shape
         if positions is None:
@@ -452,15 +384,12 @@ class Qwen3:
         return self.embedding.as_linear(h)
 
 
-# ===================================================== 2. the dense-cache fork
-
+# --- 4. The dense-cache fork -------------------------------------------------
 
 class Qwen3CachedAttention(_AttentionWeights):
-    """Grouped-query attention against a growing KV cache.
-
-    The cache backend is explicit in the body: rotated keys and values go through
-    `cache.update_and_fetch`, and attention runs over everything accumulated, so `q`
-    has length `L` while `k` and `v` have length `S`.
+    """Grouped-query attention against a growing KV cache. Rotated keys and values go
+    through cache.update_and_fetch and attention runs over everything accumulated,
+    so q has length L while k and v have length S.
     """
 
     def __init__(
@@ -546,25 +475,14 @@ class Qwen3CachedBlock:
 
 
 class Qwen3Cached:
-    """Qwen3 with a per-layer dense KV cache: it stops recomputing the past.
+    """Qwen3 with a per-layer dense KV cache: it stops recomputing the past. input_ids
+    [B, L] is the new tokens only; logits [B, L, V], or [B, 1, V] with last_only.
 
-    A fork of `Qwen3` rather than a replacement: that class remains the oracle, and
-    every claim made here is checked by producing the same tokens it does. Three
-    changes, all position bookkeeping:
-
-    * Only the new tokens are fed in. Their keys and values join the cache and
-      attention runs against everything cached so far.
-    * RoPE positions become ``arange(offset, offset + L)`` rather than ``arange(L)``.
-    * The causal mask becomes ``(L, S)``, using the offset form of the reference mask
-      so a single decode token may attend to the entire cache.
-
-    The same `offset` machinery is what chunked prefill needs, which is why chunked
-    prefill is a scheduler change rather than a model rewrite.
-
-    ::
-
-        input_ids: B x L      (the *new* tokens only)
-        logits:    B x L x V  (or B x 1 x V with last_only)
+    A fork of Qwen3 rather than a replacement -- that class stays the oracle. Three
+    changes, all position bookkeeping: only new tokens are fed in, RoPE positions
+    become arange(offset, offset + L), and the mask becomes (L, S) so a decode token
+    may attend to the whole cache. That offset machinery is what chunked prefill
+    needs, which is why chunking is a scheduler change rather than a model rewrite.
     """
 
     def __init__(
@@ -600,15 +518,11 @@ class Qwen3Cached:
         positions: torch.Tensor | None = None,
         last_only: bool = False,
     ) -> torch.Tensor:
-        """Forward the new tokens, extending ``caches`` in place.
-
-        ``positions`` defaults to ``arange(offset, offset + L)`` read from the caches,
-        which is why the caller does not track position separately.
-
-        ``last_only`` skips the LM head on every position but the last. Generation only
-        reads the last one, and the head is a `V`-wide matmul, so on a 128-token prefill
-        it saves about 20 GFLOP. It defaults to False so the output stays directly
-        comparable to `Qwen3`.
+        """Forward the new tokens, extending caches in place. positions defaults to
+        arange(offset, offset + L) read from the caches, so the caller tracks nothing.
+        last_only skips the LM head on every position but the last, saving about
+        20 GFLOP on a 128-token prefill; it defaults to False so the output stays
+        directly comparable to Qwen3.
         """
         if len(caches) != len(self.blocks):
             raise ValueError(f"expected {len(self.blocks)} caches, one per layer, got {len(caches)}")
@@ -629,16 +543,12 @@ class Qwen3Cached:
         return self.embedding.as_linear(h)
 
 
-# ====================================================== 3. the paged-pool fork
-
+# --- 5. The paged-pool fork --------------------------------------------------
 
 class Qwen3PagedAttention(_AttentionWeights):
-    """Grouped-query attention against the paged pool, for one layer.
-
-    The cache backend is explicit in the body: rotated keys and values are scattered
-    into the pool through the batch's slot mapping (`manager.kv.write`), and attention
-    gathers them back through the block table inside the kernel
-    (`kernels.paged_attention`).
+    """Grouped-query attention against the paged pool, for one layer. Rotated keys and
+    values are scattered into the pool through the batch's slot mapping, and
+    attention gathers them back through the block table inside the kernel.
     """
 
     def __init__(
@@ -725,31 +635,17 @@ class Qwen3PagedBlock:
 
 
 class Qwen3Paged:
-    """Qwen3 over a ragged batch and a paged cache: the model the engine runs.
+    """Qwen3 over a ragged batch and a paged cache: the model the engine runs. Takes a
+    ForwardBatch of T tokens across N sequences, returns logits [N, V].
 
-    The third fork. `Qwen3` recomputes everything, `Qwen3Cached` keeps a dense cache
-    per sequence, and this one keeps no cache of its own: it is handed a `ForwardBatch`
-    and a `BlockManager` and writes its keys and values straight into the pool. Two
-    changes from `Qwen3Cached`, both about shape rather than mathematics:
-
-    * No batch axis. Activations are `T x ...` where `T` is every scheduled token in
-      the iteration, sequences concatenated. A padded `B x L` rectangle would give back
-      the memory the paged cache buys.
-    * Attention takes metadata instead of tensors: `cu_seqlens_q` for which rows belong
-      to which sequence, `context_lens` for how far back each may look, and the block
-      tables for where its pages are. One call covers a 512-token prefill chunk and
-      eleven decode steps.
-
-    ::
-
-        batch:  a ForwardBatch of T tokens across N sequences
-        logits: N x V — one row per sequence, at its last computed position
-
-    Only `N` rows come back, not `T`. The LM head is a `V`-wide matmul and generation
-    samples only from a sequence's last position, so computing it for the other `T - N`
-    rows of a prefill chunk is wasted work — about 20 GFLOP on a 128-token chunk of this
-    model. Speculative verification is the exception and asks for all `T` with
-    `all_rows=True`, needing a distribution at every proposed position.
+    The third fork keeps no cache of its own, writing keys and values straight into
+    the pool. Two changes from Qwen3Cached, both shape rather than mathematics.
+    There is no batch axis -- activations are T x ... over every scheduled token,
+    since a padded rectangle would give back the memory paging buys. And attention
+    takes metadata instead of tensors: cu_seqlens_q, context_lens, and the block
+    tables, so one call covers a 512-token prefill chunk and eleven decode steps.
+    Only N rows come back because generation samples from a sequence's last position
+    and the head is a V-wide matmul; speculative verification asks for all T.
     """
 
     def __init__(
@@ -792,22 +688,14 @@ class Qwen3Paged:
         return cls(config, weights, manager, use_cuda=use_cuda)
 
     def self_draft(self, num_layers: int, manager: BlockManager) -> Qwen3Paged:
-        """This model truncated to its first `num_layers`, over a separate KV pool.
+        """This model truncated to its first num_layers, over a separate KV pool.
 
-        The draft model for speculative decoding on a machine that cannot afford a second
-        checkpoint. Qwen3-0.6B is already the smallest of its family, and an 8 GB card has
-        no room for another set of weights plus two KV caches. Running the target's early
-        layers costs no additional memory — the blocks, the embedding and the head are the
-        same tensors, shared rather than copied — and a prefix of a transformer is both
-        cheaper and weaker, which is what a draft needs to be.
-
-        It needs its own `manager` because a draft keeps its own keys and values: the
-        pool's layer axis is `num_layers` deep here rather than the target's, and the two
-        caches are written at different times over different tokens.
-
-        Weakness is acceptable where wrongness is not. Rejection sampling is indifferent
-        to draft quality — a poor draft is rejected more often — so this choice affects
-        only the acceptance rate, never the output distribution.
+        The draft for speculative decoding on a machine that cannot afford a second
+        checkpoint. Running the target's early layers costs no additional memory -- the
+        blocks, embedding and head are the same tensors -- and a prefix of a transformer
+        is both cheaper and weaker, which is what a draft needs to be. It needs its own
+        manager because a draft keeps its own KV. Weakness is acceptable where wrongness
+        is not: rejection sampling is indifferent to draft quality.
         """
         if not 1 <= num_layers <= len(self.blocks):
             raise ValueError(
@@ -826,13 +714,9 @@ class Qwen3Paged:
 
     @torch.no_grad()
     def __call__(self, batch: ForwardBatch, all_rows: bool = False) -> torch.Tensor:
-        """One forward pass, returning `N x V` normally and `T x V` when `all_rows`.
-
-        `all_rows` exists for speculative verification, the one caller that needs every
-        position's distribution: it forwards a sequence's pending token followed by `k`
-        proposals and needs the target's distribution at all `k + 1` positions in a single
-        pass. Off by default, since paying the `V`-wide matmul for a prefill chunk's
-        interior rows is exactly what the `index_select` below avoids.
+        """One forward pass, returning [N, V] normally and [T, V] when all_rows. all_rows
+        exists for speculative verification, which forwards a pending token plus k
+        proposals and needs the target's distribution at all k + 1 positions in one pass.
         """
         if batch.slot_mapping is None or batch.block_tables is None:
             raise ValueError(

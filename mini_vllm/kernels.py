@@ -1,51 +1,11 @@
-"""The CUDA kernels' front door: JIT build of ``csrc/`` and the dispatch seam.
+"""The CUDA kernels' front door: JIT build of csrc/ and the dispatch seam.
 
-What this file teaches
-    How hand-written CUDA reaches a PyTorch program, in two halves:
-
-    1. *The build* — `load_extension` JIT-compiles ``csrc/`` on first use,
-       after `resolve_cuda_home` finds (or assembles from pip wheels) a CUDA
-       toolkit whose major version matches torch's.
-    2. *The dispatch* — one wrapper per op (`rmsnorm`, `rope`, `swiglu`,
-       `attention`, `paged_attention`, `quantize_scatter`), each of which runs
-       either the hand-written kernel or the reference implementation from
-       `ops.py`. The model passes `use_cuda` down and never learns which ran.
-
-Inputs and outputs
-    The wrappers take and return plain tensors with the same signatures as
-    their `ops.py` references. `dispatch_report` returns a human-readable
-    statement of which path each op would take and why.
-
-Read next
-    `engine.py` — the serving loop these kernels accelerate. The kernels
-    themselves are in ``csrc/``, one file per kernel, readable in the same
-    order as the wrappers below.
-
-One invariant
-    `use_cuda=True` means "use kernels where they are implemented, correct,
-    and *faster*". An op whose kernel measures slower than PyTorch is listed
-    in `NOT_YET_FASTER` with the measured reason and keeps the reference path,
-    so a benchmark can never silently route through a kernel that loses. The
-    same wrapper with `use_cuda=False` is the oracle the kernel is diffed
-    against, which is how the tests establish that a kernel changed the speed
-    and not the output.
-
-Runnable example
-    ``python -m mini_vllm.kernels --rebuild`` — force a full rebuild, print
-    the resolved toolchain, and verify the compiled rmsnorm kernel against
-    `ops.rms_norm` on a real input. (Requires a CUDA GPU.)
-
-The toolchain problem, for anyone hitting a build error
-    ``torch.utils.cpp_extension`` refuses to compile when nvcc's CUDA major
-    version differs from the one torch was built against, and on the machine
-    of record they differ (torch is a cu130 build, the system nvcc is 12.8).
-    The resolution is to use the CUDA 13 compiler shipped as pip wheels. Those
-    wheels are split across packages — nvcc and its nvvm backend in one,
-    runtime headers in another, the CCCL headers that ``cuda_fp16.h`` pulls in
-    in a third — and pip may install them into different site-packages trees,
-    so no single directory resembles a CUDA installation. `synthesize_cuda_home`
-    assembles a symlink tree that does, under ``build/``, and points CUDA_HOME
-    at it.
+load_extension JIT-compiles csrc/ on first use, after resolve_cuda_home finds
+or assembles a toolkit whose CUDA major version matches torch's; then one
+wrapper per op runs either the hand-written kernel or the ops.py reference, and
+the model never learns which. use_cuda=True means "where implemented, correct,
+and faster" -- an op whose kernel measures slower is listed in NOT_YET_FASTER
+and keeps the reference path.
 """
 
 from __future__ import annotations
@@ -112,9 +72,7 @@ class ToolchainError(RuntimeError):
     """Raised when no CUDA toolkit matching torch's CUDA version can be found."""
 
 
-# ======================================================================== build
-# --------------------------------------------------------------------- probing
-
+# --- 1. Probing the toolchain ------------------------------------------------
 
 def torch_cuda_major() -> int:
     """The CUDA major version torch was built against, e.g. 13 for ``2.11.0+cu130``."""
@@ -147,13 +105,10 @@ def _nvidia_wheel_roots() -> list[Path]:
 
 
 class WheelToolkit:
-    """The pieces of a CUDA toolkit as pip scatters them.
-
-    No single directory is guaranteed to hold a usable toolkit. On this machine nvcc and
-    nvvm come from one site-packages tree, the runtime headers and libraries from another,
-    and the CCCL headers that ``cuda_fp16.h`` includes (``nv/target``) from a third wheel
-    in a fourth tree. The include and library search paths are therefore lists, merged
-    downstream.
+    """The pieces of a CUDA toolkit as pip scatters them. No single directory is
+    guaranteed to hold a usable one: on this machine nvcc and nvvm come from one
+    site-packages tree, the runtime headers from another, and the CCCL headers
+    cuda_fp16.h includes from a third. The search paths are therefore lists.
     """
 
     def __init__(self, compiler_root: Path, include_dirs: list[Path], lib_dirs: list[Path]) -> None:
@@ -191,8 +146,7 @@ def _find_wheel_toolkit(major: int) -> WheelToolkit | None:
     return WheelToolkit(compiler, include_dirs, lib_dirs)
 
 
-# ------------------------------------------------------------ toolkit assembly
-
+# --- 2. Toolkit assembly -----------------------------------------------------
 
 def _relink(link: Path, target: Path) -> None:
     """Point ``link`` at ``target``, replacing whatever was there before."""
@@ -219,19 +173,18 @@ def _ensure_real_dir(path: Path) -> None:
 
 
 def synthesize_cuda_home(toolkit: WheelToolkit, dest: Path = TOOLKIT_DIR) -> Path:
-    """Assemble a directory that looks enough like a CUDA toolkit for torch.
-
-    Layout produced::
+    """Assemble a directory that looks enough like a CUDA toolkit for torch:
 
         dest/bin      -> compiler_root/bin     (nvcc, ptxas, cudafe++, crt/)
         dest/nvvm     -> compiler_root/nvvm    (cicc and libdevice)
         dest/include/ -> merged symlinks from every wheel include dir
         dest/lib64/   -> merged symlinks from every wheel lib dir, plus sonames
-        dest/lib      -> dest/lib64
 
-    ``bin`` is linked as a whole directory because nvcc locates its nvvm backend relative
-    to the real path of the binary; linking individual executables leaves it unable to
-    find ``cicc``.
+    Needed because cpp_extension refuses to compile when nvcc's CUDA major differs
+    from torch's, and the pip wheels that supply a matching compiler are split
+    across packages that may land in different site-packages trees, so no single
+    directory resembles a CUDA install. bin is linked as a whole directory because
+    nvcc locates its nvvm backend relative to the real path of the binary.
     """
     dest.mkdir(parents=True, exist_ok=True)
     _relink(dest / "bin", toolkit.compiler_root / "bin")
@@ -317,8 +270,7 @@ def resolve_cuda_home() -> tuple[Path, str]:
     )
 
 
-# --------------------------------------------------------------------- loading
-
+# --- 3. Loading the extension ------------------------------------------------
 
 def _available_bytes() -> int | None:
     """RAM the machine will give a compile, or None if it does not report it.
@@ -434,7 +386,7 @@ def toolchain_report() -> dict[str, Any]:
     return report
 
 
-# ===================================================================== dispatch
+# --- 4. Dispatch policy ------------------------------------------------------
 
 # Which ops have a hand-written kernel, paired with the source file the dispatch report
 # names beside each one.
@@ -496,12 +448,10 @@ def cuda_kernel_names() -> list[str]:
 
 
 def dispatch_report(use_cuda: bool) -> str:
-    """One line per op saying which implementation a run would use.
-
-    `use_cuda=True` means use kernels where they exist, so an op with no kernel falls
-    back silently, as does any op called on CPU tensors. That silence is how a kernel
-    that never ran ends up in a benchmark, so this states which path each op would take
-    and the benchmark prints it.
+    """One line per op saying which implementation a run would use. use_cuda=True means
+    use kernels where they exist, so an op with no kernel falls back silently, as
+    does any op called on CPU tensors -- and that silence is how a kernel that never
+    ran ends up in a benchmark.
     """
     lines = []
     for name, (implemented, source) in CUDA_KERNELS.items():
@@ -518,8 +468,7 @@ def dispatch_report(use_cuda: bool) -> str:
     return "\n".join(lines)
 
 
-# ------------------------------------------------------------------------ ops
-
+# --- 5. Ops ------------------------------------------------------------------
 
 def rmsnorm(
     x: torch.Tensor,
@@ -557,11 +506,11 @@ def rope(
 
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor, use_cuda: bool = False) -> torch.Tensor:
-    """``silu(gate) * up``, the elementwise half of the MLP. Kernel: ``csrc/swiglu.cu``.
+    """silu(gate) * up, the elementwise half of the MLP. Kernel: csrc/swiglu.cu.
 
-    Takes the two projections rather than the input: the projections are ordinary matmuls
-    that cuBLAS handles better than a hand-written kernel. What is worth fusing is this
-    part, two full passes over a `B x L x intermediate` tensor for a few flops per
+    Takes the two projections rather than the input: those are ordinary matmuls
+    cuBLAS handles better than a hand-written kernel. What is worth fusing is this
+    part, two full passes over a B x L x intermediate tensor for a few flops per
     element, which is pure memory traffic.
     """
     if _use_kernel("swiglu", use_cuda, gate) and gate.dtype == up.dtype:
@@ -576,19 +525,13 @@ def attention(
     mask: torch.Tensor | str | None = None,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Grouped-query attention, with a separate kernel for decode and for prefill.
+    """Grouped-query attention, q [B, H_q, L, D] and k/v [B, H_k, S, D], with a
+    separate kernel for decode and for prefill.
 
-    ::
-
-        q:    B x H_q x L x D
-        k, v: B x H_k x S x D
-        out:  B x H_q x L x D
-
-    Decode and prefill are different problems rather than different sizes of one. Decode
-    has `L = 1`: no parallelism across queries, one long pass over the cache, entirely
-    memory-bound. Prefill has `L = S`: a matrix multiply worth tiling. Hence separate
-    kernels, ``csrc/decode_attention.cu`` and ``csrc/flash_prefill.cu``, with the routing
-    here so the model does not have to choose.
+    Decode and prefill are different problems rather than different sizes of one:
+    decode has L = 1, no parallelism across queries and one long memory-bound pass
+    over the cache, while prefill has L = S, a matrix multiply worth tiling. Hence
+    csrc/decode_attention.cu and csrc/flash_prefill.cu.
     """
     is_decode = q.shape[-2] == 1
     name = "decode_attention" if is_decode else "flash_prefill"
@@ -617,28 +560,16 @@ def paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Ragged attention over a paged cache. Kernel: ``csrc/paged_attention.cu``.
+    """Ragged attention over a paged cache: q [T, H_q, D] over pools of
+    num_blocks x P x H_k x D. Kernel: csrc/paged_attention.cu.
 
-    ::
-
-        q:    T x H_q x D              every scheduled token, sequences concatenated
-        pools num_blocks x P x H_k x D
-        out:  T x H_q x D
-
-    The fallback differs in kind from the others here. The PyTorch path for `rmsnorm` is
-    a slower way to do the same work; the PyTorch path for this copies every sequence's
-    whole cache into a contiguous temporary first, which is the traffic paging exists to
-    remove. It is the oracle rather than an alternative, and the engine's throughput
-    numbers are only meaningful on the kernel path.
-
-    `max_query_len` and `max_context_len` are plain integers rather than reads off
-    `seq_lens` and `context_lens`. They decide a grid shape and a split count, so reading
-    them from a device tensor would synchronize on every iteration's critical path, and
-    the caller already holds them as Python integers from building the batch.
-
-    With an FP8 e4m3 pool the kernel dequantizes in registers: `k_scale` folds into the
-    softmax scale at the launch site and `v_scale` rides on the output, so the inner
-    loops are unchanged and an FP8 element costs only its conversion on load.
+    The fallback differs in kind from the others here: it copies every sequence's
+    whole cache into a contiguous temporary first, which is the traffic paging
+    exists to remove, so it is the oracle rather than an alternative.
+    max_query_len and max_context_len are plain integers because they decide a grid
+    shape, and reading them off a device tensor would synchronize on the critical
+    path. With an FP8 pool the kernel dequantizes in registers, so the inner loops
+    are unchanged.
     """
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
@@ -684,13 +615,10 @@ def quantize_scatter(
     v_scale: float,
     use_cuda: bool = False,
 ) -> None:
-    """Quantize a step's KV to FP8 and scatter it into the pool. Kernel: ``csrc/kv_quantize.cu``.
-
-    ``key_pool`` and ``value_pool`` are one layer's pages flattened to
-    ``num_slots x H_k x D``, the same view :func:`paged_attention` reads back. Writes in
-    place, returns nothing. The oracle is the two-pass PyTorch it replaces — quantize into
-    a temporary, then ``index_copy_`` — and the two agree bit for bit: both divide by the
-    scale in fp32 and round to nearest even.
+    """Quantize a step's KV to FP8 and scatter it into the pool, in place. Kernel:
+    csrc/kv_quantize.cu. The oracle is the two-pass PyTorch it replaces -- quantize
+    into a temporary, then index_copy_ -- and the two agree bit for bit, both
+    dividing by the scale in fp32 and rounding to nearest even.
     """
     if _use_kernel("kv_quantize_scatter", use_cuda, key) and key_pool.dtype is FP8_KERNEL_DTYPE:
         load_extension().kv_quantize_scatter(
@@ -711,8 +639,7 @@ def quantize_scatter(
     value_pool.view(torch.uint8).index_copy_(0, index, quant_values.view(torch.uint8))
 
 
-# ------------------------------------------------------------- dispatch guards
-
+# --- 6. Dispatch guards ------------------------------------------------------
 
 def _kernel_can_page(
     q: torch.Tensor,
@@ -720,15 +647,10 @@ def _kernel_can_page(
     value_pool: torch.Tensor,
     block_tables: torch.Tensor,
 ) -> bool:
-    """Whether the paged kernel can serve this call.
-
-    The kernel walks the pools by slot arithmetic rather than by stride, so they must be
-    contiguous: a narrowed view would read the wrong pages rather than read slowly, which
-    is why this is a condition and not a copy.
-
-    FP8 pools are served as well, dequantized in registers, so the pools may differ from
-    the query in dtype provided they agree with each other and use a storage type the
-    kernel knows.
+    """Whether the paged kernel can serve this call. It walks the pools by slot
+    arithmetic rather than by stride, so they must be contiguous: a narrowed view
+    would read the wrong pages rather than read slowly. FP8 pools are served too, so
+    they may differ from the query in dtype provided they agree with each other.
     """
     pools_match = key_pool.dtype == value_pool.dtype
     pool_is_fp8 = key_pool.dtype is FP8_KERNEL_DTYPE
@@ -749,12 +671,10 @@ def _kernel_can_attend(
     mask: torch.Tensor | str | None,
     is_decode: bool,
 ) -> bool:
-    """Whether the attention kernels can serve this exact call.
-
-    Both kernels encode the causal structure in arithmetic rather than reading a mask
-    tensor — decode attends to the whole cache, prefill compares each index against the
-    diagonal — so `mask="causal"` is the only mask they can honour. An explicit tensor
-    could express anything, so it falls back to the oracle rather than being ignored.
+    """Whether the attention kernels can serve this exact call. Both encode the causal
+    structure in arithmetic rather than reading a mask tensor, so mask="causal" is
+    the only mask they can honour; an explicit tensor falls back to the oracle
+    rather than being ignored.
     """
     is_causal_shorthand = isinstance(mask, str) and mask == "causal"
     if is_decode:
@@ -773,8 +693,7 @@ def _kernel_can_attend(
     return k.shape[-2] > 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
 
 
-# ---------------------------------------------------------------- CLI: make ext
-
+# --- 7. CLI: build and verify ------------------------------------------------
 
 def main() -> int:
     import argparse

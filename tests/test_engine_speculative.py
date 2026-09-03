@@ -1,25 +1,11 @@
 """The engine's public API, and speculative decoding end to end.
 
-Four sections:
-
-* Rejection sampling as mathematics: the residual identity, a 120k-draw chi-square
-  against a deliberately wrong draft (the distributional claim no example can make),
-  and the greedy degenerate case. Pure CPU.
-* Speculative bookkeeping: proposals live outside the output, acceptance commits
-  exactly the surviving run, rollback returns exactly the rejected slots, and a full
-  propose/reject/trim loop leaks nothing. Pure CPU.
-* The `LLM` API on real weights: token-identical to `transformers.generate` for
-  sixteen varied prompts, the stream and the batch API agreeing by construction,
-  stop tokens, parallel sampling's CoW branches, prefix-cache identity, and resource
-  release when a caller walks away.
-* Speculation on real weights: greedy speculative output identical to greedy
-  non-speculative output (including with a deliberately bad draft — rejection
-  sampling makes draft quality irrelevant to correctness), self-draft acceptance
-  1.0, whole accepted runs streamed in order, and both pools balanced after every
-  test.
-
-The engine tests build one engine at a time through `conftest.real_engine`: the card
-of record has 8 GB, and an fp32 Qwen3-0.6B plus two KV pools is most of it.
+Four sections: rejection sampling as mathematics (the residual identity and a
+120k-draw chi-square against a deliberately wrong draft), speculative
+bookkeeping, the LLM API on real weights against transformers.generate, and
+speculation on real weights, where greedy speculative output must be identical
+to greedy non-speculative output. The engine tests build one engine at a time,
+the card of record having 8 GB.
 """
 
 from __future__ import annotations
@@ -49,8 +35,7 @@ def rows(*distributions: torch.Tensor) -> torch.Tensor:
     return torch.stack(list(distributions))
 
 
-# ========================================================== rejection sampling
-
+# --- Rejection sampling ------------------------------------------------------
 
 def test_the_residual_is_the_mass_acceptance_leaves_behind():
     """``relu(p - q)`` normalized, and its raw mass is exactly ``1 - sum(min(p, q))``.
@@ -189,8 +174,7 @@ def test_the_shape_contracts_are_enforced():
         accept_proposals(rows(probability, probability), rows(distribution(0.3, 0.3, 0.4)), [0])
 
 
-# ===================================================== speculative bookkeeping
-
+# --- Speculative bookkeeping -------------------------------------------------
 
 def decoding_sequence(prompt: int = 4, outputs: int = 1, **kwargs) -> Sequence:
     """A sequence past prefill with one uncommitted token — the state a decode step
@@ -323,8 +307,7 @@ def test_trim_tokens_reports_but_does_not_release():
     assert table.num_blocks == 3
 
 
-# ================================================================ the LLM API
-
+# --- The LLM API -------------------------------------------------------------
 
 @pytest.fixture(scope="module")
 def llm():
@@ -502,8 +485,7 @@ def test_the_engine_reports_what_it_did(llm):
     assert llm.kv_cache_bytes > 0
 
 
-# ------------------------------------------------- prefix caching, engine level
-
+# --- Prefix caching, engine level --------------------------------------------
 
 @pytest.mark.oracle
 def test_a_prefix_cache_hit_changes_nothing_it_produces():
@@ -536,8 +518,7 @@ def test_prefix_caching_matches_the_uncached_engine():
     assert cached.token_ids == plain.token_ids
 
 
-# ==================================================== speculation, end to end
-
+# --- Speculation, end to end -------------------------------------------------
 
 def assert_no_spec_leaks(llm) -> None:
     """Both pools back to full: the target's and the draft's."""

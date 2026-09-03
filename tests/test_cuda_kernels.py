@@ -1,26 +1,12 @@
 """Every CUDA kernel against the PyTorch reference it replaces.
 
-The whole file carries the `cuda` marker, so it skips cleanly on a machine without a
-GPU; the `oracle` tests additionally need the real Qwen3-0.6B weights.
-
-The comparisons are differential: each kernel is pinned to the exact `ops.py`
-expression it replaces, on the boundary shapes where kernels break —
-
-* RMSNorm / RoPE / SwiGLU: value parity across dtypes, then greedy token identity
-  through the whole model, which is the property that matters more than the value.
-* Decode attention: the online-softmax recurrence. Tile boundaries, a maximum arriving
-  in the last tile (every accumulator must be rescaled), the split-key path for long
-  contexts and the merge across splits, and logits large enough to overflow a
-  non-shifted softmax.
-* Flash prefill: tiled causal attention, tile-boundary sizes, and proof the kernel
-  cannot see the future. Correct but not the default (`NOT_YET_FASTER`), so it is
-  called directly rather than through dispatch.
-* Paged attention: the gather-through-the-block-table, on *shuffled* tables — with an
-  unshuffled table physical and logical order coincide and almost any indexing bug
-  looks right. Decode, ragged mixed batches, the long-context split, and FP8 pools
-  with explicit scales.
-* FP8 quantize-and-scatter: bit-identical to the two-pass PyTorch reference, on
-  scattered slots.
+The comparisons are differential: each kernel is pinned to the exact ops.py
+expression it replaces, on the boundary shapes where kernels break -- tile
+boundaries and late maxima for the online softmax, shuffled block tables for
+the paged gather, proof the flash prefill cannot see the future, and
+bit-identity for FP8 quantize-scatter. The whole file carries the cuda marker
+and skips cleanly without a GPU; oracle tests additionally need the real
+weights.
 """
 
 from __future__ import annotations
@@ -53,8 +39,7 @@ def kernel(device):
     return kernels.load_extension()
 
 
-# ------------------------------------------------------------- the extension
-
+# --- The extension -----------------------------------------------------------
 
 def test_every_claimed_kernel_is_callable(kernel):
     """The dispatch table cannot claim a kernel that is missing or misspelled."""
@@ -71,8 +56,7 @@ def test_the_dispatch_report_names_every_op(kernel):
     assert "torch" in line, "a kernel measured slower must not be the default"
 
 
-# ------------------------------------------------------------------- RMSNorm
-
+# --- RMSNorm -----------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_rmsnorm_matches_the_oracle(kernel, dtype):
@@ -99,8 +83,7 @@ def test_rmsnorm_dispatch_declines_mixed_dtypes(kernel):
     assert_allclose(got, ops.rms_norm(x, weight))
 
 
-# ---------------------------------------------------------------------- RoPE
-
+# --- RoPE --------------------------------------------------------------------
 
 def test_rope_matches_the_oracle_at_explicit_positions(kernel):
     """Positions are per token and non-contiguous: the ragged-batch case."""
@@ -123,8 +106,7 @@ def test_rope_keeps_low_precision_activations(kernel, dtype):
     assert_allclose(got, ops.apply_rope(x, positions, tables.cos, tables.sin))
 
 
-# -------------------------------------------------------------------- SwiGLU
-
+# --- SwiGLU ------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_swiglu_matches_the_oracle(kernel, dtype):
@@ -141,8 +123,7 @@ def test_swiglu_fp32_is_bitwise(kernel):
     assert torch.equal(kernel.swiglu(gate, up), ops.silu(gate) * up)
 
 
-# ---------------------------------------------------------- decode attention
-
+# --- Decode attention --------------------------------------------------------
 
 def attend(kernel, q, k, v):
     return kernel.decode_attention(q, k, v, 1.0 / math.sqrt(q.shape[-1]))
@@ -272,8 +253,7 @@ def test_decode_refuses_shapes_it_cannot_serve(kernel):
         attend(kernel, q, empty, empty)
 
 
-# ------------------------------------------------------------- flash prefill
-
+# --- Flash prefill -----------------------------------------------------------
 
 def prefill(kernel, q, k, v):
     return kernel.flash_prefill(q, k, v, 1.0 / math.sqrt(q.shape[-1]))
@@ -352,8 +332,7 @@ def test_flash_prefill_stays_off_the_dispatch_path(kernel):
     assert torch.equal(got, want), "prefill dispatch left the reference path"
 
 
-# ------------------------------------------------------------ paged attention
-
+# --- Paged attention ---------------------------------------------------------
 
 def paged_setup(batch, context_len, block_size=16, dtype=torch.bfloat16,
                 kv_dtype=None, query_len=1):
@@ -487,8 +466,7 @@ def test_paged_dispatch_reaches_the_kernel(kernel):
     assert torch.equal(via_dispatch, direct)
 
 
-# ------------------------------------------------------- FP8 quantize-scatter
-
+# --- FP8 quantize-scatter ----------------------------------------------------
 
 def test_quantize_scatter_is_bitwise_identical_to_the_two_pass_reference(kernel):
     """Both divide by the scale in fp32 and round to nearest even, so the stored FP8
@@ -531,8 +509,7 @@ def test_quantize_scatter_round_trips_within_fp8_tolerance(kernel):
     assert relative_error(pool.float(), key.float()) < FP8_MAX_ERROR
 
 
-# --------------------------------------------------- the model, kernels on/off
-
+# --- The model, kernels on/off -----------------------------------------------
 
 def tiny_pair(tiny_qwen3, device, dtype):
     theirs = tiny_qwen3.to(device=device, dtype=dtype)

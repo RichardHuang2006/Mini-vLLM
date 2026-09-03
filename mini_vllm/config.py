@@ -1,24 +1,10 @@
 """Every knob in the engine, in one file.
 
-What this file teaches
-    The four configuration surfaces of an inference engine and who owns each:
-    the *model* (architecture read from a checkpoint), the *scheduler* (per-
-    iteration compute budgets), the *sampler* (per-request decoding rules), and
-    the *engine* (memory, features, and the wiring of everything else).
-
-Inputs and outputs
-    `ModelConfig` is parsed from a checkpoint's ``config.json``. The other three
-    are constructed by callers. `EngineConfig` is the single source of truth for
-    defaults: the block size, the KV-memory fraction, and the feature toggles
-    appear here and nowhere else.
-
-Read next
-    `ops.py` — the reference implementations these configs parameterize.
-
-One invariant
-    A `ModelConfig` that loads is a `ModelConfig` the checkpoint agrees with:
-    every derived shape in `model.py` is checked against the loaded tensors, so
-    a wrong config fails at load time, not as a matmul error 28 layers deep.
+Four surfaces: ModelConfig (architecture, parsed from a checkpoint),
+SchedulerConfig (per-iteration budgets), SamplingParams (per-request decoding),
+and EngineConfig (memory, features, wiring). EngineConfig is the single source
+of truth for defaults, and a wrong ModelConfig fails at load time rather than
+as a matmul error 28 layers deep.
 """
 
 from __future__ import annotations
@@ -63,7 +49,7 @@ KV_CACHE_DTYPES: dict[str, torch.dtype | None] = {
 
 
 def resolve_kv_dtype(name: str) -> torch.dtype | None:
-    """Turn a ``kv_cache_dtype`` string into a storage dtype, or None for the model's."""
+    """Turn a kv_cache_dtype name into a storage dtype, or None for the model's."""
     if name not in KV_CACHE_DTYPES:
         raise ValueError(
             f"unknown kv_cache_dtype {name!r}; expected one of {sorted(KV_CACHE_DTYPES)}"
@@ -71,15 +57,14 @@ def resolve_kv_dtype(name: str) -> torch.dtype | None:
     return KV_CACHE_DTYPES[name]
 
 
-# ----------------------------------------------------------------- model config
-
+# --- 1. Model config ---------------------------------------------------------
 
 def _rope_theta(raw: dict) -> float:
     """Read the RoPE base, wherever this config generation happens to keep it.
 
-    Older configs put `rope_theta` at the top level; transformers 5.x nests it under
-    `rope_parameters`, and for a time under `rope_scaling`. All three appear in
-    checkpoints in the wild, and a wrong base silently changes every position encoding.
+    Older configs put it at the top level, transformers 5.x nests it under
+    rope_parameters, and for a time under rope_scaling. All three appear in the
+    wild, and a wrong base silently changes every position encoding.
     """
     if raw.get("rope_theta") is not None:
         return float(raw["rope_theta"])
@@ -94,7 +79,7 @@ def _rope_theta(raw: dict) -> float:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """The subset of ``config.json`` this engine actually uses."""
+    """The subset of config.json this engine actually uses."""
 
     num_hidden_layers: int
     hidden_size: int
@@ -111,17 +96,17 @@ class ModelConfig:
 
     @property
     def group_size(self) -> int:
-        """``G = H_q / H_k``: how many query heads share each KV head."""
+        """G = H_q / H_k: how many query heads share each KV head."""
         return self.num_attention_heads // self.num_key_value_heads
 
     @property
     def q_projection_size(self) -> int:
-        """``H_q · D``, which is not ``E``: it is twice ``E`` in Qwen3-0.6B."""
+        """H_q * D, which is not E: it is twice E in Qwen3-0.6B."""
         return self.num_attention_heads * self.head_dim
 
     @property
     def kv_projection_size(self) -> int:
-        """``H_k · D``."""
+        """H_k * D."""
         return self.num_key_value_heads * self.head_dim
 
     def __post_init__(self) -> None:
@@ -162,33 +147,20 @@ class ModelConfig:
         return cls.from_dict(json.loads(path.read_text()))
 
 
-# ------------------------------------------------------------- scheduler config
-
+# --- 2. Scheduler config -----------------------------------------------------
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    """Admission limits for one iteration.
+    """Admission limits for one iteration."""
 
-    ``max_batched_tokens`` is the compute budget: how many token-positions one
-    forward pass may cover. ``max_sequences`` is the memory-and-overhead budget on
-    how many requests may be in flight. ``chunk_size`` bounds a single prefill's
-    share of an iteration.
-
-    ``enable_chunked_prefill`` defaults on; turning it off gives the tests their
-    reference, the same prompt in a single pass, which must produce the same logits as
-    the chunked run.
-
-    ``prefill_priority`` inverts the pass order to prompts before decode steps, the
-    policy vLLM shipped before chunked prefill and the baseline the benchmarks measure
-    against. Off by default: a prompt large enough to consume the budget then leaves
-    nothing for sequences a caller is already reading, so their next token waits for
-    the whole prompt. Kept reachable so the cost is measurable.
-    """
-
-    max_batched_tokens: int = 2048
-    max_sequences: int = 16
-    chunk_size: int = 512
-    enable_chunked_prefill: bool = True
+    max_batched_tokens: int = 2048     # compute budget: token-positions per pass
+    max_sequences: int = 16            # how many requests may be in flight
+    chunk_size: int = 512              # one prefill's share of an iteration
+    enable_chunked_prefill: bool = True  # off = the tests' single-pass reference
+    # Prompts before decodes: what vLLM shipped before chunked prefill, and the
+    # baseline the benchmarks measure against. Off by default -- a prompt large
+    # enough to consume the budget leaves nothing for sequences a caller is already
+    # reading. Kept reachable so the cost is measurable.
     prefill_priority: bool = False
 
     def __post_init__(self) -> None:
@@ -200,25 +172,19 @@ class SchedulerConfig:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
 
 
-# -------------------------------------------------------------- sampling params
-
+# --- 3. Sampling params ------------------------------------------------------
 
 @dataclass(frozen=True)
 class SamplingParams:
-    """One request's sampling configuration.
-
-    ``temperature=0`` means greedy. ``top_k=0`` and ``top_p=1.0`` both mean
-    "disabled", so the default is plain temperature-1 sampling over the full
-    distribution.
+    """One request's sampling configuration. temperature=0 is greedy; top_k=0 and
+    top_p=1.0 both mean disabled, so the default is plain temperature-1 sampling.
     """
 
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
-    # How many independent completions to draw for one prompt. `n > 1` is parallel
-    # sampling: the prompt is prefilled once and the n branches share its KV through a
-    # forked block table, diverging in physical memory only when one of them writes,
-    # which is where copy-on-write applies on the serving path.
+    # Completions per prompt. n > 1 prefills once and forks the block table, so the
+    # branches share KV until one writes -- copy-on-write on the serving path.
     n: int = 1
 
     def __post_init__(self) -> None:
@@ -236,28 +202,15 @@ class SamplingParams:
         return self.temperature == 0.0
 
 
-# ---------------------------------------------------------------- engine config
-
+# --- 4. Engine config --------------------------------------------------------
 
 @dataclass(frozen=True)
 class EngineConfig:
-    """Everything `LLM` accepts, as one frozen record.
+    """Everything LLM accepts, as one frozen record.
 
-    `LLM(model, **overrides)` builds one of these internally, so keyword arguments
-    and an explicit ``EngineConfig`` are the same thing; the dataclass exists so the
-    defaults live in exactly one place and a configuration can be logged, compared,
-    or replayed.
-
-    The knobs group as:
-
-    * memory — ``num_blocks`` (None sizes the pool to ``kv_fraction`` of free VRAM),
-      ``block_size`` (tokens per KV page), ``kv_cache_dtype`` ("fp8" halves page cost);
-    * scheduling — ``max_batched_tokens``, ``max_sequences``, ``chunk_size``,
-      ``enable_chunked_prefill``, ``prefill_priority``;
-    * features — ``enable_prefix_caching``, ``num_speculative_tokens`` with the
-      draft-model settings, ``use_cuda_kernels``;
-    * reproducibility — ``seed`` for the sampling generator (None leaves sampling on
-      the global RNG; greedy decoding is deterministic either way).
+    LLM(model, **overrides) builds one internally, so keyword arguments and an
+    explicit EngineConfig are the same thing; the dataclass exists so the defaults
+    live in one place and a configuration can be logged, compared, or replayed.
     """
 
     model: str = DEFAULT_MODEL_ID
@@ -265,9 +218,9 @@ class EngineConfig:
     dtype: torch.dtype | None = None
 
     # KV memory.
-    num_blocks: int | None = None
-    block_size: int = 16
-    kv_cache_dtype: str = "auto"
+    num_blocks: int | None = None  # None sizes the pool to kv_fraction of free VRAM
+    block_size: int = 16           # tokens per KV page
+    kv_cache_dtype: str = "auto"   # "fp8" halves the cost of a page
     kv_fraction: float = DEFAULT_KV_FRACTION
 
     # Scheduling.
@@ -285,7 +238,8 @@ class EngineConfig:
     draft_blocks: int | None = None
     use_cuda_kernels: bool = True
 
-    # Reproducibility.
+    # Reproducibility. None leaves sampling on the global RNG; greedy is
+    # deterministic either way.
     seed: int | None = None
 
     def __post_init__(self) -> None:

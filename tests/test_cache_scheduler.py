@@ -1,20 +1,12 @@
 """The paged KV cache and the continuous-batching scheduler.
 
-Four groups, ordered the way `cache.py` and `scheduler.py` are:
-
-* Bookkeeping: the block pool's reference counts, the block table's slot arithmetic,
-  the manager's capacity and release paths. Integers, no tensors, no GPU.
-* Copy-on-write and radix-tree prefix caching: forking is free, a write copies exactly
-  one page, a shared prefix is the *same physical page* and its KV is bit-for-bit what
-  was written.
-* The scheduler's policy: admission under budgets, chunked prefill, piggyback decoding,
-  iteration-level preemption. Still no tensors.
-* Identity: none of the above may change a single token. Batched, chunked, piggybacked
-  and preempted runs are compared token-for-token against single-sequence runs, on the
-  dense oracle and through the whole paged engine.
-
-Every test that allocates ends with a leak check: a leaked block is invisible until the
-pool runs dry thousands of iterations later, in whichever test ran last.
+Four groups, ordered the way cache.py and scheduler.py are: bookkeeping
+(refcounts, slot arithmetic, capacity -- integers, no GPU), copy-on-write and
+radix-tree prefix caching, the scheduler's policy, and identity, where batched,
+chunked, piggybacked and preempted runs are compared token-for-token against
+single-sequence runs. Every test that allocates ends with a leak check, since a
+leaked block is invisible until the pool runs dry thousands of iterations
+later.
 """
 
 from __future__ import annotations
@@ -66,8 +58,7 @@ def tokens(token_ids: list[int], **kwargs) -> Sequence:
     return Sequence(prompt_token_ids=list(token_ids), sampling_params=GREEDY, **kwargs)
 
 
-# ============================================================= the block pool
-
+# --- The block pool ----------------------------------------------------------
 
 def test_refcounts_allow_sharing_without_capacity():
     """Two holders of one block cost one block."""
@@ -115,8 +106,7 @@ def test_allocate_many_is_all_or_nothing():
     assert pool.num_free == 3, "a failed group allocation took blocks"
 
 
-# ============================================================ the block table
-
+# --- The block table ---------------------------------------------------------
 
 def test_the_slot_arithmetic():
     """position -> (block, offset) -> flat slot, through an out-of-order table."""
@@ -156,8 +146,7 @@ def test_copy_shares_blocks_without_touching_refcounts():
     assert forked.block_ids == (3, 5, 9)
 
 
-# ============================================== the manager: lifetime and CoW
-
+# --- The manager: lifetime and CoW -------------------------------------------
 
 @pytest.fixture
 def manager() -> Iterator[BlockManager]:
@@ -331,8 +320,7 @@ def test_speculative_trim_returns_spilled_pages(manager: BlockManager):
     manager.free(request)
 
 
-# ============================================= the paged-attention oracle seam
-
+# --- The paged-attention oracle seam -----------------------------------------
 
 def paged_batch(manager: BlockManager, requests, counts) -> ForwardBatch:
     for request, count in zip(requests, counts, strict=True):
@@ -496,8 +484,7 @@ def test_the_slot_mapping_covers_this_iteration_only():
     assert second.block_tables.tolist() == [[0, 1]]
 
 
-# =========================================================== the radix tree
-
+# --- The radix tree ----------------------------------------------------------
 
 def test_match_returns_the_longest_cached_prefix():
     cache = PrefixCache(block_size=4)
@@ -678,8 +665,7 @@ def test_no_leaks_across_two_thousand_cached_requests(caching_manager: BlockMana
     manager.check_no_leaks()
 
 
-# ============================================================== the FP8 pool
-
+# --- The FP8 pool ------------------------------------------------------------
 
 def test_an_fp8_pool_stores_e4m3_and_halves_the_bytes():
     fp8 = PagedKvPool(1, 4, 4, 2, 8, dtype=torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
@@ -737,8 +723,7 @@ def test_fp8_copy_on_write_copies_raw_bytes():
     manager.check_no_leaks()
 
 
-# ======================================================== the scheduler policy
-
+# --- The scheduler policy ----------------------------------------------------
 
 def test_admission_is_fcfs_and_bounded():
     scheduler = Scheduler(SchedulerConfig(max_sequences=2))
@@ -924,8 +909,7 @@ def test_scheduler_output_and_config_contracts():
             SchedulerConfig(**kwargs)
 
 
-# ================================================= identity on the dense oracle
-
+# --- Identity on the dense oracle --------------------------------------------
 
 @pytest.fixture
 def tiny_model(tiny_qwen3):
@@ -1035,8 +1019,7 @@ def test_chunking_does_not_change_the_number_of_tokens_computed(tiny_model):
         assert computed == len(prompt) + 3, f"chunk size {chunk_size}"
 
 
-# ============================================= identity through the paged engine
-
+# --- Identity through the paged engine ---------------------------------------
 
 class Engine:
     """The engine loop over a tiny model, without a tokenizer or a checkpoint.

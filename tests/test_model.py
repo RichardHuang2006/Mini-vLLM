@@ -1,18 +1,10 @@
 """The reference ops, the weight loader, and the three Qwen3 variants.
 
-The oracle chain, tested link by link:
-
-    HuggingFace transformers  ─▶  Qwen3 (dense)  ─▶  Qwen3Cached  ─▶  Qwen3Paged
-
-* The ops are checked against torch and against HuggingFace's own modules.
-* The loader's name mapping is checked total in both directions, and (with weights
-  downloaded) bitwise against the transformers state dict.
-* The dense model must match HF logits and greedy tokens on a tiny random model, with
-  no download; the cached model must match the dense one; the paged model must match
-  the cached one — all exactly, in fp32, on greedy tokens.
-
-Everything here runs on the CPU unless marked; `oracle` tests need the real
-Qwen3-0.6B checkpoint.
+The oracle chain tested link by link -- transformers against Qwen3, Qwen3
+against Qwen3Cached, Qwen3Cached against Qwen3Paged -- all exactly, in fp32, on
+greedy tokens, plus the ops against torch and the loader's name mapping checked
+total in both directions. Everything runs on the CPU unless marked; oracle
+tests need the real Qwen3-0.6B checkpoint.
 """
 
 from __future__ import annotations
@@ -47,8 +39,7 @@ from mini_vllm.scheduler import ForwardBatch, Sequence
 GREEDY = SamplingParams(temperature=0.0)
 
 
-# ------------------------------------------------------------- reference ops
-
+# --- Reference ops -----------------------------------------------------------
 
 def test_linear_matches_torch():
     x, w, bias = torch.randn(3, 5, 8), torch.randn(4, 8), torch.randn(4)
@@ -155,8 +146,7 @@ def test_paged_attention_gathered_rejects_causality_violations():
         )
 
 
-# ------------------------------------------------------------------ sampling
-
+# --- Sampling ----------------------------------------------------------------
 
 def test_greedy_rows_are_one_hot():
     logits = torch.randn(3, 50)
@@ -204,8 +194,7 @@ def test_dispatch_falls_back_on_cpu_tensors():
     assert_allclose(kernels.rmsnorm(x, weight, use_cuda=True), ops.rms_norm(x, weight))
 
 
-# ----------------------------------------------------------------- the loader
-
+# --- The loader --------------------------------------------------------------
 
 def test_the_name_mapping_is_total_in_both_directions(tiny_qwen3):
     """Every HF tensor is consumed or deliberately dropped; every local name is filled."""
@@ -259,8 +248,7 @@ def test_every_real_tensor_is_bitwise_equal_to_transformers():
         assert torch.equal(ours[name], reference[name]), f"{name} differs from transformers"
 
 
-# ----------------------------------------------------- dense model vs HF
-
+# --- Dense model vs HF -------------------------------------------------------
 
 def test_logits_match_hf_on_the_tiny_model(tiny_qwen3):
     """The dense model against HuggingFace's, same random weights, fp32, exact-ish."""
@@ -306,8 +294,7 @@ def test_real_logits_sit_within_the_bf16_drift_limit():
     assert_relative_error_below(model(ids), theirs, BF16_DRIFT_LIMIT)
 
 
-# ------------------------------------------------------- cached vs dense
-
+# --- Cached vs dense ---------------------------------------------------------
 
 def test_the_dense_cache_appends_like_concat():
     cache = DenseKvCache()
@@ -406,8 +393,7 @@ def test_the_generation_loops_agree(tiny_qwen3):
     )
 
 
-# -------------------------------------------------------- paged vs cached
-
+# --- Paged vs cached ---------------------------------------------------------
 
 def paged_from(tiny_qwen3, num_blocks: int = 64, block_size: int = 4) -> Qwen3Paged:
     config, weights = config_from_hf(tiny_qwen3), weights_from_hf(tiny_qwen3)
@@ -474,8 +460,7 @@ def test_a_self_draft_shares_weights_and_truncates_layers(tiny_qwen3):
     assert draft.manager is draft_manager
 
 
-# ------------------------------------------------------------ real weights
-
+# --- Real weights ------------------------------------------------------------
 
 @pytest.mark.oracle
 def test_real_greedy_generation_matches_transformers():

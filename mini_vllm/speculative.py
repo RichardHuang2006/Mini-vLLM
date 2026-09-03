@@ -1,44 +1,10 @@
 """Speculative decoding: free tokens that cost no accuracy.
 
-What this file teaches
-    The complete speculative-decoding loop, bottom-up:
-
-    1. `residual_distribution` — the corrective distribution `norm(relu(p - q))`.
-    2. `accept_proposals` — the rejection-sampling rule that preserves the
-       target's output distribution exactly.
-    3. `Proposal` / `DraftProposer` — the draft model, its own KV pool, its
-       shadow sequences, and the cache resynchronization after every verdict.
-    4. `SpeculativeDecoder` — one iteration: propose, verify in a single
-       target pass, commit the accepted prefix, roll back the rejected tail's
-       pages, and count what happened (`SpecStats`).
-
-Inputs and outputs
-    The proposer takes running `Sequence`s and returns `k` proposed tokens
-    plus the draft distributions `q` they were drawn from. The verifier takes
-    the target's `T x V` logits for the whole ragged iteration and returns,
-    per sequence, the run of tokens actually committed (1 to k+1 of them).
-
-Read next
-    `benchmark.py` — where acceptance rate and wall clock are measured.
-
-One invariant
-    The emitted tokens are distributed exactly as if the target model had
-    sampled them one at a time. A proposal is accepted with probability
-    `min(1, p/q)`; the first rejection draws once from `norm(relu(p - q))`
-    and discards everything after; a fully accepted run takes a bonus token
-    from `p_{k+1}`, which the same target pass already computed. The draft's
-    quality therefore affects only latency, never output — and at temperature
-    zero the same code path degenerates to "keep the prefix where the two
-    argmaxes agree", with no randomness, so greedy speculative output is
-    token-identical to greedy non-speculative output.
-
-Why this wins at all: a decode step reads every weight in the model to
-produce one token, so it is bound by memory bandwidth with the arithmetic
-units mostly idle. Reading the same weights to score `k + 1` tokens costs
-nearly the same, because scoring existing tokens is what attention
-parallelizes. If a cheap draft guesses `k` tokens and the target agrees with
-most of them, the engine gets several tokens per expensive pass instead of
-one.
+residual_distribution, accept_proposals, DraftProposer and SpeculativeDecoder:
+propose k tokens, verify them in a single target pass, commit the accepted
+prefix, and roll back the rejected tail's pages. The emitted tokens are
+distributed exactly as if the target had sampled them one at a time, so the
+draft's quality affects only latency, never output.
 """
 
 from __future__ import annotations
@@ -62,27 +28,19 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------- 1. residual distribution
-
+# --- 1. Residual distribution ------------------------------------------------
 
 class ResidualError(ValueError):
     """Raised when a residual distribution has no mass to sample from."""
 
 
 def residual_distribution(target: torch.Tensor, draft: torch.Tensor) -> torch.Tensor:
-    """``norm(relu(p - q))``: the target's belief minus what the draft already covered.
+    """norm(relu(p - q)): the target's belief minus what the draft already covered.
 
-    ::
-
-        target, draft: V     probabilities over the vocabulary
-        returns:       V     probabilities, summing to one
-
-    The clamp makes this a distribution rather than a signed difference. The mass before
-    renormalizing is `1 - Σ min(p, q)`, the exact shortfall the acceptance test leaves
-    behind, so this is the missing term rather than a heuristic repair: the probability
-    the acceptance step emits token `t` is `q(t)·min(1, p(t)/q(t)) = min(q(t), p(t))`,
-    and drawing the rejection case from the normalized `relu(p - q)` restores `p`
-    exactly. The test suite verifies this empirically with a chi-square test.
+    The clamp makes this a distribution rather than a signed difference. The mass
+    before renormalizing is 1 - sum(min(p, q)), the exact shortfall acceptance
+    leaves behind, so drawing the rejection case from it restores p exactly rather
+    than repairing it heuristically. The tests verify that with a chi-square.
     """
     residual = (target - draft).clamp_min(0.0)
     total = residual.sum()
@@ -103,8 +61,7 @@ def _draw(probabilities: torch.Tensor, generator: torch.Generator | None) -> int
     return int(torch.multinomial(probabilities, 1, generator=generator).item())
 
 
-# --------------------------------------------------- 2. rejection-sampling rule
-
+# --- 2. Rejection-sampling rule ----------------------------------------------
 
 def accept_proposals(
     target_probs: torch.Tensor,
@@ -113,39 +70,17 @@ def accept_proposals(
     generator: torch.Generator | None = None,
     greedy: bool = False,
 ) -> tuple[list[int], int]:
-    """Verify one sequence's proposals, returning the tokens to commit.
+    """Verify one sequence's proposals, returning (tokens, num_accepted).
 
-    The rule (Leviathan et al. 2023; Chen et al. 2023):
-
-    * Accept proposal `x_i` with probability `min(1, p_i(x_i) / q_i(x_i))`. A token the
-      target likes at least as much as the draft did is always kept; one it likes half
-      as much is kept half the time.
-    * On the first rejection, stop and draw one token from the residual
-      `norm(relu(p_i - q_i))`. Every later proposal is discarded — each was conditioned
-      on a token that is no longer there.
-    * If every proposal is accepted, take a bonus token from `p_{k+1}`, which the
-      target scored in the same forward pass.
-
-    ::
-
-        target_probs: (k + 1) x V   the target's distribution at each proposed position,
-                                    plus one more for the bonus
-        draft_probs:  k x V         the draft's distribution at each proposed position
+        target_probs: (k + 1) x V   per proposed position, plus one for the bonus
+        draft_probs:  k x V         the draft's distribution per position
         proposals:    k             the draft's tokens
-        returns:      (tokens, num_accepted)
 
-    ``tokens`` is what the sequence should append: the accepted prefix followed by either
-    the bonus token (nothing rejected) or the residual token (something rejected). Its
-    length is ``num_accepted + 1``, so a step always makes progress and never stalls.
-
-    ``num_accepted`` is reported separately because it is the speedup: `k` accepted
-    proposals turn `k + 1` target passes into one, while zero accepted means the draft
-    passes were spent for nothing. Its average over a run determines whether the draft
-    model pays for itself.
-
-    ``greedy=True`` is the explicit temperature-zero path: `p` and `q` are point
-    masses, so `p(x)/q(x)` is 1 when the argmaxes agree and 0 otherwise, and acceptance
-    reduces to keeping the prefix where the two models agree with no randomness.
+    The rule (Leviathan et al. 2023; Chen et al. 2023): accept x_i with probability
+    min(1, p_i/q_i); on the first rejection draw once from norm(relu(p_i - q_i)) and
+    discard every later proposal, each conditioned on a token no longer there; if
+    all are accepted take a bonus from p_{k+1}, scored in the same pass. greedy=True
+    is the temperature-zero path, keeping the prefix where the argmaxes agree.
     """
     if isinstance(proposals, torch.Tensor):
         proposals = [int(token) for token in proposals]
@@ -212,17 +147,14 @@ def accept_proposals(
     return accepted + [bonus], len(accepted)
 
 
-# ------------------------------------------------- 3. proposal representation
-
+# --- 3. Proposal representation ----------------------------------------------
 
 @dataclass
 class Proposal:
     """What a draft produced for one sequence, and the distributions it drew from.
-
-    ``probabilities`` is the `q` of the acceptance rule, and must be the distribution the
-    token was actually sampled from: the draft's logits after the request's temperature
-    and top-p, not the raw softmax. The rejection test compares `p/q` and is exact only
-    if `q` is the true proposal distribution.
+    probabilities is the q of the acceptance rule and must be what the token was
+    actually sampled from -- the draft's logits after the request's temperature and
+    top-p, not the raw softmax -- since the p/q test is exact only then.
     """
 
     token_ids: list[int]
@@ -232,31 +164,18 @@ class Proposal:
         return len(self.token_ids)
 
 
-# ------------------------------------------- 4. the draft model and its state
-
+# --- 4. The draft model and its state ----------------------------------------
 
 class DraftProposer:
     """A draft model, its own KV pool, and one shadow sequence per request in flight.
 
-    The proposer runs a smaller model forward `k` times to guess what the target will
-    say. Two constraints shape the implementation.
-
-    The draft keeps its own KV cache. It is a different model over the same tokens, so
-    its keys and values are its own, in its own pool with its own block tables. The
-    shadow sequences hold those tables: one per target sequence, carrying the same
-    tokens and a separate count of how many the draft has computed.
-
-    The draft must be resynchronized every step, and is not always behind by one. The
-    target accepts some prefix of the proposals and replaces the rest, so after
-    verification the draft's cache holds tokens the sequence no longer contains.
-    :meth:`_synchronize` finds the first divergence, returns the pages past it, and
-    lets the next forward pass recompute from there. Skipping this fails *silently*:
-    the draft would propose from a context including rejected tokens, acceptance would
-    collapse, and rejection sampling would still produce correct output, only slower.
-
-    The `k` proposals cost `k` sequential forward passes. They are cheap passes over a
-    small model and are batched across every sequence in flight, so the cost is `k`
-    launches rather than `k` times the batch size.
+    Two constraints shape it. The draft keeps its own KV cache, being a different
+    model over the same tokens, so the shadow sequences hold its block tables. And
+    it must be resynchronized every step, not always by one: the target accepts some
+    prefix of the proposals and replaces the rest, so _synchronize finds the first
+    divergence and returns the pages past it. Skipping that fails silently -- the
+    draft would propose from a context including rejected tokens, acceptance would
+    collapse, and the output would still be correct, only slower.
     """
 
     def __init__(
@@ -275,8 +194,7 @@ class DraftProposer:
         self.device = manager.kv.device
         self._shadows: dict[int, Sequence] = {}
 
-    # ---------------------------------------------------------------- lifecycle
-
+    # ------------------------------------------------------------- lifecycle
     def release(self, sequence: Sequence) -> None:
         """Drop a finished sequence's draft cache. Called when the target frees it."""
         shadow = self._shadows.pop(sequence.seq_id, None)
@@ -308,12 +226,10 @@ class DraftProposer:
             self._shadows[sequence.seq_id] = shadow
         return shadow
 
-    # ----------------------------------------- 5. draft-cache synchronization
-
+    # ------------------------------------------- draft-cache synchronization
     def _synchronize(self, sequence: Sequence, shadow: Sequence) -> None:
-        """Bring the shadow's tokens and cache in line with what the target committed.
-
-        The draft's cache is valid exactly as far as the two agree. Past the first
+        """Bring the shadow's tokens and cache in line with what the target committed. The
+        draft's cache is valid exactly as far as the two agree; past the first
         divergence it describes a sequence that no longer exists, so those pages are
         returned and the next forward pass recomputes from there.
         """
@@ -332,17 +248,13 @@ class DraftProposer:
 
         shadow.output_token_ids = list(sequence.output_token_ids)
 
-    # --------------------------------------------------- 6. proposal generation
-
+    # --------------------------------------------------- proposal generation
     @torch.no_grad()
     def propose(self, sequences: list[Sequence]) -> dict[int, Proposal]:
-        """Run `k` batched draft decodes, returning one proposal per sequence.
-
-        The first pass does double duty. A shadow that is behind — freshly created with
-        its whole prompt uncomputed, or resynchronized after a rejection — folds its
-        catch-up into the same forward that produces the first proposal, since the logits
-        at the end of a catch-up chunk are the next token's distribution. `k` proposals
-        therefore cost `k` passes, never `k + 1`.
+        """Run k batched draft decodes, returning one proposal per sequence. The first pass
+        does double duty: a shadow that is behind folds its catch-up into the same
+        forward that produces the first proposal, since the logits at the end of a
+        catch-up chunk are the next token's distribution. So k proposals cost k passes.
         """
         if not sequences:
             return {}
@@ -393,22 +305,17 @@ class DraftProposer:
         }
 
     def _draw(self, probabilities: torch.Tensor, params) -> list[int]:
-        """One token per row, from the distributions the proposals must record.
-
-        Sampled from `probabilities` rather than by calling the sampler again on the
-        logits, so the token and the `q` handed to the verifier cannot disagree; that
-        disagreement would break the acceptance test silently.
+        """One token per row, sampled from probabilities rather than by calling the sampler
+        again on the logits, so the token and the q handed to the verifier cannot
+        disagree -- a disagreement that would break the acceptance test silently.
         """
         if all(parameter.is_greedy for parameter in params):
             return probabilities.argmax(dim=-1).tolist()
         return torch.multinomial(probabilities, 1).squeeze(-1).tolist()
 
     def _forward(self, shadows: list[Sequence]) -> torch.Tensor:
-        """One ragged draft pass over whatever each shadow has left to compute.
-
-        ::
-
-            returns: N x V   the last row of each shadow, its next-token distribution
+        """One ragged draft pass over whatever each shadow has left to compute, returning
+        N x V: the last row of each shadow, its next-token distribution.
         """
         scheduled = [(shadow, shadow.num_uncomputed_tokens) for shadow in shadows]
         for shadow, count in scheduled:
@@ -422,22 +329,15 @@ class DraftProposer:
         return logits
 
 
-# ---------------------------------------- 7-11. verification and rollback
-
+# --- 5. Verification and rollback --------------------------------------------
 
 class SpeculativeDecoder:
     """Wraps a target model and a draft proposer into one verified decode step.
 
-    The ordering of a speculative iteration (driven by `engine.LLM._speculative_step`)
-    is forced:
-
-    1. Propose, *before* the scheduler runs, because proposals lengthen a sequence and
-       the scheduler must reserve slots for them.
-    2. Verify with `all_rows=True`, because the target's distribution is needed at
-       every proposed position rather than only the last.
-    3. Accept, per sequence, by the rejection rule.
-    4. Roll back in the same iteration, returning the pages the rejected tail no longer
-       needs, so no page is ever held by a token that does not exist.
+    The ordering is forced: propose before the scheduler runs, because proposals
+    lengthen a sequence and it must reserve slots for them; verify with
+    all_rows=True; accept per sequence; and roll back in the same iteration, so no
+    page is ever held by a token that does not exist.
     """
 
     def __init__(self, proposer: DraftProposer, model, manager, runner=None) -> None:
@@ -452,12 +352,10 @@ class SpeculativeDecoder:
         return self.proposer.num_speculative_tokens
 
     def candidates(self, sequences: list[Sequence]) -> list[Sequence]:
-        """Which sequences can be speculated for this iteration.
-
-        Only sequences past their prefill. There is nothing to speculate from until a
-        prompt is computed, and a chunked prefill's later chunks already keep the GPU
-        busy, so speculating on top of them would add draft passes to an iteration that
-        was not bandwidth-starved.
+        """Which sequences can be speculated for this iteration: only those past their
+        prefill. There is nothing to speculate from until a prompt is computed, and a
+        chunked prefill's later chunks already keep the GPU busy, so speculating on top
+        of them would add draft passes to an iteration that was not bandwidth-starved.
         """
         return [
             sequence
@@ -482,17 +380,12 @@ class SpeculativeDecoder:
         logits: torch.Tensor,
         generator: torch.Generator | None = None,
     ) -> list[tuple[Sequence, list[int]]]:
-        """Judge every proposal from one `T x V` target pass, committing what survives.
+        """Judge every proposal from one T x V target pass, committing what survives.
 
-        ``logits`` covers all `T` tokens of the iteration, so a sequence's `k + 1`
-        distributions are the `k + 1` consecutive rows it contributed. Row `i` is the
-        target's distribution for the token following position `i`, so the rows aligned
-        with a sequence's pending token and its `k` proposals are exactly the `k + 1`
-        distributions the acceptance rule needs.
-
-        Commits through `Sequence.accept` (which truncates at a stop token) and rolls
-        back the rejected tail's cache slots through `manager.trim` in the same
-        iteration.
+        logits covers all T tokens of the iteration, and row i is the target's
+        distribution for the token following position i, so the rows aligned with a
+        sequence's pending token and its k proposals are exactly the k + 1 the rule
+        needs. Rolls the rejected tail's slots back through manager.trim.
         """
         emitted: list[tuple[Sequence, list[int]]] = []
         row = 0
@@ -536,8 +429,7 @@ class SpeculativeDecoder:
         self.proposer.release(sequence)
 
 
-# ------------------------------------------------- 12. acceptance statistics
-
+# --- 6. Acceptance statistics ------------------------------------------------
 
 @dataclass
 class SpecStats:
@@ -552,11 +444,10 @@ class SpecStats:
 
     @property
     def acceptance_rate(self) -> float:
-        """Fraction of proposals the target kept. The number that decides `k`.
-
-        Below roughly `1/(k+1)` the draft is not paying for its own forward passes and
-        speculation is a slowdown; near 1 a larger `k` would do better. It is a property
-        of the draft-target pair and the text, not of this code.
+        """Fraction of proposals the target kept: the number that decides k. Below roughly
+        1/(k+1) the draft is not paying for its own forward passes and speculation is a
+        slowdown; near 1 a larger k would do better. It is a property of the
+        draft-target pair and the text, not of this code.
         """
         return self.accepted / self.proposed if self.proposed else 0.0
 

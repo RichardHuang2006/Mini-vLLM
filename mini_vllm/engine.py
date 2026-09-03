@@ -1,49 +1,11 @@
-"""The engine: request admission, the iteration loop, and the one import a
-caller needs.
+"""The engine: request admission, the iteration loop, and the one import a caller
+needs.
 
-What this file teaches
-    How the pieces become a serving engine, in three layers:
-
-    1. *Reference generation loops* — `generate_ids` (recompute everything,
-       quadratic) and `generate_ids_cached` (prefill once, then one token per
-       step). These are the oracles the engine is diffed against; the serving
-       path never calls `transformers.generate()`, which exists in the tests
-       and benchmarks purely as an external correctness and speed reference.
-    2. `PagedModelRunner` — executes one scheduler decision as one ragged
-       forward pass: reserve pages, build the batch, forward, sample.
-    3. `LLM` — the public API: `add_request`, `step()`, `generate`,
-       `generate_stream`, with prefix caching, FP8 KV, CUDA kernels,
-       parallel sampling, and speculative decoding wired in.
-
-    What each piece contributes to one iteration:
-
-    * `scheduler.Scheduler` decides which sequences run and how many tokens
-      each contributes.
-    * `cache.BlockManager` backs that decision with pages, and refuses it
-      when it cannot.
-    * `PagedModelRunner` turns it into a single ragged forward pass.
-    * `model.Qwen3Paged` runs the 28 layers against the pool.
-    * `ops.sample` picks a token per sequence; the tokenizer turns them back
-      into text.
-
-Inputs and outputs
-    Prompts (strings or token-id lists) and `config.SamplingParams` in;
-    `Completion`s or a stream of `StreamUpdate`s out.
-
-Read next
-    `speculative.py` — the draft/verify loop `step()` switches to when
-    `num_speculative_tokens > 0`.
-
-One invariant
-    `step()` advances every request in flight by exactly one iteration; there
-    is no per-request loop anywhere in this file. And `generate` is
-    implemented *on top of* `generate_stream` rather than beside it, so the
-    batch API is the streaming API drained and the two cannot drift apart
-    token for token.
-
-Runnable example
-    python -m mini_vllm.engine "The capital of France is" --max-tokens 32
-    python -m mini_vllm.engine "Explain KV caching" --stream --temperature 0.8
+Three layers: the reference generation loops the serving path is diffed
+against, PagedModelRunner executing one scheduler decision as one ragged
+forward pass, and LLM, the public API. step() advances every request in flight
+by exactly one iteration, and generate is generate_stream drained, so the batch
+and streaming APIs cannot drift apart.
 """
 
 from __future__ import annotations
@@ -85,7 +47,8 @@ __all__ = [
 DEFAULT_MAX_TOKENS = 32
 
 
-# ==================================================== reference generation
+# --- 1. Reference generation -------------------------------------------------
+
 #
 # The slow, obviously correct generation loops. `generate_ids` re-runs all 28 layers
 # over the entire prefix every step, so generating token 100 redoes the work of tokens
@@ -163,16 +126,10 @@ def generate_ids(
     eos_token_ids: SequenceABC[int] = (),
     pad_token_id: int | None = None,
 ) -> torch.Tensor:
-    """Greedy decode with no cache, returning the prompt plus generated tokens.
-
-    ::
-
-        input_ids: B x L      ->  B x (L + generated)
-
-    Stops once every row has produced a stop token. Rows that finish early are filled
-    with ``pad_token_id`` to keep the batch rectangular, matching HuggingFace. It is also
-    why the serving layer abandons rectangular batches: with 16 sequences of widely
-    differing lengths, most of a padded batch is wasted work.
+    """Greedy decode with no cache: input_ids [B, L] -> [B, L + generated]. Rows that
+    finish early are filled with pad_token_id to keep the batch rectangular,
+    matching HuggingFace -- and that padding is why the serving layer abandons
+    rectangular batches.
     """
     if input_ids.ndim != 2:
         raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
@@ -209,16 +166,10 @@ def generate_ids_cached(
     pad_token_id: int | None = None,
     caches: list | None = None,
 ) -> torch.Tensor:
-    """Greedy decode with a KV cache: prefill once, then one token per step.
-
-    ::
-
-        prefill: the whole prompt at offset 0   -> first token, cache holds len(prompt)
-        decode:  one token at offset = prev_len -> next token, cache grows by 1
-
-    Structurally identical to the naive loop except that it feeds `next_tokens` back in
-    rather than the whole sequence. The caches carry the position, so nothing here tracks
-    an offset by hand.
+    """Greedy decode with a KV cache: prefill the whole prompt at offset 0, then one
+    token per step. Structurally identical to the naive loop except that it feeds
+    next_tokens back in rather than the whole sequence; the caches carry the
+    position, so nothing here tracks an offset by hand.
     """
     if input_ids.ndim != 2:
         raise ValueError(f"expected B x L input ids, got shape {tuple(input_ids.shape)}")
@@ -252,23 +203,15 @@ def generate_ids_cached(
     return tokens
 
 
-# ========================================================= the paged runner
-
+# --- 2. The paged runner -----------------------------------------------------
 
 class PagedModelRunner:
     """Runs one iteration: reserve pages, build the ragged batch, forward, sample.
 
-    The replacement for `scheduler.DenseModelRunner`. The dense runner issues one
-    forward pass per scheduled sequence, since a `B x H x S x D` cache cannot hold two
-    sequences of different lengths. This one builds a single ragged `ForwardBatch` and
-    runs one pass for the whole iteration: a 512-token prefill chunk and eleven decode
-    steps together.
-
-    Ordering inside `execute` matters. Blocks are reserved before the batch is built,
-    because `slot_mapping` holds physical addresses and there is nothing to address
-    until the pages exist. The scheduler has already checked capacity, so the
-    reservation is expected to succeed; a failure means the scheduler and the pool have
-    disagreed, and it propagates rather than being absorbed.
+    The replacement for scheduler.DenseModelRunner, which issues one pass per
+    sequence. Ordering inside execute matters: blocks are reserved before the batch
+    is built, because slot_mapping holds physical addresses and there is nothing to
+    address until the pages exist.
     """
 
     def __init__(self, model, manager: BlockManager, device: torch.device | str | None = None):
@@ -277,17 +220,9 @@ class PagedModelRunner:
         self.device = torch.device(device) if device else manager.kv.device
 
     def execute(self, output, all_rows: bool = False) -> torch.Tensor:
-        """One forward pass over the whole scheduled batch.
-
-        ::
-
-            returns: num_scheduled x V   (each sequence's last computed position)
-                     total_tokens  x V   when `all_rows`
-
-        `all_rows` is for speculative verification, which needs the target's
-        distribution at every proposed position rather than only the last. Off
-        otherwise: the LM head is a `V`-wide matmul and a prefill chunk's interior rows
-        have no use for it.
+        """One forward pass over the whole scheduled batch, returning num_scheduled x V --
+        each sequence's last computed position -- or total_tokens x V with all_rows,
+        which speculative verification needs.
         """
         for sequence, count in output.scheduled:
             self.manager.allocate(sequence, count)
@@ -307,13 +242,10 @@ class PagedModelRunner:
         logits: torch.Tensor,
         generator: torch.Generator | None = None,
     ) -> list[int]:
-        """One token per scheduled sequence, honouring per-row sampling parameters.
-
-        Rows belonging to a chunk that has not reached the end of its prompt are
-        sampled and then discarded by `Scheduler.commit`: one wasted row of an
-        already-batched sample instead of a branch in the hot path. Slicing the logits
-        down to the finishing sequences first would cost a device synchronization to
-        determine which those are.
+        """One token per scheduled sequence, honouring per-row parameters. Rows from a
+        chunk that has not reached the end of its prompt are sampled and discarded by
+        Scheduler.commit: one wasted row instead of a branch in the hot path, since
+        slicing the logits first would cost a device synchronization.
         """
         params = [sequence.sampling_params for sequence, _ in output.scheduled]
         if all(parameter.is_greedy for parameter in params):
@@ -325,8 +257,7 @@ class PagedModelRunner:
         self.manager.free(sequence)
 
 
-# ========================================================== the public API
-
+# --- 3. The public API -------------------------------------------------------
 
 @dataclass(frozen=True)
 class Completion:
@@ -348,12 +279,10 @@ class Completion:
 
 @dataclass(frozen=True)
 class StreamUpdate:
-    """One token, as it is produced.
-
-    `index` is the position of the prompt in the list handed to `generate_stream`, not
-    the sequence id: under continuous batching requests finish out of order and in
-    interleaved pieces, so the caller needs to know which of its prompts a token
-    belongs to.
+    """One token, as it is produced. index is the position of the prompt in the list
+    handed to generate_stream, not the sequence id: under continuous batching
+    requests finish out of order and interleaved, so the caller needs to know which
+    of its prompts a token belongs to.
     """
 
     index: int
@@ -397,25 +326,13 @@ class EngineStats:
 class LLM:
     """A paged-attention inference engine for Qwen3.
 
-    ::
-
         llm = LLM("Qwen/Qwen3-0.6B")
         completions = llm.generate(prompts, max_tokens=64)
 
-    Configuration is one `config.EngineConfig`. Keyword arguments are a convenience
-    that builds one::
-
-        LLM("Qwen/Qwen3-0.6B", enable_prefix_caching=True, kv_cache_dtype="fp8")
-        LLM(config=EngineConfig(num_speculative_tokens=4))    # the same thing
-
-    Two defaults decide how many requests can be in flight:
-
-    * `num_blocks` defaults to as many pages as fit in `kv_fraction` of the memory free
-      once the weights are loaded. At 16 tokens a page and Qwen3-0.6B's 8 KV heads over
-      28 layers a page is 448 KB, so the pool holds thousands of pages and the request
-      count is bounded by the pool rather than by a configured maximum.
-    * `max_batched_tokens` is the compute budget per iteration; `chunk_size` bounds any
-      single prefill's share of it.
+    Configuration is one config.EngineConfig; keyword arguments build one. num_blocks
+    defaults to as many pages as fit in kv_fraction of the memory free once the
+    weights are loaded, so the request count is bounded by the pool rather than by a
+    configured maximum, and max_batched_tokens is the compute budget per iteration.
     """
 
     def __init__(
@@ -496,25 +413,13 @@ class LLM:
     def _build_speculation(self, config: EngineConfig) -> SpeculativeDecoder:
         """Stand up the draft model and the KV pool it needs of its own.
 
-        Two kinds of draft, chosen by available memory.
-
-        A separate checkpoint (`draft_model=...`) is the standard arrangement and the
-        only one that is faster: a genuinely smaller model agrees with the target often
-        and costs a fraction of it per token. It also costs a second set of weights, so
-        on an 8 GB card it means a small draft against a larger target — Qwen3-0.6B
-        drafting for Qwen3-1.7B fits, two 1.7Bs do not.
-
-        A self-draft (the default) is this model's own first `num_draft_layers`, sharing
-        every weight tensor and adding no weights. It cannot be faster: a shallow prefix
-        of Qwen3-0.6B is too weak for its proposals to be accepted (a 4-layer draft is
-        rejected essentially always) and a deep one costs nearly what the target costs.
-        It exercises the whole mechanism on hardware with no room for a second model,
-        and at full depth it gives the strongest correctness statement available:
-        acceptance 1.0 with output identical to no speculation.
-
-        Either way the draft keeps its own keys and values, since a different model over
-        the same tokens has different KV, so a second pool is built here at the draft's
-        layer count rather than the target's.
+        Two kinds, chosen by available memory. A separate checkpoint is the standard
+        arrangement and the only one that is faster, at the cost of a second set of
+        weights. A self-draft (the default) is this model's own first num_draft_layers,
+        sharing every weight tensor: it cannot be faster, a shallow prefix being too
+        weak to be accepted and a deep one costing nearly what the target costs, but it
+        exercises the mechanism where there is no room for a second model, and at full
+        depth gives acceptance 1.0 with output identical to no speculation.
         """
         if config.draft_model is not None:
             weights, draft_config = load_weights(
@@ -566,8 +471,7 @@ class LLM:
         proposer = DraftProposer(drafter, draft_manager, num_speculative_tokens=k)
         return SpeculativeDecoder(proposer, self.model, self.manager, runner=self.runner)
 
-    # ------------------------------------------------------------------- sizing
-
+    # ---------------------------------------------------------------- sizing
     @staticmethod
     def blocks_that_fit(
         config,
@@ -576,12 +480,9 @@ class LLM:
         fraction: float,
         kv_dtype: torch.dtype | None = None,
     ) -> int:
-        """How many pages fit in `fraction` of what is free right now.
-
-        Measured after the weights are resident, so this is memory actually available
-        rather than the card's capacity: the difference is 1.2 GB for this model, which
-        on an 8 GB laptop GPU dominates the result. An FP8 cache halves the per-page
-        cost, so the same budget buys twice the pages.
+        """How many pages fit in fraction of what is free right now. Measured after the
+        weights are resident, so this is memory actually available rather than the
+        card's capacity -- a 1.2 GB difference for this model.
         """
         per_block = PagedKvPool.bytes_for(
             num_layers=config.num_hidden_layers,
@@ -611,13 +512,10 @@ class LLM:
     def reconfigure(self, **changes) -> None:
         """Swap the scheduling policy between runs, keeping the weights and the pool.
 
-        For the benchmarks' A/B, where the same request set is replayed under chunked
-        prefill and under a prefill-prioritized baseline. Loading the model twice to
-        flip one boolean would double the resident weights and halve the pool the second
-        engine sizes itself against, so the two runs would differ in more than policy.
-
-        Between runs only: the queues must be empty, since a sequence mid-prefill was
-        chunked under a policy that is about to be replaced.
+        For the benchmarks' A/B. Loading the model twice to flip one boolean would
+        double the resident weights and halve the pool the second engine sizes itself
+        against, so the runs would differ in more than policy. Between runs only: the
+        queues must be empty.
         """
         if self.scheduler.num_unfinished:
             raise ValueError(
@@ -626,8 +524,7 @@ class LLM:
             )
         self.scheduler = Scheduler(replace(self.scheduler.config, **changes), manager=self.manager)
 
-    # ---------------------------------------------------------------- admission
-
+    # ------------------------------------------------------------- admission
     def add_request(
         self,
         prompt: str | SequenceABC[int],
@@ -635,12 +532,10 @@ class LLM:
         max_tokens: int = 16,
         ignore_eos: bool = False,
     ) -> Sequence:
-        """Tokenize (if needed), wrap in a `Sequence`, and enqueue it.
-
-        `ignore_eos` exists for the benchmarks: a request that stops early has done less
-        work than the one it is compared against, and a throughput figure over a run
-        where some requests quit at token 9 and others at 64 measures the prompts rather
-        than the engine.
+        """Tokenize (if needed), wrap in a Sequence, and enqueue it. ignore_eos exists for
+        the benchmarks: a request that stops early has done less work than the one it is
+        compared against, and a throughput figure over a run where some requests quit at
+        token 9 and others at 64 measures the prompts rather than the engine.
         """
         if isinstance(prompt, str):
             token_ids = self.tokenizer(prompt).input_ids
@@ -659,15 +554,12 @@ class LLM:
         self.stats.prompt_tokens += len(token_ids)
         return sequence
 
-    # --------------------------------------------------------------- the loop
-
+    # -------------------------------------------------------------- the loop
     def step(self) -> list[tuple[Sequence, int]]:
-        """Advance every sequence in flight by one iteration.
-
-        Returns the `(sequence, token)` pairs that produced a token, which is not the
-        set of sequences that ran: a prefill chunk stopping mid-prompt computed logits
-        for a position the prompt already answers, and sampling from those would invent
-        a token the request did not ask for.
+        """Advance every sequence in flight by one iteration, returning the
+        (sequence, token) pairs that produced a token -- not the set that ran. A prefill
+        chunk stopping mid-prompt computed logits for a position the prompt already
+        answers.
         """
         if self.spec is not None:
             return self._speculative_step()
@@ -705,16 +597,11 @@ class LLM:
     def _speculative_step(self) -> list[tuple[Sequence, int]]:
         """One iteration with a draft model in front of the target.
 
-        Differs from the ordinary step in three places, the first two ordered by
-        necessity. Proposals are drafted before `schedule`, because they lengthen a
-        sequence and the scheduler must reserve pages for them. The target then runs with
-        `all_rows=True`, because verification needs its distribution at every proposed
-        position. Finally a sequence emits between 1 and `k + 1` tokens rather than one.
-
-        Proposals the scheduler could not fit this iteration are discarded rather than
-        carried over: `q` was computed for a context the next iteration may not share,
-        and re-drafting costs one cheap pass while verifying against a stale `q` is
-        wrong.
+        Differs in three places, the first two ordered by necessity: proposals are
+        drafted before schedule, the target runs with all_rows=True, and a sequence
+        emits between 1 and k + 1 tokens. Proposals the scheduler could not fit are
+        discarded rather than carried over -- q was computed for a context the next
+        iteration may not share.
         """
         spec = self.spec
         assert spec is not None  # only reached when speculation is configured
@@ -783,12 +670,9 @@ class LLM:
 
     def _fork_after_prefill(self, output, logits: torch.Tensor) -> list[Sequence]:
         """Spawn a parallel-sampling request's remaining branches once it has prefilled.
-
-        A request with ``n > 1`` is admitted as a single leader and prefilled once. When
-        that prefill completes, the logits row that gave the leader its first token is
-        sampled ``n - 1`` more times, and each draw becomes a branch sharing the prompt's
-        KV through the block manager's fork: no prompt is recomputed, and no page is
-        copied until a branch writes past the shared prefix.
+        The logits row that gave the leader its first token is sampled n - 1 more times,
+        and each draw becomes a branch sharing the prompt's KV through the manager's
+        fork: no prompt is recomputed, and no page is copied until a branch writes.
         """
         children: list[Sequence] = []
         for row, (sequence, _count) in enumerate(output.scheduled):
@@ -821,14 +705,10 @@ class LLM:
     ) -> Iterator[StreamUpdate]:
         """Yield each token as it is produced, across all prompts, interleaved.
 
-        Interleaved because the engine runs all prompts at once: ordering prompt 0's
-        tokens ahead of prompt 1's would require buffering one to deliver the other.
-        Each update names the prompt it belongs to.
-
         An update's text is the delta, computed by re-decoding the whole output and
-        taking the new suffix rather than decoding the single token. A token is not a
-        character: the two-token sequence for a byte pair in an emoji decodes to nothing
-        and then to the emoji, so per-token decoding would emit replacement characters.
+        taking the new suffix rather than decoding the single token: a token is not a
+        character, and the two-token sequence for a byte pair in an emoji decodes to
+        nothing and then to the emoji.
         """
         prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
         sequences = self._admit(prompt_list, sampling_params, max_tokens, ignore_eos)
@@ -909,18 +789,10 @@ class LLM:
         skip_special_tokens: bool = True,
         ignore_eos: bool = False,
     ) -> list[Completion]:
-        """Run every prompt to completion and return them in the order given.
-
-        In the order given, though they did not finish in that order: a 20-token request
-        admitted beside a 500-token one finishes 480 iterations earlier, and reassembling
-        that is what a batch API exists to do.
-
-        A prompt requested with ``n > 1`` yields ``n`` completions, contiguous and in
-        sample order, before the next prompt's. The return length is therefore the sum of
-        the requested ``n``, one per prompt under the default ``n == 1``.
-
-        The body is the streaming API drained, which is what a caller of the stream would
-        write anyway and makes agreement between the two APIs hold by construction.
+        """Run every prompt to completion and return them in the order given, though they
+        did not finish in it. A prompt requested with n > 1 yields n completions,
+        contiguous and in sample order. The body is the streaming API drained, which
+        makes agreement between the two hold by construction.
         """
         prompt_list = [prompts] if isinstance(prompts, str) else list(prompts)
 
@@ -961,8 +833,7 @@ class LLM:
                 )
         return completions
 
-    # ------------------------------------------------------------------ helpers
-
+    # --------------------------------------------------------------- helpers
     def _admit(
         self,
         prompts: Iterable[str],
@@ -1008,8 +879,7 @@ class LLM:
         )
 
 
-# ============================================================== CLI demo
-
+# --- 4. CLI demo -------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(

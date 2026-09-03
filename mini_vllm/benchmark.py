@@ -1,56 +1,11 @@
 """The benchmark harness: evidence for every performance claim in the README.
 
-What this file teaches
-    How to measure a GPU inference engine without fooling yourself. Three ways
-    a GPU benchmark reports the wrong number, all handled here:
-
-    * Asynchronous launches. CUDA calls return before the work finishes, so a
-      naive timer measures how fast Python enqueues kernels. Every timed
-      region is bracketed by `torch.cuda.synchronize()`.
-    * A cold first iteration. Allocator growth, cuBLAS autotuning and JIT
-      loading land on whichever iteration runs first, so there is a warmup.
-    * A throttled GPU. A card parked in a low power state runs 30x slow.
-      `ClockSampler` watches the clocks during every run and the report warns
-      when they were far below maximum, which voids the numbers.
-
-    Every mode prints one uniform evidence header (hardware, model, dtype,
-    batch, prompt lengths, output tokens, warmup, metric) so a result can be
-    reproduced or disqualified from the transcript alone.
-
-The modes, one per claim:
-
-    single       TTFT and decode tok/s for one request (optionally vs
-                 transformers, optionally the uncached quadratic loop)
-    kernels      achieved memory bandwidth per CUDA kernel vs the PyTorch it
-                 replaces, with a copy_ ceiling and an L2-size caveat
-    throughput   output tok/s over a whole request set by concurrency, vs
-                 transformers.generate on one padded rectangle
-    scheduler    decode-latency tails under an adversarial mix: chunked
-                 prefill vs the prefill-priority baseline on one Poisson
-                 arrival schedule
-    prefix-cache TTFT with the radix tree on and off, shared-preamble workload
-    fp8          KV pages per budget and greedy agreement, FP8 vs BF16 cache
-    spec         speculative decoding acceptance and wall clock by draft depth
-
-Read next
-    The tests — the correctness side of the same evidence.
-
-One invariant
-    A number is only reported alongside the conditions that produced it, and a
-    run whose GPU was observed throttled says so in the same breath. Prefill
-    and decode are always reported separately: TTFT is compute-bound, decode
-    is memory-bound, and an optimization typically helps one and not the
-    other, so a single average hides the effect.
-
-Run it::
-
-    python -m mini_vllm.benchmark --mode single --compare hf --use-cuda-kernels
-    python -m mini_vllm.benchmark --mode kernels
-    python -m mini_vllm.benchmark --mode throughput --batch-sizes 1,4,16,32 --compare hf
-    python -m mini_vllm.benchmark --mode scheduler --num-requests 2000
-    python -m mini_vllm.benchmark --mode prefix-cache
-    python -m mini_vllm.benchmark --mode fp8
-    python -m mini_vllm.benchmark --mode spec --draft-layers 4,14,28
+How to measure a GPU inference engine without fooling yourself -- every timed
+region is bracketed by torch.cuda.synchronize(), warmed up first, and watched
+by ClockSampler, which voids a run whose clocks were throttled. One mode per
+claim (single, kernels, throughput, scheduler, prefix-cache, fp8, spec), each
+printing a uniform evidence header so a result can be reproduced or
+disqualified from the transcript alone.
 """
 
 from __future__ import annotations
@@ -114,8 +69,7 @@ STRESS_LONG_EVERY = 20
 STRESS_OUTPUT_LEN = 32
 
 
-# ------------------------------------------------------------------- gpu state
-
+# --- 1. GPU state ------------------------------------------------------------
 
 @dataclass(frozen=True)
 class GpuState:
@@ -267,8 +221,7 @@ def evidence_header(
     print()
 
 
-# ------------------------------------------------------------- shared plumbing
-
+# --- 2. Shared plumbing ------------------------------------------------------
 
 def _synchronize(device: torch.device) -> None:
     if device.type == "cuda":
@@ -307,8 +260,7 @@ def percentile(values: SequenceABC[float], fraction: float) -> float:
     return ordered[index]
 
 
-# ================================================================= mode: single
-
+# --- 3. Mode: single ---------------------------------------------------------
 
 def mode_single(args) -> None:
     """One request: TTFT and decode tok/s, optionally vs transformers.
@@ -407,8 +359,7 @@ def mode_single(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# ================================================================ mode: kernels
-
+# --- 4. Mode: kernels --------------------------------------------------------
 
 @dataclass(frozen=True)
 class BandwidthResult:
@@ -739,8 +690,7 @@ def mode_kernels(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# ============================================================= mode: throughput
-
+# --- 5. Mode: throughput -----------------------------------------------------
 
 def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
     """`num_requests` prompts whose lengths cycle through `THROUGHPUT_LENGTHS`."""
@@ -754,13 +704,11 @@ def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
 
 
 def mode_throughput(args) -> None:
-    """Output tokens/sec over a whole request set, by concurrency, vs transformers.
-
-    The comparison is asymmetric by construction, which is the finding: `generate`
-    takes one padded rectangle, so prompts of 32 to 512 tokens all run for 512, while
-    the engine gives each sequence its own length and admits a replacement the
-    iteration a request finishes. That gap is what continuous batching and paging buy.
-    `ignore_eos` fixes the token count so both sides do identical work.
+    """Output tokens/sec over a whole request set, by concurrency, vs transformers. The
+    comparison is asymmetric by construction, which is the finding: generate takes
+    one padded rectangle, so prompts of 32 to 512 tokens all run for 512, while the
+    engine gives each sequence its own length and admits a replacement the iteration
+    a request finishes.
     """
     from transformers import AutoTokenizer
 
@@ -844,8 +792,7 @@ def mode_throughput(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# ============================================================== mode: scheduler
-
+# --- 6. Mode: scheduler ------------------------------------------------------
 
 @dataclass(frozen=True)
 class StressRequest:
@@ -1112,17 +1059,13 @@ def mode_scheduler(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# =========================================================== mode: prefix-cache
-
+# --- 7. Mode: prefix-cache ---------------------------------------------------
 
 def mode_prefix_cache(args) -> None:
-    """The same shared-preamble workload with the radix tree on and off.
-
-    The workload is the one prefix caching exists for and the one a chat server has:
-    many requests opening with the same long system prompt and differing only in a
-    short question. The reported figure is TTFT, where a cache hit lands: it removes
-    prompt tokens from the prefill, so the first token arrives sooner while decode is
-    untouched.
+    """The same shared-preamble workload with the radix tree on and off: many requests
+    opening with the same long system prompt and differing only in a short question,
+    which is what a chat server sees. The figure is TTFT, where a hit lands -- it
+    removes prompt tokens from the prefill, leaving decode untouched.
     """
     from mini_vllm import LLM, SamplingParams
 
@@ -1183,17 +1126,13 @@ def mode_prefix_cache(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# ==================================================================== mode: fp8
-
+# --- 8. Mode: fp8 ------------------------------------------------------------
 
 def mode_fp8(args) -> None:
-    """FP8 vs BF16 KV cache: capacity for the same budget, and greedy agreement.
-
-    Capacity is arithmetic made observable: an e4m3 element is half a bf16 element, so
-    the same memory budget holds twice the pages, which the two engines' pool sizes
-    show directly. Accuracy is measured as greedy token agreement over real prompts —
-    the model computes in bf16 either way; only the resident cache is quantized, so
-    divergence appears where a rounding in a cached key or value flips a near-tie.
+    """FP8 vs BF16 KV cache: capacity for the same budget, and greedy agreement. An
+    e4m3 element is half a bf16 element, so the same budget holds twice the pages.
+    The model computes in bf16 either way and only the resident cache is quantized,
+    so divergence appears where a rounding in a cached key or value flips a near-tie.
     """
     from mini_vllm import LLM, SamplingParams
     from mini_vllm.cache import PagedKvPool
@@ -1254,17 +1193,13 @@ def mode_fp8(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# =================================================================== mode: spec
-
+# --- 9. Mode: spec -----------------------------------------------------------
 
 def mode_spec(args) -> None:
-    """Speculation off, then on at a sweep of self-draft depths.
-
-    Reports the acceptance rate beside the wall clock, since either alone is
-    misleading: a deep draft is accepted often and costs nearly what the target costs,
-    while a shallow one is cheap and rejected. What speculation needs to pay off is a
-    genuinely smaller separate checkpoint (`LLM(draft_model=...)`); the self-draft
-    sweep exercises and validates the mechanism on a single-model memory budget.
+    """Speculation off, then on at a sweep of self-draft depths. Reports acceptance
+    beside wall clock, since either alone misleads: a deep draft is accepted often
+    and costs nearly what the target costs, while a shallow one is cheap and
+    rejected. Paying off needs a genuinely smaller separate checkpoint.
     """
     from mini_vllm import LLM, SamplingParams
 
@@ -1316,8 +1251,7 @@ def mode_spec(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# ------------------------------------------------------------------------- CLI
-
+# --- 10. CLI -----------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Mini-vLLM.")

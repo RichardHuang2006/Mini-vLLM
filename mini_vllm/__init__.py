@@ -1,20 +1,8 @@
-"""Mini-vLLM — a paged-attention LLM inference engine for Qwen3.
+"""Mini-vLLM — a paged-attention inference engine for Qwen3.
 
-::
-
-    from mini_vllm import LLM, SamplingParams
-
-    llm = LLM()
-    print(llm.generate("The capital of France is", max_tokens=16)[0].text)
-
-The public API is five names: `LLM`, `EngineConfig`, `SamplingParams`,
-`Completion`, and `StreamUpdate`. Everything else is an implementation detail,
-importable from its module for study (`mini_vllm.ops`, `mini_vllm.cache`, ...)
-but not re-exported here.
-
-The engine names are imported lazily so that `import mini_vllm.ops`, in tests
-of the reference implementations, does not pull in transformers and the model
-loader.
+config, ops, model, cache, scheduler, kernels, engine, speculative, benchmark.
+Five names are re-exported, lazily so a test of the reference ops does not pull
+in transformers: LLM, EngineConfig, SamplingParams, Completion, StreamUpdate.
 """
 
 from __future__ import annotations

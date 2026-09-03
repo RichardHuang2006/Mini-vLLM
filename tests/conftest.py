@@ -1,11 +1,9 @@
 """Fixtures and comparison helpers shared by every test.
 
-Three things live here, each making a class of bug cheap to find:
-
-* Seeding, so any failure reproduces exactly.
-* Dtype-aware comparison, so no test hardcodes a tolerance and drifts.
-* A tiny Qwen3, so correctness tests run in milliseconds without the 1.2 GB of real
-  weights. The real weights are reserved for `@pytest.mark.oracle`.
+Three things, each making a class of bug cheap to find: seeding, so any failure
+reproduces exactly; dtype-aware comparison, so no test hardcodes a tolerance
+and drifts; and a tiny Qwen3, so correctness tests run in milliseconds without
+the 1.2 GB of real weights, which are reserved for @pytest.mark.oracle.
 """
 
 from __future__ import annotations
@@ -82,8 +80,7 @@ TINY_QWEN3_DIMS: dict[str, Any] = {
 }
 
 
-# ---------------------------------------------------------------- determinism
-
+# --- Determinism -------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def seeded():
@@ -106,8 +103,7 @@ def device() -> torch.device:
     return torch.device("cuda")
 
 
-# ----------------------------------------------------------------- comparison
-
+# --- Comparison --------------------------------------------------------------
 
 def assert_allclose(
     actual: torch.Tensor,
@@ -224,7 +220,8 @@ def tokens_equal():
     return assert_tokens_equal
 
 
-# ------------------------------------------------------------- real engines
+# --- Real engines ------------------------------------------------------------
+
 #
 # The GPU of record has 8 GB and a bf16 Qwen3-0.6B is 1.2 GB of weights before its KV
 # cache, so two engines do not fit at once. An engine that sizes its own pool takes a
@@ -281,8 +278,7 @@ def real_engine(**kwargs: Any):
         free_cuda_memory()
 
 
-# ---------------------------------------------------------------- tiny model
-
+# --- Tiny model --------------------------------------------------------------
 
 def make_tiny_qwen3(**overrides: Any):
     """Build a randomly-initialized Qwen3 small enough to test against.

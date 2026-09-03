@@ -1,34 +1,15 @@
 """The reference implementations: every operation the engine runs, in its slow,
 obviously correct form.
 
-What this file teaches
-    The complete inventory of math inside an LLM inference engine — nine
-    operations, in the order a token meets them: linear projection, activation,
-    normalization, rotary position, attention (grouped, causal, and paged), and
-    sampling. Everything else in this project is bookkeeping around these.
+Nine operations in the order a token meets them, from linear projection to
+sampling. Every one is a correctness oracle -- csrc/ and the fast paths in
+kernels.py are diffed against these exact implementations, so they are written
+for clarity and kept frozen.
 
-Inputs and outputs
-    Plain tensors in, plain tensors out. Shapes are written with ``B`` batch,
-    ``L`` query length, ``S`` source (context) length, ``H_q``/``H_k`` query/KV
-    heads, ``D`` head dim, ``E`` hidden size, ``V`` vocabulary, ``T`` total
-    tokens of a ragged batch, and ``N..`` for any leading batch dimensions.
-
-Read next
-    `model.py` — these ops assembled into the Qwen3 forward pass.
-
-One invariant
-    Every function here is a correctness oracle. The CUDA kernels in `csrc/`
-    and the fast paths in `kernels.py` are diffed against these exact
-    implementations, so they are written for clarity and kept frozen: a change
-    here changes what "correct" means for the whole project.
-
-Runnable example
-    >>> import torch
-    >>> from mini_vllm import ops
-    >>> q = torch.randn(1, 16, 4, 64)   # B x H_q x L x D
-    >>> kv = torch.randn(1, 8, 4, 64)   # B x H_k x S x D
-    >>> ops.scaled_dot_product_attention_grouped(q, kv, kv, mask="causal").shape
-    torch.Size([1, 16, 4, 64])
+Shape symbols used throughout:
+    B = batch   L = query length   S = source (context) length   D = head dim
+    H_q / H_k = query / KV heads   E = hidden size   V = vocab
+    T = total tokens of a ragged batch   N.. = leading batch dims
 """
 
 from __future__ import annotations
@@ -57,22 +38,12 @@ __all__ = [
 ]
 
 
-# ------------------------------------------------------------------- 1. linear
-
+# --- 1. Linear ---------------------------------------------------------------
 
 def linear(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-    """``y = x @ w.T (+ bias)``.
-
-    ::
-
-        x:    N.. x I
-        w:    O x I        (transposed, the HuggingFace storage convention)
-        bias: O
-        out:  N.. x O
-
-    The weight is stored as ``O x I`` rather than ``I x O`` because that is the
-    checkpoint convention. Matching it here means the weight loader never transposes,
-    and a transposed weight surfaces as a shape error rather than wrong numbers.
+    """y = x @ w.T (+ bias). x: N.. x I, w: O x I, bias: O, out: N.. x O. The weight is
+    stored O x I, the checkpoint convention, so the loader never transposes and a
+    transposed weight is a shape error rather than wrong numbers.
     """
     out = x @ w.transpose(-2, -1)
     if bias is not None:
@@ -81,18 +52,10 @@ def linear(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None) -
 
 
 class Embedding:
-    """A ``V x E`` table, readable as a lookup or as a linear projection.
-
-    Qwen3-0.6B sets ``tie_word_embeddings=true``, so one matrix serves as both the
-    input embedding and the output projection: hence one object with two methods
-    rather than two layers. At ``V x E`` = 151936 x 1024 it is about 155M of the
-    596M parameters, and untying it would add another 155M.
-
-    ::
-
-        weight:         V x E
-        __call__(ids):  B x L      (int64)  ->  B x L x E
-        as_linear(h):   B x L x E            ->  B x L x V
+    """A V x E table, read as a lookup (B x L -> B x L x E) or as a linear projection
+    (B x L x E -> B x L x V). Qwen3-0.6B ties the word embeddings, so one matrix
+    serves as both -- one object with two methods rather than two layers, and 155M
+    of the 596M parameters.
     """
 
     def __init__(self, vocab_size: int, dim: int, weight: torch.Tensor) -> None:
@@ -111,43 +74,31 @@ class Embedding:
         return self.weight[ids]
 
     def as_linear(self, h: torch.Tensor) -> torch.Tensor:
-        """``h @ weightᵀ``: the tied LM head.
-
-        A vocabulary-wide matmul, and the most expensive op in a decode step: `E x V`
-        work to produce logits for one token. The serving layer therefore runs it only
-        on the last position of each sequence.
+        """h @ weight.T: the tied LM head, and the most expensive op in a decode step --
+        E x V work for one token's logits, so the serving layer runs it only on each
+        sequence's last position.
         """
         if h.shape[-1] != self.dim:
             raise ValueError(f"expected last dimension {self.dim}, got {h.shape[-1]}")
         return linear(h, self.weight)
 
 
-# ----------------------------------------------------------- 2. silu / softmax
-
+# --- 2. SiLU / softmax -------------------------------------------------------
 
 def silu(x: torch.Tensor) -> torch.Tensor:
-    """``x * sigmoid(x)``, the activation inside Qwen3's SwiGLU MLP.
-
-    The fused SwiGLU CUDA kernel computes ``silu(gate) * up`` in one pass; this is
-    the expression it must agree with.
+    """x * sigmoid(x), the activation inside Qwen3's SwiGLU MLP. The fused SwiGLU
+    kernel computes silu(gate) * up in one pass and must agree with this.
     """
     return x * torch.sigmoid(x)
 
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Softmax along ``dim``, computed in fp32 and returned in the input dtype.
+    """Softmax along dim, computed in fp32 and returned in the input dtype.
 
-    Two properties that recur in every attention kernel:
-
-    Subtract the row max first. ``exp`` overflows to ``inf`` around 88 in fp32 and
-    attention logits routinely exceed that; subtracting the max makes the largest
-    exponent exactly ``exp(0) == 1`` without changing the result, since the shared factor
-    cancels between numerator and denominator. This is the basis of the online-softmax
-    recurrence in the decode attention kernel, where the max arrives incrementally and
-    the running total is rescaled as it changes.
-
-    Reduce in fp32. Summing bf16 exponentials loses enough precision to move greedy
-    tokens a few layers downstream.
+    Subtract the row max first: exp overflows around 88 in fp32 and attention logits
+    exceed that, while the shared factor cancels -- the basis of the decode kernel's
+    online-softmax recurrence. Reduce in fp32: summing bf16 exponentials moves
+    greedy tokens a few layers downstream.
     """
     x32 = x.float()
     x32 = x32 - x32.max(dim=dim, keepdim=True).values
@@ -155,31 +106,16 @@ def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return (exp / exp.sum(dim=dim, keepdim=True)).to(x.dtype)
 
 
-# ------------------------------------------------------------------ 3. RMSNorm
-
+# --- 3. RMSNorm --------------------------------------------------------------
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """``x * rsqrt(mean(x²) + eps) * weight``, reducing over the last dimension.
+    """x * rsqrt(mean(x^2) + eps) * weight over the last axis. x, out: N.. x dim.
 
-    ::
-
-        x:      N.. x dim
-        weight: dim
-        out:    N.. x dim
-
-    Qwen3 uses this in three places: before attention, before the MLP, and inside
-    attention as QK-norm over the head dimension of `q` and `k`. The same function
-    serves all three, differing only in the width of the reduced axis. Unlike
-    LayerNorm there is no mean subtraction and no bias: the vector is rescaled but
-    not recentred.
-
-    The reduction is fp32 even when ``x`` is bf16, and that is required rather than
-    conservative. A bf16 sum of 1024 squares carries roughly three decimal digits, and
-    the error feeds a multiplicative rescale of the whole residual stream; across 28
-    layers it moves greedy tokens.
-
-    The cast back to the input dtype happens before the weight multiply, matching
-    HuggingFace, so this is exactly rather than approximately comparable to the oracle.
+    Qwen3 uses it before attention, before the MLP, and as QK-norm over the head
+    dimension; the same function serves all three. The reduction is fp32 even for
+    bf16 input -- a bf16 sum of 1024 squares carries about three decimal digits, and
+    the error rescales the whole residual stream. The cast back happens before the
+    weight multiply, matching HuggingFace exactly rather than closely.
     """
     input_dtype = x.dtype
 
@@ -190,17 +126,13 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.
     return weight * normalized.to(input_dtype)
 
 
-# --------------------------------------------------------------------- 4. RoPE
-
+# --- 4. RoPE -----------------------------------------------------------------
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """``[x1, x2] -> [-x2, x1]``, splitting the head dimension in half.
-
-    The "rotate halves" convention, pairing element ``i`` with element ``i + D/2``. The
-    original RoFormer paper pairs adjacent elements instead; the two are related by a
-    permutation of the head dimension, so both are self-consistent but not
-    interchangeable against a given checkpoint. Qwen3's weights were trained with this
-    one, and the other produces fluent nonsense rather than an error.
+    """[x1, x2] -> [-x2, x1], pairing element i with element i + D/2. RoFormer pairs
+    adjacent elements instead, so the two are self-consistent but not interchangeable
+    against a checkpoint; Qwen3 was trained with this one, and the other produces
+    fluent nonsense rather than an error.
     """
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
@@ -212,18 +144,9 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Rotate ``x`` using precomputed tables, gathered at ``positions``.
-
-    ::
-
-        x:         B x L x H x D
-        positions: L  or  B x L
-        cos, sin:  max_seq_len x D
-        out:       same shape and dtype as x
-
-    Split out from :class:`RoPE` so it takes the tables as plain tensors: the fused RoPE
-    kernel has the same signature, which lets `kernels.rope` dispatch between the two
-    without either side knowing about the other.
+    """Rotate x [B, L, H, D] using cos/sin tables [max_seq_len, D] gathered at positions
+    [L] or [B, L]. Split out of RoPE so it takes the tables as plain tensors: the
+    fused kernel has the same signature, which is what lets kernels.rope dispatch.
     """
     # positions is L or B x L, so the gather yields L x D or B x L x D; the head
     # axis is inserted so one row applies to every head of its token.
@@ -235,23 +158,13 @@ def apply_rope(
 
 
 class RoPE:
-    """Precomputed rotary embedding tables, applied at explicit positions.
+    """Precomputed rotary tables, applied at explicit positions.
 
-    The interface carries the design decision: :meth:`__call__` takes the absolute
-    position of every token as a tensor and never assumes ``arange(L)``. That is what
-    makes the serving layer possible. A decode step for a sequence at position 500 and
-    a prefill chunk covering positions 0-511 share a single forward pass, so position
-    is a property of each token rather than of the batch. An implicit ``arange``
-    produces correct prefill and a subtly wrong continuation.
-
-    ::
-
-        x:         B x L x H x D   (or any N.. x H x D with positions to match)
-        positions: L  or  B x L    (int64, absolute position of each token)
-        out:       same shape as x
-
-    ``cos`` and ``sin`` are exposed as attributes because the fused RoPE kernel reads
-    the same tables directly and must agree with this implementation row for row.
+    __call__ takes the absolute position of every token and never assumes arange(L),
+    which is what makes the serving layer possible: a decode step at position 500
+    and a prefill chunk covering 0-511 share one forward pass. An implicit arange
+    prefills correctly and then continues wrongly. cos and sin are attributes
+    because the fused kernel reads the same tables and must agree row for row.
     """
 
     def __init__(
@@ -301,8 +214,7 @@ class RoPE:
         return apply_rope(x, positions, self.cos, self.sin)
 
 
-# ------------------------------------------------- 5. grouped-query attention
-
+# --- 5. Grouped-query attention ----------------------------------------------
 
 def scaled_dot_product_attention_grouped(
     q: torch.Tensor,
@@ -311,26 +223,14 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: torch.Tensor | str | None = None,
 ) -> torch.Tensor:
-    """Grouped-query attention: ``H_k`` key/value heads serving ``H_q`` query heads.
+    """Grouped-query attention: H_k KV heads serving H_q query heads, G = H_q / H_k.
+    q is B x H_q x L x D, k and v are B x H_k x S x D, out matches q.
 
-    ::
-
-        q:    B x H_q x L x D
-        k, v: B x H_k x S x D
-        out:  B x H_q x L x D
-
-        G = H_q / H_k        each KV head serves G query heads
-
-    Implemented by reshaping the query into ``B x H_k x G x L x D`` and letting
-    broadcasting align each KV head with its own group, rather than materializing ``G``
-    copies of K and V with ``repeat_interleave``. Same numbers, without the ``G``-fold
-    duplication of the cache that GQA exists to avoid and that the paged attention
-    kernels rely on.
-
-    This materializes the whole ``L x S`` score matrix, which is what the
-    FlashAttention-style kernels avoid; it exists as the oracle they are diffed
-    against, so it is written for clarity rather than speed. Pass ``mask="causal"``
-    for dense causal attention (see :func:`causal_mask` for the decode offset).
+    Reshapes the query to B x H_k x G x L x D and lets broadcasting align each KV
+    head with its group, rather than materializing G copies of the cache GQA exists
+    to avoid. It does materialize the whole L x S score matrix, which the
+    FlashAttention-style kernels avoid; it is their oracle. mask="causal" gives
+    dense causal attention.
     """
     *batch, num_query_heads, query_len, head_dim = q.shape
     num_kv_heads = k.shape[-3]
@@ -373,8 +273,7 @@ def scaled_dot_product_attention_grouped(
     return out.reshape(*batch, num_query_heads, query_len, head_dim)
 
 
-# ---------------------------------------------------- 6. dense causal attention
-
+# --- 6. Dense causal attention -----------------------------------------------
 
 def causal_mask(
     query_len: int,
@@ -382,20 +281,14 @@ def causal_mask(
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """An additive causal mask of shape ``query_len x source_len``.
+    """An additive [query_len, source_len] mask: query i may attend to key j only when
+    j <= source_len - query_len + i.
 
-    Dense causal attention is :func:`scaled_dot_product_attention_grouped` plus this
-    mask: query ``i`` may attend to key ``j`` only when ``j <= source_len - query_len
-    + i``. The mask is additive rather than boolean because additive masks compose:
-    adding ``-inf`` before the softmax drives a position to exactly zero afterwards,
-    and several masks can be summed.
-
-    The offset carries the subtlety. With ``L == S`` (prefill) it reduces to a lower
-    triangle. With ``L < S`` (decode against a filled cache) the ``L`` queries are the
-    last ``L`` positions of the sequence rather than the first, so the diagonal shifts
-    right by ``S - L``. Omitting the shift yields a model that prefills correctly and
-    then decodes nonsense, because a decode token would be forbidden from seeing its own
-    cache.
+    Additive because such masks compose -- adding -inf before the softmax drives a
+    position to exactly zero after it. The offset is the subtlety: at L == S it is a
+    lower triangle, but at L < S the queries are the last positions rather than the
+    first, so the diagonal shifts right by S - L. Omitting it prefills correctly and
+    then decodes nonsense.
     """
     offset = source_len - query_len
     rows = torch.arange(query_len, device=device).unsqueeze(1)
@@ -407,8 +300,7 @@ def causal_mask(
     )
 
 
-# --------------------------------------------- 7. reference paged attention
-
+# --- 7. Reference paged attention --------------------------------------------
 
 def paged_attention_gathered(
     q: torch.Tensor,
@@ -423,36 +315,16 @@ def paged_attention_gathered(
 ) -> torch.Tensor:
     """Grouped-query causal attention over a paged cache, one sequence at a time.
 
-    The oracle for the paged attention kernels. For each sequence it walks the block
-    table, copies that sequence's keys and values out of the pool into a contiguous
-    tensor, and calls the reference attention on it.
+        q:              T x H_q x D              scheduled tokens, concatenated
+        key/value_pool: num_blocks x P x H_k x D one layer's pages
+        block_tables:   int32 N x max_blocks     -1 padded
+        cu_seqlens_q:   int32 N + 1              where each sequence's queries start
+        context_lens:   int32 N                  cached tokens each attends over
 
-    That is a full copy of the cache every iteration, the traffic paging exists to
-    avoid and worse than the dense cache it replaces. It is also correct by
-    construction: with :func:`scaled_dot_product_attention_grouped` as the reference,
-    a correct gather gives a correct answer, which is what the kernels are diffed
-    against.
-
-    ::
-
-        q:            T x H_q x D            every scheduled token, sequences concatenated
-        key_pool:     num_blocks x P x H_k x D   (one layer's pages; P = block size)
-        value_pool:   num_blocks x P x H_k x D
-        block_tables: int32 N x max_blocks   -1 padded
-        cu_seqlens_q: int32 N + 1            where each sequence's queries start
-        context_lens: int32 N                how many cached tokens each attends over
-        out:          T x H_q x D
-
-    The flattened token axis is what lets one call serve a mixed batch: a 300-token
-    prefill chunk followed by a dozen single-token decodes is 312 rows here,
-    distinguished only by `cu_seqlens_q`. Each sequence is masked causally with its own
-    `(L, S)` offset: a decode step's single query sees the whole context, and a prefill
-    chunk's queries are the last `L` positions of `S`.
-
-    With FP8 pools the gather also dequantizes, casting each cached key and value up and
-    multiplying by its scale before the math, so the oracle attends in the activation
-    dtype exactly as the kernel does after dequantizing in registers. The scales default
-    to 1.0, the identity for an unquantized pool.
+    The oracle for the paged kernels: it walks each block table, copies that
+    sequence's KV into a contiguous tensor, and calls the reference attention -- a
+    full copy of the cache every iteration, but correct by construction. With FP8
+    pools the gather also dequantizes, as the kernel does in registers.
     """
     if q.dim() != 3:
         raise ValueError(f"expected q shaped T x H_q x D, got {tuple(q.shape)}")
@@ -519,7 +391,7 @@ def paged_attention_gathered(
     return out
 
 
-# --------------------------------------------------- 8. sampling probabilities
+# --- 8. Sampling probabilities -----------------------------------------------
 
 # Everything below is vectorized across the batch with per-row parameters. A server
 # batches whatever requests arrive together and they will not agree on temperature:
@@ -554,20 +426,12 @@ def sampling_probabilities(
     logits: torch.Tensor,
     params: SamplingParams | Sequence[SamplingParams],
 ) -> torch.Tensor:
-    """The distribution each row will actually be sampled from.
+    """The distribution each row will be sampled from: logits [B, V] -> probabilities
+    [B, V], fp32, rows summing to 1.
 
-    ::
-
-        logits: B x V   ->   probabilities: B x V   (fp32, rows sum to 1)
-
-    Exposed separately from :func:`sample` because it makes the sampler testable: a
-    truncation rule is easier to verify by inspecting the distribution it produces than
-    by drawing from it. Greedy rows come back one-hot. Speculative decoding also builds
-    on this: rejection sampling needs the target's and the draft's *distributions*, not
-    their draws.
-
-    Temperature is applied first, then top-k and top-p together on the scaled
-    distribution, so the truncation sees the same probabilities the draw will.
+    Separate from sample because it makes the sampler testable, and because
+    rejection sampling needs distributions rather than draws. Temperature applies
+    first, so top-k and top-p see the same probabilities the draw will.
     """
     if logits.ndim != 2:
         raise ValueError(f"expected B x V logits, got shape {tuple(logits.shape)}")
@@ -612,24 +476,16 @@ def sampling_probabilities(
     return result
 
 
-# ----------------------------------------------------------------- 9. sampling
-
+# --- 9. Sampling -------------------------------------------------------------
 
 def sample(
     logits: torch.Tensor,
     params: SamplingParams | Sequence[SamplingParams] = SamplingParams(),
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Draw one token per row: greedy, temperature, top-k and top-p in one call.
-
-    ::
-
-        logits: B x V   ->   tokens: B   (int64)
-
-    Greedy rows (``temperature == 0``) come out of the same path — their distribution
-    is one-hot, so the multinomial draw is deterministic. Pass a ``generator`` to make
-    a draw reproducible without disturbing global RNG state, which is what lets a
-    server replay one request.
+    """Draw one token per row: logits [B, V] -> tokens [B]. Greedy rows come out of
+    the same path, their distribution being one-hot. Pass a generator to make a
+    draw reproducible without disturbing global RNG state.
     """
     probabilities = sampling_probabilities(logits, params)
     return torch.multinomial(probabilities, num_samples=1, generator=generator).squeeze(1)
