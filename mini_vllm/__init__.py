@@ -1,9 +1,4 @@
-"""Mini-vLLM — a paged-attention inference engine for Qwen3.
-
-config, ops, model, cache, scheduler, kernels, engine, speculative, benchmark.
-Five names are re-exported, lazily so a test of the reference ops does not pull
-in transformers: LLM, EngineConfig, SamplingParams, Completion, StreamUpdate.
-"""
+"""Mini-vLLM — a paged-attention inference engine for Qwen3."""
 
 from __future__ import annotations
 
@@ -17,6 +12,7 @@ if TYPE_CHECKING:
 
 __all__ = ["LLM", "EngineConfig", "SamplingParams", "Completion", "StreamUpdate"]
 
+# Re-exported lazily so importing a reference op does not pull in transformers.
 _ENGINE_EXPORTS = frozenset({"LLM", "Completion", "StreamUpdate"})
 
 

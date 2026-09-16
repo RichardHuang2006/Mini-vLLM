@@ -1,10 +1,4 @@
-# Mini-vLLM — a paged-attention LLM inference engine
-#
-# Targets: setup (venv + deps) · ext (build CUDA extension) · test · bench · clean · help
-#
-# `make test` uses whatever `python` is on PATH, so it works against an
-# already-installed torch without `make setup` first. `make setup` creates a
-# local venv for a clean-room install.
+# Mini-vLLM — a paged-attention LLM inference engine. `make help` lists the targets.
 
 PYTHON ?= python3
 VENV    = .venv
@@ -15,75 +9,45 @@ TORCH_INDEX = https://download.pytorch.org/whl/cu130
         bench-prefix-cache bench-fp8 bench-spec clean help
 .DEFAULT_GOAL := help
 
-# ------------------------------------------------------------------- setup ---
-# Create a local venv and install pinned dependencies for a fresh clone. The
-# extra index is where the CUDA 13 torch build lives.
+# A local venv for a fresh clone; `make test` uses whatever python is on PATH instead.
 setup:
 	$(PYTHON) -m venv $(VENV)
 	$(VENVBIN)/pip install --upgrade pip
 	$(VENVBIN)/pip install -r requirements.txt --extra-index-url $(TORCH_INDEX)
 	@echo "setup: activate with 'source $(VENVBIN)/activate'"
 
-# --------------------------------------------------------------------- ext ---
-# Force a full rebuild of the csrc/ extension and print the resolved toolchain,
-# then verify the compiled rmsnorm kernel against its PyTorch reference. A stale
-# JIT cache is the first thing to suspect when a kernel edit appears to do
-# nothing, so this target exists to rule it out in one command.
+# A stale JIT cache is the first thing to suspect when a kernel edit appears to do nothing.
 ext:
 	$(PYTHON) -m mini_vllm.kernels --rebuild
 
-# -------------------------------------------------------------------- test ---
-# Run the suite. Pure-CPU tests always run; `cuda` tests skip without a GPU and
-# `oracle` tests skip until the Qwen3-0.6B weights are downloaded.
 test:
 	$(PYTHON) -m pytest -q
 
-# Everything that needs neither a GPU nor downloaded weights.
 test-cpu:
 	$(PYTHON) -m pytest -q -m "not cuda and not oracle and not slow"
 
-# ------------------------------------------------------------------- bench ---
-# TTFT and decode tok/s for the cached model. Warns if it caught the GPU running
-# below its clocks, which would make every number meaningless.
 bench:
 	$(PYTHON) -m mini_vllm.benchmark --mode single --compare hf --use-cuda-kernels
 
-# The headline: output tokens/sec over a whole request set against
-# `transformers.generate`, swept over concurrency. Downloads Qwen3-0.6B on first
-# run. This is the table in the README.
 bench-throughput:
 	$(PYTHON) -m mini_vllm.benchmark --mode throughput --batch-sizes 1,4,16,32 \
 		--compare hf --use-cuda-kernels --kv-fraction 0.35
 
-# Chunked prefill against a prefill-prioritized baseline on one Poisson arrival
-# schedule: decode-latency tails, and a leak check over the whole run. Takes a
-# few minutes — it serves 2000 requests twice.
 bench-scheduler:
 	$(PYTHON) -m mini_vllm.benchmark --mode scheduler --num-requests 2000 --use-cuda-kernels
 
-# Achieved memory bandwidth for each hand-written kernel, next to the PyTorch
-# expression it replaced. The score for a memory-bound op is its share of peak
-# bandwidth, not its wall-clock.
 bench-kernels:
 	$(PYTHON) -m mini_vllm.benchmark --mode kernels
 
-# Radix-tree prefix caching on and off over a shared-preamble workload. Reports TTFT,
-# because that is the only place a cache hit lands: it takes prompt tokens out of the
-# prefill and leaves decode exactly as it was.
 bench-prefix-cache:
 	$(PYTHON) -m mini_vllm.benchmark --mode prefix-cache --use-cuda-kernels
 
-# FP8 against BF16 KV cache: pages per memory budget (the 2x) and greedy token
-# agreement over real prompts.
 bench-fp8:
 	$(PYTHON) -m mini_vllm.benchmark --mode fp8 --use-cuda-kernels
 
-# Speculative decoding, sweeping the draft's depth. Acceptance rate beside the wall
-# clock, because neither column means much alone.
 bench-spec:
 	$(PYTHON) -m mini_vllm.benchmark --mode spec --draft-layers 4,14,28 --use-cuda-kernels
 
-# --------------------------------------------------------------- housekeeping
 clean:
 	rm -rf $(VENV) build .pytest_cache .hypothesis
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +

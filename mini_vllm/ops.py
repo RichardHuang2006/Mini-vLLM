@@ -1,16 +1,4 @@
-"""The reference implementations: every operation the engine runs, in its slow,
-obviously correct form.
-
-Nine operations in the order a token meets them, from linear projection to
-sampling. Every one is a correctness oracle -- csrc/ and the fast paths in
-kernels.py are diffed against these exact implementations, so they are written
-for clarity and kept frozen.
-
-Shape symbols used throughout:
-    B = batch   L = query length   S = source (context) length   D = head dim
-    H_q / H_k = query / KV heads   E = hidden size   V = vocab
-    T = total tokens of a ragged batch   N.. = leading batch dims
-"""
+"""Reference implementations: every operation the engine runs, in its slow, correct form."""
 
 from __future__ import annotations
 
@@ -38,13 +26,8 @@ __all__ = [
 ]
 
 
-# --- 1. Linear ---------------------------------------------------------------
-
 def linear(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-    """y = x @ w.T (+ bias). x: N.. x I, w: O x I, bias: O, out: N.. x O. The weight is
-    stored O x I, the checkpoint convention, so the loader never transposes and a
-    transposed weight is a shape error rather than wrong numbers.
-    """
+    """y = x @ w.T (+ bias), with w stored O x I as the checkpoint keeps it."""
     out = x @ w.transpose(-2, -1)
     if bias is not None:
         out = out + bias
@@ -52,11 +35,7 @@ def linear(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None) -
 
 
 class Embedding:
-    """A V x E table, read as a lookup (B x L -> B x L x E) or as a linear projection
-    (B x L x E -> B x L x V). Qwen3-0.6B ties the word embeddings, so one matrix
-    serves as both -- one object with two methods rather than two layers, and 155M
-    of the 596M parameters.
-    """
+    """A V x E table, read as a lookup or, for the tied LM head, as a linear projection."""
 
     def __init__(self, vocab_size: int, dim: int, weight: torch.Tensor) -> None:
         if weight.shape != (vocab_size, dim):
@@ -74,66 +53,40 @@ class Embedding:
         return self.weight[ids]
 
     def as_linear(self, h: torch.Tensor) -> torch.Tensor:
-        """h @ weight.T: the tied LM head, and the most expensive op in a decode step --
-        E x V work for one token's logits, so the serving layer runs it only on each
-        sequence's last position.
-        """
+        """h @ weight.T: the tied LM head, and the most expensive op in a decode step."""
         if h.shape[-1] != self.dim:
             raise ValueError(f"expected last dimension {self.dim}, got {h.shape[-1]}")
         return linear(h, self.weight)
 
 
-# --- 2. SiLU / softmax -------------------------------------------------------
-
 def silu(x: torch.Tensor) -> torch.Tensor:
-    """x * sigmoid(x), the activation inside Qwen3's SwiGLU MLP. The fused SwiGLU
-    kernel computes silu(gate) * up in one pass and must agree with this.
-    """
+    """x * sigmoid(x), the activation inside Qwen3's SwiGLU MLP."""
     return x * torch.sigmoid(x)
 
 
 def softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Softmax along dim, computed in fp32 and returned in the input dtype.
-
-    Subtract the row max first: exp overflows around 88 in fp32 and attention logits
-    exceed that, while the shared factor cancels -- the basis of the decode kernel's
-    online-softmax recurrence. Reduce in fp32: summing bf16 exponentials moves
-    greedy tokens a few layers downstream.
-    """
+    """Softmax along dim, computed in fp32 and returned in the input dtype."""
     x32 = x.float()
+    # Subtract the row max: exp overflows around 88 in fp32 and the factor cancels.
     x32 = x32 - x32.max(dim=dim, keepdim=True).values
     exp = torch.exp(x32)
     return (exp / exp.sum(dim=dim, keepdim=True)).to(x.dtype)
 
 
-# --- 3. RMSNorm --------------------------------------------------------------
-
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """x * rsqrt(mean(x^2) + eps) * weight over the last axis. x, out: N.. x dim.
-
-    Qwen3 uses it before attention, before the MLP, and as QK-norm over the head
-    dimension; the same function serves all three. The reduction is fp32 even for
-    bf16 input -- a bf16 sum of 1024 squares carries about three decimal digits, and
-    the error rescales the whole residual stream. The cast back happens before the
-    weight multiply, matching HuggingFace exactly rather than closely.
-    """
+    """x * rsqrt(mean(x^2) + eps) * weight over the last axis, reduced in fp32."""
     input_dtype = x.dtype
 
     x32 = x.float()
     mean_square = x32.pow(2).mean(dim=-1, keepdim=True)
     normalized = x32 * torch.rsqrt(mean_square + eps)
 
+    # The cast back happens before the weight multiply, matching HuggingFace exactly.
     return weight * normalized.to(input_dtype)
 
 
-# --- 4. RoPE -----------------------------------------------------------------
-
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """[x1, x2] -> [-x2, x1], pairing element i with element i + D/2. RoFormer pairs
-    adjacent elements instead, so the two are self-consistent but not interchangeable
-    against a checkpoint; Qwen3 was trained with this one, and the other produces
-    fluent nonsense rather than an error.
-    """
+    """[x1, x2] -> [-x2, x1], pairing element i with element i + D/2 as Qwen3 was trained."""
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
@@ -144,12 +97,8 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Rotate x [B, L, H, D] using cos/sin tables [max_seq_len, D] gathered at positions
-    [L] or [B, L]. Split out of RoPE so it takes the tables as plain tensors: the
-    fused kernel has the same signature, which is what lets kernels.rope dispatch.
-    """
-    # positions is L or B x L, so the gather yields L x D or B x L x D; the head
-    # axis is inserted so one row applies to every head of its token.
+    """Rotate x [B, L, H, D] using cos/sin tables [max_seq_len, D] gathered at positions."""
+    # The head axis is inserted so one table row applies to every head of its token.
     gathered_cos = cos.to(x.device)[positions].unsqueeze(-2)
     gathered_sin = sin.to(x.device)[positions].unsqueeze(-2)
 
@@ -158,14 +107,7 @@ def apply_rope(
 
 
 class RoPE:
-    """Precomputed rotary tables, applied at explicit positions.
-
-    __call__ takes the absolute position of every token and never assumes arange(L),
-    which is what makes the serving layer possible: a decode step at position 500
-    and a prefill chunk covering 0-511 share one forward pass. An implicit arange
-    prefills correctly and then continues wrongly. cos and sin are attributes
-    because the fused kernel reads the same tables and must agree row for row.
-    """
+    """Precomputed rotary tables, applied at explicit absolute positions."""
 
     def __init__(
         self,
@@ -181,21 +123,17 @@ class RoPE:
         self.max_seq_len = max_seq_len
         self.theta = theta
 
-        # Frequency i decays as theta^(-2i/D): the first pairs rotate quickly and encode
-        # local offsets, the last rotate slowly and encode long-range position. Qwen3's
-        # theta of 1e6 stretches the slow end far enough to cover a long context.
+        # Frequency i decays as theta^(-2i/D): early pairs are local, late ones long-range.
         exponents = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim
         inverse_frequencies = 1.0 / (theta**exponents)
 
         positions = torch.arange(max_seq_len, dtype=torch.float32, device=device)
         angles = torch.outer(positions, inverse_frequencies)  # max_seq_len x D/2
 
-        # Duplicated rather than interleaved, matching `rotate_half`: element i and
-        # element i + D/2 share a rotation angle.
+        # Duplicated rather than interleaved, matching `rotate_half`.
         angles = torch.cat((angles, angles), dim=-1)  # max_seq_len x D
 
-        # Tables stay fp32 even when activations are bf16: a bf16 cosine near a zero
-        # crossing loses enough precision to shift tokens.
+        # Tables stay fp32: a bf16 cosine near a zero crossing would shift tokens.
         self.cos = angles.cos()
         self.sin = angles.sin()
 
@@ -214,8 +152,6 @@ class RoPE:
         return apply_rope(x, positions, self.cos, self.sin)
 
 
-# --- 5. Grouped-query attention ----------------------------------------------
-
 def scaled_dot_product_attention_grouped(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -223,15 +159,7 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: torch.Tensor | str | None = None,
 ) -> torch.Tensor:
-    """Grouped-query attention: H_k KV heads serving H_q query heads, G = H_q / H_k.
-    q is B x H_q x L x D, k and v are B x H_k x S x D, out matches q.
-
-    Reshapes the query to B x H_k x G x L x D and lets broadcasting align each KV
-    head with its group, rather than materializing G copies of the cache GQA exists
-    to avoid. It does materialize the whole L x S score matrix, which the
-    FlashAttention-style kernels avoid; it is their oracle. mask="causal" gives
-    dense causal attention.
-    """
+    """Grouped-query attention: q is B x H_q x L x D, k and v are B x H_k x S x D."""
     *batch, num_query_heads, query_len, head_dim = q.shape
     num_kv_heads = k.shape[-3]
 
@@ -243,8 +171,7 @@ def scaled_dot_product_attention_grouped(
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
 
-    # Split the query-head axis into (kv_head, group) so it broadcasts against
-    # the singleton group axis inserted into K and V below.
+    # Split the query heads into (kv_head, group) so K and V broadcast over the group.
     q = q.reshape(*batch, num_kv_heads, group_size, query_len, head_dim)
     k = k.unsqueeze(-3)
     v = v.unsqueeze(-3)
@@ -257,12 +184,10 @@ def scaled_dot_product_attention_grouped(
         mask = causal_mask(query_len, source_len, q.dtype, q.device)
     if mask is not None:
         if mask.ndim == 4:
-            # A per-head mask is shaped for B x H_q x L x S, so its head axis
-            # needs the same (kv_head, group) split as the query.
+            # A per-head mask needs the same (kv_head, group) split as the query.
             mask = mask.reshape(*mask.shape[:-3], num_kv_heads, group_size, query_len, source_len)
         elif mask.ndim == 3:
-            # (B, L, S) and (H_q, L, S) are indistinguishable from the shape alone and
-            # would reshape the wrong way silently, so refuse to guess.
+            # (B, L, S) and (H_q, L, S) are indistinguishable from the shape alone.
             raise ValueError(
                 "ambiguous 3-D mask: pass L x S to share across heads, "
                 "or B x H_q x L x S to vary per head"
@@ -273,23 +198,13 @@ def scaled_dot_product_attention_grouped(
     return out.reshape(*batch, num_query_heads, query_len, head_dim)
 
 
-# --- 6. Dense causal attention -----------------------------------------------
-
 def causal_mask(
     query_len: int,
     source_len: int,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """An additive [query_len, source_len] mask: query i may attend to key j only when
-    j <= source_len - query_len + i.
-
-    Additive because such masks compose -- adding -inf before the softmax drives a
-    position to exactly zero after it. The offset is the subtlety: at L == S it is a
-    lower triangle, but at L < S the queries are the last positions rather than the
-    first, so the diagonal shifts right by S - L. Omitting it prefills correctly and
-    then decodes nonsense.
-    """
+    """An additive [query_len, source_len] mask: query i may attend to key j <= S - L + i."""
     offset = source_len - query_len
     rows = torch.arange(query_len, device=device).unsqueeze(1)
     columns = torch.arange(source_len, device=device).unsqueeze(0)
@@ -299,8 +214,6 @@ def causal_mask(
         ~allowed, float("-inf")
     )
 
-
-# --- 7. Reference paged attention --------------------------------------------
 
 def paged_attention_gathered(
     q: torch.Tensor,
@@ -313,18 +226,10 @@ def paged_attention_gathered(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Grouped-query causal attention over a paged cache, one sequence at a time.
+    """Causal grouped attention over a paged cache, gathering each sequence's pages first.
 
-        q:              T x H_q x D              scheduled tokens, concatenated
-        key/value_pool: num_blocks x P x H_k x D one layer's pages
-        block_tables:   int32 N x max_blocks     -1 padded
-        cu_seqlens_q:   int32 N + 1              where each sequence's queries start
-        context_lens:   int32 N                  cached tokens each attends over
-
-    The oracle for the paged kernels: it walks each block table, copies that
-    sequence's KV into a contiguous tensor, and calls the reference attention -- a
-    full copy of the cache every iteration, but correct by construction. With FP8
-    pools the gather also dequantizes, as the kernel does in registers.
+    q is T x H_q x D, the pools are num_blocks x P x H_k x D, and the int32 metadata is
+    block_tables (N x max_blocks, -1 padded), cu_seqlens_q (N + 1) and context_lens (N).
     """
     if q.dim() != 3:
         raise ValueError(f"expected q shaped T x H_q x D, got {tuple(q.shape)}")
@@ -367,9 +272,7 @@ def paged_attention_gathered(
                 f"but its table is padded there: {block_tables[index].tolist()}"
             )
 
-        # The gather: `index_select` on the block axis, then flatten block and offset
-        # back into one logical axis, which works because the two are adjacent. The
-        # kernel does the same arithmetic per element instead of per block.
+        # index_select on the block axis, then flatten block and offset into one axis.
         ids = table.to(dtype=torch.int64, device=key_pool.device)
         keys = key_pool.index_select(0, ids).reshape(-1, num_kv_heads, head_dim)
         values = value_pool.index_select(0, ids).reshape(-1, num_kv_heads, head_dim)
@@ -389,17 +292,6 @@ def paged_attention_gathered(
         out[start:end] = attended.squeeze(0).permute(1, 0, 2)
 
     return out
-
-
-# --- 8. Sampling probabilities -----------------------------------------------
-
-# Everything below is vectorized across the batch with per-row parameters. A server
-# batches whatever requests arrive together and they will not agree on temperature:
-# row 0 may be greedy while row 1 wants `temperature=1.2, top_p=0.9`. Looping over rows
-# would put a Python loop inside the decode step, the hottest path in the engine, so
-# every row is masked and scaled in parallel and greedy is handled as `temperature == 0`
-# rather than as a separate code path. The cost is one sort along the vocabulary axis
-# per step, which is what makes per-row top-k and top-p expressible as pure tensor ops.
 
 
 def _as_columns(
@@ -426,13 +318,7 @@ def sampling_probabilities(
     logits: torch.Tensor,
     params: SamplingParams | Sequence[SamplingParams],
 ) -> torch.Tensor:
-    """The distribution each row will be sampled from: logits [B, V] -> probabilities
-    [B, V], fp32, rows summing to 1.
-
-    Separate from sample because it makes the sampler testable, and because
-    rejection sampling needs distributions rather than draws. Temperature applies
-    first, so top-k and top-p see the same probabilities the draw will.
-    """
+    """The fp32 [B, V] distribution each row will be sampled from, vectorized per row."""
     if logits.ndim != 2:
         raise ValueError(f"expected B x V logits, got shape {tuple(logits.shape)}")
 
@@ -440,8 +326,7 @@ def sampling_probabilities(
     temperature, top_k, top_p = _as_columns(params, batch, logits.device)
 
     greedy = temperature == 0.0
-    # Divide by 1.0 on greedy rows to keep this branch-free and finite; those rows
-    # are overwritten with their one-hot below.
+    # Divide by 1.0 on greedy rows to stay branch-free; they are overwritten below.
     scaled = logits.float() / torch.where(greedy, torch.ones_like(temperature), temperature)
 
     descending, order = scaled.sort(dim=-1, descending=True)
@@ -452,9 +337,7 @@ def sampling_probabilities(
     effective_k = torch.where(top_k == 0, torch.full_like(top_k, vocab), top_k)
     keep = rank < effective_k
 
-    # top-p: keep a token while the probability mass strictly before it is below p. That
-    # gives the smallest prefix whose total reaches p, including the boundary token that
-    # crosses it rather than stopping short.
+    # top-p: keep a token while the mass strictly before it is below p, boundary included.
     mass_before = probabilities.cumsum(dim=-1) - probabilities
     keep &= mass_before < top_p
 
@@ -476,16 +359,11 @@ def sampling_probabilities(
     return result
 
 
-# --- 9. Sampling -------------------------------------------------------------
-
 def sample(
     logits: torch.Tensor,
     params: SamplingParams | Sequence[SamplingParams] = SamplingParams(),
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Draw one token per row: logits [B, V] -> tokens [B]. Greedy rows come out of
-    the same path, their distribution being one-hot. Pass a generator to make a
-    draw reproducible without disturbing global RNG state.
-    """
+    """Draw one token per row: logits [B, V] -> tokens [B]; greedy rows are one-hot."""
     probabilities = sampling_probabilities(logits, params)
     return torch.multinomial(probabilities, num_samples=1, generator=generator).squeeze(1)

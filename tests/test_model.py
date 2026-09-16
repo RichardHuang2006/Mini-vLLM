@@ -1,10 +1,8 @@
 """The reference ops, the weight loader, and the three Qwen3 variants.
 
-The oracle chain tested link by link -- transformers against Qwen3, Qwen3
-against Qwen3Cached, Qwen3Cached against Qwen3Paged -- all exactly, in fp32, on
-greedy tokens, plus the ops against torch and the loader's name mapping checked
-total in both directions. Everything runs on the CPU unless marked; oracle
-tests need the real Qwen3-0.6B checkpoint.
+The oracle chain link by link: transformers vs Qwen3, Qwen3 vs Qwen3Cached, Qwen3Cached
+vs Qwen3Paged. Everything runs on the CPU unless marked; oracle tests need the real
+Qwen3-0.6B checkpoint.
 """
 
 from __future__ import annotations
@@ -17,11 +15,14 @@ from conftest import (
     assert_relative_error_below,
     assert_tokens_equal,
     config_from_hf,
+    make_tiny_qwen3,
     qwen3_from_hf,
     weights_from_hf,
 )
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEmbedding
 
-from mini_vllm import ops
+from mini_vllm import kernels, ops
 from mini_vllm.cache import BlockManager, DenseKvCache
 from mini_vllm.config import ModelConfig, SamplingParams
 from mini_vllm.engine import generate_ids, generate_ids_cached
@@ -31,6 +32,7 @@ from mini_vllm.model import (
     Qwen3Paged,
     expected_names,
     expected_shape,
+    load_weights,
     map_name,
     resolve_model_path,
 )
@@ -38,8 +40,6 @@ from mini_vllm.scheduler import ForwardBatch, Sequence
 
 GREEDY = SamplingParams(temperature=0.0)
 
-
-# --- Reference ops -----------------------------------------------------------
 
 def test_linear_matches_torch():
     x, w, bias = torch.randn(3, 5, 8), torch.randn(4, 8), torch.randn(4)
@@ -61,8 +61,6 @@ def test_softmax_is_stable_at_large_logits():
 
 def test_rms_norm_matches_hf_semantics():
     """fp32 reduction, cast back before the weight multiply — HF's exact order."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
-
     x = torch.randn(2, 7, 64, dtype=torch.bfloat16)
     theirs = Qwen3RMSNorm(64, eps=1e-6)
     theirs.weight.data = torch.randn(64, dtype=torch.bfloat16)
@@ -75,14 +73,9 @@ def test_rms_norm_matches_hf_semantics():
 
 def test_rope_matches_hf_tables():
     """Same frequencies, same rotate-half convention, row for row."""
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-
-    from conftest import make_tiny_qwen3
-
     hf_model = make_tiny_qwen3()
     head_dim = hf_model.config.head_dim
-    # Read theta through our own config parser: transformers 5.x makes `rope_theta` a
-    # per-layer attribute that raises on global access.
+    # Through our own parser: transformers 5.x raises on global `rope_theta` access.
     theta = config_from_hf(hf_model).rope_theta
     rope = ops.RoPE(head_dim, 128, theta=theta)
 
@@ -146,8 +139,6 @@ def test_paged_attention_gathered_rejects_causality_violations():
         )
 
 
-# --- Sampling ----------------------------------------------------------------
-
 def test_greedy_rows_are_one_hot():
     logits = torch.randn(3, 50)
     probabilities = ops.sampling_probabilities(logits, GREEDY)
@@ -186,15 +177,10 @@ def test_a_seeded_generator_reproduces_the_draw():
 
 
 def test_dispatch_falls_back_on_cpu_tensors():
-    """`use_cuda=True` on CPU tensors quietly runs the reference: one model object
-    serves both CPU tests and GPU runs."""
-    from mini_vllm import kernels
-
+    """`use_cuda=True` on CPU tensors runs the reference, so one model object serves both."""
     x, weight = torch.randn(4, 64), torch.randn(64)
     assert_allclose(kernels.rmsnorm(x, weight, use_cuda=True), ops.rms_norm(x, weight))
 
-
-# --- The loader --------------------------------------------------------------
 
 def test_the_name_mapping_is_total_in_both_directions(tiny_qwen3):
     """Every HF tensor is consumed or deliberately dropped; every local name is filled."""
@@ -231,10 +217,6 @@ def test_model_config_reads_nested_rope_theta():
 @pytest.mark.oracle
 def test_every_real_tensor_is_bitwise_equal_to_transformers():
     """The loader against the transformers state dict, tensor for tensor."""
-    from transformers import AutoModelForCausalLM
-
-    from mini_vllm.model import load_weights
-
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
         pytest.skip("Qwen3-0.6B weights are not downloaded")
@@ -248,10 +230,8 @@ def test_every_real_tensor_is_bitwise_equal_to_transformers():
         assert torch.equal(ours[name], reference[name]), f"{name} differs from transformers"
 
 
-# --- Dense model vs HF -------------------------------------------------------
-
 def test_logits_match_hf_on_the_tiny_model(tiny_qwen3):
-    """The dense model against HuggingFace's, same random weights, fp32, exact-ish."""
+    """The dense model against HuggingFace's, same random weights, fp32."""
     model = qwen3_from_hf(tiny_qwen3)
     ids = torch.randint(0, 512, (2, 12))
 
@@ -276,9 +256,7 @@ def test_greedy_tokens_match_hf_on_the_tiny_model(tiny_qwen3):
 
 @pytest.mark.oracle
 def test_real_logits_sit_within_the_bf16_drift_limit():
-    """The real checkpoint, real text: within 5% of HF, where a broken model sits at 14%."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
+    """The real checkpoint on real text: within 5% of HF, where a broken model sits at 14%."""
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
         pytest.skip("Qwen3-0.6B weights are not downloaded")
@@ -293,8 +271,6 @@ def test_real_logits_sit_within_the_bf16_drift_limit():
 
     assert_relative_error_below(model(ids), theirs, BF16_DRIFT_LIMIT)
 
-
-# --- Cached vs dense ---------------------------------------------------------
 
 def test_the_dense_cache_appends_like_concat():
     cache = DenseKvCache()
@@ -335,18 +311,14 @@ def test_cached_decode_matches_recomputing_from_scratch(tiny_qwen3):
 
 
 def test_chunked_prefill_matches_one_pass(tiny_qwen3):
-    """Feeding the prompt in pieces must give the last position the same logits.
-
-    This is the model-side half of chunked prefill: explicit positions and the offset
-    causal mask. Chunk sizes straddle every edge — single tokens, an uneven split, all
-    but one, and the whole prompt.
-    """
+    """Feeding the prompt in pieces must give the last position the same logits."""
     config, weights = config_from_hf(tiny_qwen3), weights_from_hf(tiny_qwen3)
     cached = Qwen3Cached(config, weights)
     prompt = torch.randint(0, 512, (1, 50))
 
     whole = cached(prompt, cached.create_kv_cache(), last_only=True)
 
+    # Chunk sizes straddle every edge: single tokens, an uneven split, all but one, all.
     for chunk in (1, 7, 49, 50):
         caches = cached.create_kv_cache()
         last = None
@@ -359,11 +331,7 @@ def test_chunked_prefill_matches_one_pass(tiny_qwen3):
 
 
 def test_a_wrong_position_at_a_chunk_boundary_is_caught(tiny_qwen3):
-    """Restarting RoPE at zero on the second chunk must change the logits.
-
-    This is the mutation the test above protects against; if it ever stops being
-    detectable, that comparison has stopped measuring anything.
-    """
+    """Restarting RoPE at zero on the second chunk must change the logits."""
     config, weights = config_from_hf(tiny_qwen3), weights_from_hf(tiny_qwen3)
     cached = Qwen3Cached(config, weights)
     prompt = torch.randint(0, 512, (1, 40))
@@ -392,8 +360,6 @@ def test_the_generation_loops_agree(tiny_qwen3):
         generate_ids(dense, ids, max_tokens=8),
     )
 
-
-# --- Paged vs cached ---------------------------------------------------------
 
 def paged_from(tiny_qwen3, num_blocks: int = 64, block_size: int = 4) -> Qwen3Paged:
     config, weights = config_from_hf(tiny_qwen3), weights_from_hf(tiny_qwen3)
@@ -460,13 +426,9 @@ def test_a_self_draft_shares_weights_and_truncates_layers(tiny_qwen3):
     assert draft.manager is draft_manager
 
 
-# --- Real weights ------------------------------------------------------------
-
 @pytest.mark.oracle
 def test_real_greedy_generation_matches_transformers():
     """The cached model against `transformers.generate`, fp32, token for token."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
         pytest.skip("Qwen3-0.6B weights are not downloaded")

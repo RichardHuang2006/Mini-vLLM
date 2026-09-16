@@ -1,16 +1,13 @@
-"""The benchmark harness: evidence for every performance claim in the README.
+"""The benchmark harness: one mode per performance claim in the README.
 
-How to measure a GPU inference engine without fooling yourself -- every timed
-region is bracketed by torch.cuda.synchronize(), warmed up first, and watched
-by ClockSampler, which voids a run whose clocks were throttled. One mode per
-claim (single, kernels, throughput, scheduler, prefix-cache, fp8, spec), each
-printing a uniform evidence header so a result can be reproduced or
-disqualified from the transcript alone.
+Every timed region is bracketed by torch.cuda.synchronize(), warmed up first, and
+watched by ClockSampler, which voids a run whose clocks were throttled.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import platform
 import random
@@ -23,10 +20,14 @@ from collections.abc import Callable, Sequence as SequenceABC
 from dataclasses import dataclass, field
 
 import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mini_vllm import kernels
-from mini_vllm.config import DEFAULT_MODEL_ID
-from mini_vllm.engine import generate_ids, generate_ids_cached, load
+from mini_vllm.cache import PagedKvPool
+from mini_vllm.config import DEFAULT_MODEL_ID, SamplingParams
+from mini_vllm.engine import LLM, generate_ids, generate_ids_cached, load
+from mini_vllm.model import resolve_model_path
+from mini_vllm.ops import RoPE
 
 __all__ = [
     "GpuState",
@@ -48,28 +49,21 @@ __all__ = [
     "throughput_prompts",
 ]
 
-# Repeated to fill any requested prompt length. Real text rather than random ids: speed
-# is unaffected, but it keeps the generated continuation readable when something looks
-# wrong.
+# Repeated to fill any prompt length; real text keeps the continuation readable.
 FILLER = (
     "The city of Rome was founded in 753 BC by the twin brothers Romulus and Remus, "
     "and grew over the following centuries into the capital of an empire. "
 )
 
-# The prompt lengths a throughput run cycles through. Varied deliberately: equal-length
-# prompts are the one case where padding costs nothing, so using them would hide most of
-# what continuous batching and paging buy. A 16x spread is ordinary for a chat workload.
+# Prompt lengths a throughput run cycles through; equal lengths would hide the padding.
 THROUGHPUT_LENGTHS = (32, 64, 128, 256, 512)
 
-# The scheduler stress mix: many short chat-like requests, with one document-sized
-# prompt dropped in periodically — the request that can delay every other.
+# The scheduler stress mix: short chat-like requests, one long prompt in every twenty.
 STRESS_SHORT_LEN = 32
 STRESS_LONG_LEN = 2048
 STRESS_LONG_EVERY = 20
 STRESS_OUTPUT_LEN = 32
 
-
-# --- 1. GPU state ------------------------------------------------------------
 
 @dataclass(frozen=True)
 class GpuState:
@@ -93,11 +87,7 @@ class GpuState:
 
     @property
     def is_throttled(self) -> bool:
-        """True when the card is running far enough below its clocks to void results.
-
-        Half speed is the threshold: boost behaviour means a healthy GPU never sits at
-        exactly its maximum, but under half of it the card is idle rather than working.
-        """
+        """True below half the rated clocks, where the card is idling rather than working."""
         return self.sm_fraction < 0.5 or self.memory_fraction < 0.5
 
     def describe(self) -> str:
@@ -111,9 +101,8 @@ class GpuState:
 def gpu_state() -> GpuState | None:
     """Read the current clocks from `nvidia-smi`, or None if that is not possible.
 
-    Only meaningful while the GPU is busy: clocks fall back to idle within milliseconds
-    of the work finishing, so a reading taken after a benchmark always looks throttled.
-    Use :class:`ClockSampler` to observe a run.
+    Only meaningful while the GPU is busy, since clocks fall back to idle within
+    milliseconds; use :class:`ClockSampler` to observe a run.
     """
     if not shutil.which("nvidia-smi"):
         return None
@@ -150,9 +139,8 @@ def gpu_state() -> GpuState | None:
 class ClockSampler:
     """Watches the GPU clocks in the background and keeps the highest seen.
 
-    A single reading is not informative: clocks ramp, so one taken at the wrong moment
-    is either idle or a boost spike. The peak over a run establishes whether the card
-    was allowed to run fast while the measurement was in flight.
+    A single reading is not informative: clocks ramp, so one taken at the wrong moment is
+    either idle or a boost spike.
     """
 
     def __init__(self, interval: float = 0.25) -> None:
@@ -221,8 +209,6 @@ def evidence_header(
     print()
 
 
-# --- 2. Shared plumbing ------------------------------------------------------
-
 def _synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -230,9 +216,7 @@ def _synchronize(device: torch.device) -> None:
 
 def _free_device_memory() -> None:
     """Release the allocator's cache so the next engine sizes itself against real free
-    memory. Two engines do not fit on an 8 GB card at once."""
-    import gc
-
+    memory; two engines do not fit on an 8 GB card at once."""
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -248,11 +232,7 @@ def build_input_ids(tokenizer, input_len: int, batch: int, device) -> torch.Tens
 
 
 def percentile(values: SequenceABC[float], fraction: float) -> float:
-    """The nearest-rank percentile: the smallest sample at or above `fraction` of them.
-
-    No interpolation: a P99 that averages two neighbours reports a latency no request
-    experienced, where a tail figure should name one a caller actually waited.
-    """
+    """The nearest-rank percentile, so a tail figure names a latency someone waited."""
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -260,15 +240,11 @@ def percentile(values: SequenceABC[float], fraction: float) -> float:
     return ordered[index]
 
 
-# --- 3. Mode: single ---------------------------------------------------------
-
 def mode_single(args) -> None:
-    """One request: TTFT and decode tok/s, optionally vs transformers.
+    """One request: TTFT and decode tok/s, optionally against transformers.
 
-    TTFT is dominated by a compute-bound pass over the whole prompt; decode tokens/sec
-    by memory bandwidth, since each step reads all 1.2 GB of weights to produce one
-    token. `--no-cache` times the quadratic uncached loop instead, the comparison that
-    motivates the KV cache.
+    TTFT is dominated by a compute-bound pass over the whole prompt; decode tokens/sec by
+    memory bandwidth. `--no-cache` times the quadratic uncached loop instead.
     """
     evidence_header(
         "single", "TTFT (ms) and decode tok/s", args.model, "bfloat16",
@@ -320,10 +296,6 @@ def mode_single(args) -> None:
                 rows.append(("mini-vllm", ttft * 1e3, steps * args.batch / decode))
 
             if args.compare == "hf":
-                from transformers import AutoModelForCausalLM
-
-                from mini_vllm.model import resolve_model_path
-
                 print("loading the transformers baseline ...")
                 hf = (AutoModelForCausalLM.from_pretrained(
                     resolve_model_path(args.model), dtype=torch.bfloat16).to(device).eval())
@@ -359,15 +331,12 @@ def mode_single(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 4. Mode: kernels --------------------------------------------------------
-
 @dataclass(frozen=True)
 class BandwidthResult:
     """One kernel, timed and converted into bytes per second.
 
-    `bytes_moved` is the traffic the op cannot avoid — read the input, write the
-    output — rather than the traffic it happened to generate, so a redundant reread
-    lowers the reported rate instead of raising it.
+    `bytes_moved` is the traffic the op cannot avoid, so a redundant reread lowers the
+    reported rate instead of raising it.
     """
 
     label: str
@@ -390,17 +359,12 @@ class BandwidthResult:
 
 
 def theoretical_bandwidth(device: int = 0) -> float | None:
-    """The card's peak memory bandwidth in GB/s, from its clock and bus width.
-
-    Double data rate, so the transfer rate is twice the reported memory clock. On the
-    hardware of record this comes to 384 GB/s. Worth re-checking on a new card: a peak
-    wrong by 2x invalidates every percentage derived from it.
-    """
+    """The card's peak memory bandwidth in GB/s, from its clock and bus width."""
     if not torch.cuda.is_available():
         return None
     properties = torch.cuda.get_device_properties(device)
     clock_hertz = properties.memory_clock_rate * 1e3  # the attribute is in kHz
-    return 2.0 * clock_hertz * (properties.memory_bus_width / 8) / 1e9
+    return 2.0 * clock_hertz * (properties.memory_bus_width / 8) / 1e9  # double data rate
 
 
 def measure_bandwidth(
@@ -410,15 +374,12 @@ def measure_bandwidth(
     warmup: int = 5,
     iterations: int = 100,
 ) -> BandwidthResult:
-    """Time ``call`` back to back and report the traffic rate it sustained.
-
-    The whole run is bracketed by one pair of syncs rather than syncing per iteration,
-    which for the short cases would time the synchronization instead.
-    """
+    """Time ``call`` back to back and report the traffic rate it sustained."""
     for _ in range(warmup):
         call()
     torch.cuda.synchronize()
 
+    # One pair of syncs for the whole run: per iteration it would time the sync.
     started = time.perf_counter()
     for _ in range(iterations):
         call()
@@ -429,13 +390,7 @@ def measure_bandwidth(
 
 
 def copy_ceiling(megabytes: int = 256, dtype: torch.dtype = torch.bfloat16) -> BandwidthResult:
-    """What a bare `copy_` of a large buffer achieves — the practical ceiling.
-
-    The theoretical peak is an upper bound nothing reaches; this is what a kernel that
-    only moves bytes achieves on this machine, making it the fairer baseline. It doubles
-    as a throttle check: an order of magnitude below spec means the GPU is idling and
-    every figure below it is invalid.
-    """
+    """What a bare `copy_` of a large buffer achieves: the practical bandwidth ceiling."""
     elements = megabytes * 1024 * 1024 // torch.tensor([], dtype=dtype).element_size()
     source = torch.randn(elements, device="cuda", dtype=dtype)
     destination = torch.empty_like(source)
@@ -457,9 +412,8 @@ class KernelCase:
 def rows_exceeding_l2(width: int, dtype: torch.dtype, multiple: int = 8) -> int:
     """How many rows it takes for the working set to be `multiple` times the L2.
 
-    This card has a 32 MB L2, larger than most tensors a 0.6B model touches. A benchmark
-    whose input and output both fit in L2 is not measuring memory bandwidth; the symptom
-    is a reported rate above the card's DRAM peak.
+    A case whose input and output both fit in L2 reports cache bandwidth, not memory
+    bandwidth; the symptom is a rate above the card's DRAM peak.
     """
     element_size = torch.tensor([], dtype=dtype).element_size()
     l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
@@ -471,8 +425,7 @@ def _quantize_into(key, value, pools, use_cuda: bool):
     """Scatter one step's KV into ``pools`` and return the key pool for comparison.
 
     `kernels.quantize_scatter` writes in place and returns nothing, but a case must
-    return what it computed so the tests can check kernel and reference agree rather
-    than assuming a speedup is not one side doing less work.
+    return what it computed so a speedup cannot be one side doing less work.
     """
     kernels.quantize_scatter(key, value, *pools, 1.0, 1.0, use_cuda=use_cuda)
     return pools[0]
@@ -481,10 +434,8 @@ def _quantize_into(key, value, pools, use_cuda: bool):
 def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
     """One case per implemented kernel per regime that matters.
 
-    Widths are the model's real ones. Two regimes per elementwise kernel: 1 row (one
-    block on one SM — launch latency, the shape a decode step has) and past-L2 (the
-    only regime where a fraction of peak bandwidth is meaningful). Attention sweeps the
-    context length instead, since its work grows with the cache rather than the batch.
+    Widths are the model's real ones. Elementwise kernels get one row (launch latency,
+    the decode shape) and a past-L2 size; attention sweeps the context length instead.
     """
     if not torch.cuda.is_available():
         return []
@@ -522,8 +473,6 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 bytes_moved=moved))
 
     if "rope" in implemented:
-        from mini_vllm.ops import RoPE
-
         heads, head_dim = 16, 128  # Qwen3-0.6B's H_q and D
         per_token = heads * head_dim
         longest = max(rows for rows, _ in regimes(per_token))
@@ -531,8 +480,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
         for rows, note in regimes(per_token):
             x = torch.randn(1, rows, heads, head_dim, device="cuda", dtype=dtype)
             positions = torch.arange(rows, device="cuda")
-            # The table rows are shared by every head of a token, so they add D fp32
-            # pairs per token on top of the activation traffic.
+            # Table rows are shared by a token's heads: D fp32 pairs per token extra.
             moved = 2 * x.numel() * x.element_size() + 2 * rows * head_dim * 4
             cases.append(KernelCase(
                 label=f"rope H={heads} D={head_dim} ({note})",
@@ -544,9 +492,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
     scale = 1.0 / math.sqrt(head_dim)
 
     if "decode_attention" in implemented:
-        # The swept axis is the cache length. At 8192 the K/V of a single layer is
-        # 32 MB, exactly this card's L2, so only the longest context is DRAM-bound —
-        # and long contexts are what the split-key path exists for.
+        # At 8192 one layer's K/V is 32 MB, this card's L2: only that case is DRAM-bound.
         for source_len in (1024, 8192):
             q = torch.randn(1, query_heads, 1, head_dim, device="cuda", dtype=dtype)
             k = torch.randn(1, kv_heads, source_len, head_dim, device="cuda", dtype=dtype)
@@ -559,10 +505,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 bytes_moved=moved))
 
     if "flash_prefill" in implemented:
-        # The one compute-bound case here, so the GB/s column carries little information
-        # and the speedup column is what matters: the oracle materializes an L x S score
-        # matrix this kernel never writes — but computes it with cuBLAS on tensor cores,
-        # which is why this kernel sits in NOT_YET_FASTER.
+        # The one compute-bound case, so the speedup column matters and GB/s does not.
         for query_len in (512,):
             q = torch.randn(1, query_heads, query_len, head_dim, device="cuda", dtype=dtype)
             k = torch.randn(1, kv_heads, query_len, head_dim, device="cuda", dtype=dtype)
@@ -575,18 +518,14 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 bytes_moved=moved))
 
     if "paged_attention" in implemented:
-        # The engine's decode shape: a batch of sequences, one token each, attending
-        # over pages scattered through a pool. The reference is the dense-gather oracle,
-        # so the speedup measures the removal of a full cache copy per iteration, not a
-        # better loop over the same data.
+        # The engine's decode shape: the speedup is a removed cache copy per iteration.
         for batch, context_len in ((16, 1024), (64, 1024)):
             blocks_each = -(-context_len // block_size)
             pool_blocks = batch * blocks_each
             keys = torch.randn(pool_blocks, block_size, kv_heads, head_dim,
                                device="cuda", dtype=dtype)
             values = torch.randn_like(keys)
-            # Shuffled deliberately: a pool in logical order would give the kernel
-            # sequential reads it will not get after a few thousand allocations.
+            # Shuffled: a pool in logical order would give reads an aged one never does.
             shuffled = torch.randperm(pool_blocks, device="cuda", dtype=torch.int32)
             block_tables = shuffled.reshape(batch, blocks_each).contiguous()
             q = torch.randn(batch, query_heads, head_dim, device="cuda", dtype=dtype)
@@ -603,8 +542,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                     q, *p, 1, s, scale),
                 bytes_moved=moved))
 
-        # A prefill chunk, the case the scalar kernel loses. Kept so the shapes are not
-        # selected to favour the kernel; a tensor-core prefill kernel is deferred.
+        # A prefill chunk: the case the kernel loses, kept so the shapes stay honest.
         for query_len, context_len in ((512, 2048),):
             blocks_each = -(-context_len // block_size)
             keys = torch.randn(blocks_each, block_size, kv_heads, head_dim,
@@ -627,10 +565,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
                 bytes_moved=moved))
 
     if "kv_quantize_scatter" in implemented:
-        # Writing a step's KV into the FP8 cache: a division, a cast and a store per
-        # element, the clearest fusion case here. The reference reads the activations,
-        # writes a whole quantized temporary, reads it back and scatters it; the kernel
-        # reads once and writes once.
+        # The clearest fusion case: the reference's temporary against one pass.
         for tokens, note in ((1, "decode, 1 token"), (4096, "past L2")):
             key = torch.randn(tokens, kv_heads, head_dim, device="cuda", dtype=dtype)
             value = torch.randn_like(key)
@@ -690,8 +625,6 @@ def mode_kernels(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 5. Mode: throughput -----------------------------------------------------
-
 def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
     """`num_requests` prompts whose lengths cycle through `THROUGHPUT_LENGTHS`."""
     lengths = [THROUGHPUT_LENGTHS[i % len(THROUGHPUT_LENGTHS)] for i in range(num_requests)]
@@ -704,17 +637,11 @@ def throughput_prompts(tokenizer, num_requests: int) -> list[str]:
 
 
 def mode_throughput(args) -> None:
-    """Output tokens/sec over a whole request set, by concurrency, vs transformers. The
-    comparison is asymmetric by construction, which is the finding: generate takes
-    one padded rectangle, so prompts of 32 to 512 tokens all run for 512, while the
-    engine gives each sequence its own length and admits a replacement the iteration
-    a request finishes.
+    """Output tokens/sec over a whole request set, by concurrency, vs transformers.
+
+    The comparison is asymmetric by construction, which is the finding: `generate` takes
+    one padded rectangle, while the engine gives each sequence its own length.
     """
-    from transformers import AutoTokenizer
-
-    from mini_vllm import LLM
-    from mini_vllm.model import resolve_model_path
-
     batch_sizes = [int(size) for size in args.batch_sizes.split(",")]
     evidence_header(
         "throughput", "output tok/s over a whole request set (eos ignored)", args.model,
@@ -724,13 +651,9 @@ def mode_throughput(args) -> None:
     path = resolve_model_path(args.model)
     tokenizer = AutoTokenizer.from_pretrained(path)
 
-    # The baseline is loaded first when there is one, because the engine sizes its KV
-    # pool from the memory free at startup; loading it second would hand the engine a
-    # budget it then has to give back, which on an 8 GB card is an out-of-memory error.
+    # Loaded first: the engine sizes its KV pool from the memory free at startup.
     hf_model = None
     if args.compare == "hf":
-        from transformers import AutoModelForCausalLM
-
         print("loading the transformers baseline ...")
         hf_model = (AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16)
                     .to(args.device).eval())
@@ -792,8 +715,6 @@ def mode_throughput(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 6. Mode: scheduler ------------------------------------------------------
-
 @dataclass(frozen=True)
 class StressRequest:
     """One arrival: when it shows up, what it asks for, and how much it wants back."""
@@ -808,10 +729,9 @@ class StressRequest:
 
 
 def poisson_arrivals(num_requests: int, rate: float, seed: int = 0) -> list[float]:
-    """Arrival times of a Poisson process of `rate` requests per second.
+    """Arrival times of a Poisson process of `rate` requests per second; 0 means at once.
 
-    Poisson rather than evenly spaced: bursts are what stress a scheduler, and
-    exponential gaps produce them. Rate 0 means all at once.
+    Poisson rather than evenly spaced, because bursts are what stress a scheduler.
     """
     if num_requests < 0:
         raise ValueError(f"num_requests must be >= 0, got {num_requests}")
@@ -840,9 +760,8 @@ def stress_requests(
 ) -> list[StressRequest]:
     """`num_requests` arrivals, one long prompt every `long_every` short ones.
 
-    Prompts are random token ids rather than text: nothing here reads the output, and a
-    tokenizer call per request would put minutes of Python between the engine and the
-    measurement.
+    Prompts are random token ids: nothing here reads the output, and a tokenizer call per
+    request would put minutes of Python between the engine and the measurement.
     """
     generator = random.Random(seed + 1)
     arrivals = poisson_arrivals(num_requests, rate, seed)
@@ -861,10 +780,8 @@ def stress_requests(
 class LatencyStats:
     """One policy's run over the stress mix, in the units an SLO is written in.
 
-    `inter_token` is the gap between consecutive tokens of the same sequence, the
-    latency a caller reading a stream sees. Its tail is the metric this mode exists to
-    move: a mean hides a stall, since one iteration spent on a 2048-token prompt is
-    amortized away by the hundreds of fast iterations around it.
+    `inter_token` is the gap between consecutive tokens of one sequence — the latency a
+    streaming caller sees, and the tail this mode exists to move.
     """
 
     label: str
@@ -898,10 +815,8 @@ class LatencyStats:
     def max_iteration_ms(self) -> float:
         """The slowest single iteration, which is the tail's floor.
 
-        Separates the two causes of a long gap: a decode that was not scheduled for
-        several iterations (a policy problem, what this mode measures) and one
-        iteration that took a long time (allocator growth, a driver stall). A P99 gap
-        of roughly one iteration means the scheduler is behaving.
+        It separates a decode that waited several iterations (a policy problem) from one
+        iteration that simply took a long time.
         """
         return max(self.iteration_seconds, default=0.0) * 1000.0
 
@@ -914,8 +829,7 @@ class LatencyStats:
         """Total time callers spent waiting beyond a normal iteration, summed.
 
         The load-robust view of the tail: a percentile depends on how many callers were
-        unlucky and therefore on the arrival rate; this reports how much waiting the
-        policy caused in total, which does not.
+        unlucky, and so on the arrival rate; this does not.
         """
         floor = percentile(self.iteration_seconds, 0.50)
         return sum(max(gap - floor, 0.0) for gap in self.inter_token)
@@ -934,10 +848,8 @@ def run_stress(llm, requests: SequenceABC[StressRequest], label: str,
                progress_every: int = 0) -> LatencyStats:
     """Replay an arrival schedule through the engine, timing every token.
 
-    The driver matches the shape of a synchronous engine: admit whatever is due, run
-    one iteration, record what came out. Arrivals are therefore quantized to iteration
-    boundaries and the resulting wait counts toward TTFT, which is correct since a real
-    server admits at the same boundaries.
+    Arrivals are quantized to iteration boundaries and the resulting wait counts toward
+    TTFT, which is correct: a real server admits at the same boundaries.
     """
     pending = deque(sorted(requests, key=lambda request: request.arrival))
     arrival_of: dict[int, float] = {}
@@ -975,8 +887,7 @@ def run_stress(llm, requests: SequenceABC[StressRequest], label: str,
             stats.completed += int(sequence.is_done())
 
         stats.iterations += 1
-        # The finished list exists for the tests; over thousands of requests it would
-        # hold every prompt of the run in memory.
+        # The finished list is for the tests; it would hold every prompt of this run.
         llm.scheduler.finished.clear()
 
         if progress_every and stats.iterations % progress_every == 0:
@@ -993,12 +904,9 @@ def run_stress(llm, requests: SequenceABC[StressRequest], label: str,
 def mode_scheduler(args) -> None:
     """The same Poisson arrival schedule under chunked prefill and prefill-priority.
 
-    Throughput barely moves between the two: the same work is done either way, and what
-    changes is which requests wait for it. The chunked run goes first so a crash in the
-    baseline still leaves the interesting number.
+    Throughput barely moves between the two: what changes is which requests wait. The
+    chunked run goes first so a crash in the baseline still leaves the interesting number.
     """
-    from mini_vllm import LLM
-
     evidence_header(
         "scheduler", "inter-token latency tails under both policies", args.model, "bfloat16",
         f"{args.num_requests} requests, Poisson {args.rate:.1f}/s, max_sequences {args.max_sequences}",
@@ -1059,16 +967,12 @@ def mode_scheduler(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 7. Mode: prefix-cache ---------------------------------------------------
-
 def mode_prefix_cache(args) -> None:
-    """The same shared-preamble workload with the radix tree on and off: many requests
-    opening with the same long system prompt and differing only in a short question,
-    which is what a chat server sees. The figure is TTFT, where a hit lands -- it
-    removes prompt tokens from the prefill, leaving decode untouched.
-    """
-    from mini_vllm import LLM, SamplingParams
+    """The same shared-preamble workload with the radix tree on and off.
 
+    The figure is TTFT, where a hit lands: it removes prompt tokens from the prefill and
+    leaves decode exactly as it was.
+    """
     preamble = ("You are a careful, concise assistant. Answer accurately, admit "
                 "uncertainty, and prefer short replies to long ones. ") * 12
     questions = [
@@ -1090,13 +994,10 @@ def mode_prefix_cache(args) -> None:
         for label, enabled in (("caching off", False), ("caching on", True)):
             llm = LLM(args.model, device=args.device, kv_fraction=args.kv_fraction,
                       enable_prefix_caching=enabled, use_cuda_kernels=args.use_cuda_kernels)
-            # Warm the cache the way a server would: by the time the second request
-            # arrives the preamble is resident. A cold first run would understate what
-            # the cache does for every request after it.
+            # Warm the cache the way a server would, before the timed requests.
             llm.generate(prompts[0], sampling_params=greedy, max_tokens=1)
 
-            # One request at a time, so TTFT is per request; submitted together, six
-            # prefills would share an iteration and the figure would measure the batch.
+            # One request at a time, so TTFT is per request rather than per batch.
             ttfts = []
             for prompt in prompts:
                 started = time.perf_counter()
@@ -1126,17 +1027,12 @@ def mode_prefix_cache(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 8. Mode: fp8 ------------------------------------------------------------
-
 def mode_fp8(args) -> None:
-    """FP8 vs BF16 KV cache: capacity for the same budget, and greedy agreement. An
-    e4m3 element is half a bf16 element, so the same budget holds twice the pages.
-    The model computes in bf16 either way and only the resident cache is quantized,
-    so divergence appears where a rounding in a cached key or value flips a near-tie.
-    """
-    from mini_vllm import LLM, SamplingParams
-    from mini_vllm.cache import PagedKvPool
+    """FP8 vs BF16 KV cache: capacity for the same budget, and greedy agreement.
 
+    The model computes in bf16 either way and only the resident cache is quantized, so
+    divergence appears where a rounding in a cached key or value flips a near-tie.
+    """
     prompts = [
         "The capital of France is",
         "Water boils at a temperature of",
@@ -1193,16 +1089,12 @@ def mode_fp8(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 9. Mode: spec -----------------------------------------------------------
-
 def mode_spec(args) -> None:
-    """Speculation off, then on at a sweep of self-draft depths. Reports acceptance
-    beside wall clock, since either alone misleads: a deep draft is accepted often
-    and costs nearly what the target costs, while a shallow one is cheap and
-    rejected. Paying off needs a genuinely smaller separate checkpoint.
-    """
-    from mini_vllm import LLM, SamplingParams
+    """Speculation off, then on at a sweep of self-draft depths.
 
+    Acceptance sits beside the wall clock because either alone misleads: a deep draft is
+    accepted often and costs nearly what the target costs, a shallow one is rejected.
+    """
     prompt = "Explain, step by step, why the sky appears blue during the day."
     greedy = SamplingParams(temperature=0.0)
     depths = [int(depth) for depth in args.draft_layers.split(",") if depth]
@@ -1251,8 +1143,6 @@ def mode_spec(args) -> None:
     report_gpu_verdict(sampler.peak)
 
 
-# --- 10. CLI -----------------------------------------------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Mini-vLLM.")
     parser.add_argument("--mode", default="single", choices=[
@@ -1262,8 +1152,7 @@ def main() -> None:
     parser.add_argument("--draft-layers", default="4,14,28",
                         help="--mode spec: draft depths to sweep")
     parser.add_argument("--input-len", type=int, default=128)
-    # Resolved below, since the right default depends on the mode: a latency run wants a
-    # long generation from few requests, and a stress run wants the opposite.
+    # Resolved below, since the right default depends on the mode.
     parser.add_argument("--output-len", type=int, default=None)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--batch-sizes", default="1,4,16",
@@ -1273,9 +1162,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=512)
     parser.add_argument("--kv-fraction", type=float, default=0.4)
     parser.add_argument("--num-requests", type=int, default=2000, help="--mode scheduler")
-    # Near what this card sustains on the mix, which is where scheduling decisions show
-    # up: far under capacity a long prompt catches only one or two decodes; far over,
-    # the tail measures the backlog rather than the decision.
+    # Near what this card sustains on the mix, which is where scheduling decisions show up.
     parser.add_argument("--rate", type=float, default=16.0,
                         help="--mode scheduler: arrivals/sec")
     parser.add_argument("--short-len", type=int, default=STRESS_SHORT_LEN)

@@ -1,23 +1,4 @@
-// RoPE: rotate q and k by the angle for each token's absolute position.
-//
-// The oracle is `apply_rope` in mini_vllm/positional_encoding.py:
-//
-//     rotated = x.float() * cos[positions] + rotate_half(x.float()) * sin[positions]
-//
-// which in PyTorch is three kernels and two materialized `B x L x H x D` temporaries, one
-// for the gather and one for `rotate_half`'s concatenation. Fused, the gather becomes
-// index arithmetic and the rotation never leaves registers, so the op is one read and one
-// write.
-//
-// Two conventions are inherited from the tables built in
-// mini_vllm/positional_encoding.py:
-//
-//   * Rotate halves, not adjacent pairs: element `i` pairs with `i + D/2`. Qwen3's
-//     weights were trained this way, and the RoFormer paper's interleaved pairing is a
-//     permutation of it that produces fluent nonsense rather than an error.
-//   * The tables are `max_seq_len x D`, fp32, with the angles duplicated so row `[i]` and
-//     row `[i + D/2]` hold the same angle. They stay fp32 even when activations are bf16,
-//     since a bf16 cosine near a zero crossing loses enough precision to move tokens.
+// RoPE at explicit positions; the oracle is `mini_vllm.ops.apply_rope`, tables and all.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -30,9 +11,7 @@ namespace {
 
 constexpr int kThreads = 256;
 
-// One thread per rotated pair — element `lane` and element `lane + half` of one head
-// vector — since the pair is the unit the rotation couples. A thread per element would
-// have each read its partner separately.
+// One thread per rotated pair, the unit the rotation couples.
 template <typename scalar_t, typename index_t>
 __global__ void rope_kernel(const scalar_t* __restrict__ x,
                             const index_t* __restrict__ positions,
@@ -53,16 +32,11 @@ __global__ void rope_kernel(const scalar_t* __restrict__ x,
   const int64_t row = index / half;  // which (token, head) vector
   const int64_t lane = index % half;
 
-  // Every head of a token rotates by the same angle, and a position tensor shorter than
-  // the token count broadcasts over the batch: the oracle's `unsqueeze(-2)` and broadcast
-  // expressed as arithmetic.
+  // The oracle's unsqueeze(-2) as arithmetic: one angle per token, shared by its heads.
   const int64_t token = row / heads;
   const int64_t position = static_cast<int64_t>(positions[token % token_count]);
 
-  // The oracle indexes the table with `cos[positions]`, so an out-of-range position is a
-  // device-side index error there as well. Left untested: a failed device assert cannot be
-  // caught and poisons the CUDA context for the rest of the process, so a test asserting
-  // it would take the suite down.
+  // Untested: a failed device assert poisons the CUDA context for the whole process.
   CUDA_KERNEL_ASSERT(position >= 0 && position < max_seq_len);
 
   const int64_t low = row * dim + lane;
@@ -73,10 +47,7 @@ __global__ void rope_kernel(const scalar_t* __restrict__ x,
   const float x_low = static_cast<float>(x[low]);
   const float x_high = static_cast<float>(x[high]);
 
-  // `rotate_half` sends [a, b] to [-b, a], so the low half of the output subtracts its
-  // partner and the high half adds. The two table rows are equal by construction, but
-  // reading both keeps this a transcription of the oracle rather than an assumption about
-  // the table's internal layout.
+  // `rotate_half` sends [a, b] to [-b, a]: the low half subtracts, the high half adds.
   out[low] = static_cast<scalar_t>(x_low * cos_table[table_low] - x_high * sin_table[table_low]);
   out[high] = static_cast<scalar_t>(x_high * cos_table[table_high] + x_low * sin_table[table_high]);
 }
@@ -140,11 +111,11 @@ torch::Tensor rope(const torch::Tensor& x,
               cos.size(1),
               " wide but the head dimension is ",
               dim,
-              "; mini_vllm/positional_encoding.py builds them as max_seq_len x D "
-              "with the angles duplicated");
+              "; mini_vllm/ops.py builds them as max_seq_len x D with the angles "
+              "duplicated");
   TORCH_CHECK(cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat,
               "rope: the cos/sin tables must be float32 even when x is bf16 — see "
-              "mini_vllm/positional_encoding.py. Got ",
+              "mini_vllm/ops.py. Got ",
               cos.scalar_type());
   TORCH_CHECK(positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong,
               "rope: positions must be int32 or int64, got ",

@@ -1,7 +1,4 @@
 // The single pybind11 entry point for every kernel in csrc/.
-//
-// Every kernel adds one forward declaration and one m.def() here, so there is
-// exactly one place that lists what the extension exposes.
 
 #include <torch/extension.h>
 

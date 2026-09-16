@@ -1,11 +1,9 @@
 """The engine's public API, and speculative decoding end to end.
 
-Four sections: rejection sampling as mathematics (the residual identity and a
-120k-draw chi-square against a deliberately wrong draft), speculative
-bookkeeping, the LLM API on real weights against transformers.generate, and
-speculation on real weights, where greedy speculative output must be identical
-to greedy non-speculative output. The engine tests build one engine at a time,
-the card of record having 8 GB.
+Four sections: rejection sampling as mathematics, speculative bookkeeping, the LLM API
+on real weights against transformers.generate, and speculation on real weights, where
+greedy speculative output must be identical to greedy non-speculative output. Engine
+tests build one engine at a time, the card of record having 8 GB.
 """
 
 from __future__ import annotations
@@ -13,9 +11,12 @@ from __future__ import annotations
 import pytest
 import torch
 from conftest import assert_tokens_equal, free_cuda_memory, real_engine
+from transformers import AutoModelForCausalLM
 
+from mini_vllm import LLM
 from mini_vllm.cache import BlockManager, BlockTable, PagedKvPool
 from mini_vllm.config import SamplingParams
+from mini_vllm.model import resolve_model_path
 from mini_vllm.scheduler import Sequence, SequenceStatus
 from mini_vllm.speculative import (
     ResidualError,
@@ -35,15 +36,8 @@ def rows(*distributions: torch.Tensor) -> torch.Tensor:
     return torch.stack(list(distributions))
 
 
-# --- Rejection sampling ------------------------------------------------------
-
 def test_the_residual_is_the_mass_acceptance_leaves_behind():
-    """``relu(p - q)`` normalized, and its raw mass is exactly ``1 - sum(min(p, q))``.
-
-    That identity is the whole reason the correction is this expression and not
-    another: the acceptance step emits token t with probability min(p(t), q(t)), so
-    the shortfall it leaves is precisely the mass of relu(p - q).
-    """
+    """``relu(p - q)`` normalized, and its raw mass is exactly ``1 - sum(min(p, q))``."""
     target = distribution(0.6, 0.3, 0.1)
     draft = distribution(0.1, 0.7, 0.2)
 
@@ -65,15 +59,11 @@ def test_an_empty_residual_is_an_error_not_a_silent_zero():
 
 @pytest.mark.parametrize("num_proposals", [1, 3])
 def test_the_emitted_token_matches_the_target_distribution(num_proposals: int):
-    """The headline claim, as a chi-square test over 120k sampled first tokens.
+    """The headline claim, as a chi-square over 120k first emitted tokens.
 
-    The draft is deliberately wrong — its mass is the target's reversed — so a
-    procedure that simply trusted the draft, or corrected rejections with the wrong
-    distribution, would produce a visibly different histogram. Only the accept/reject
-    rule with the `relu(p - q)` residual reproduces the target.
-
-    The *first* emitted token is the one measured: it is the position every trial has
-    in common, and where the correction acts.
+    The draft is deliberately wrong — its mass is the target's reversed — so trusting it,
+    or correcting rejections with the wrong distribution, gives a visibly different
+    histogram.
     """
     vocabulary = 5
     target = distribution(0.40, 0.25, 0.20, 0.10, 0.05)
@@ -87,8 +77,7 @@ def test_the_emitted_token_matches_the_target_distribution(num_proposals: int):
     draft_rows = rows(*[draft] * num_proposals)
 
     for _ in range(trials):
-        # The draft proposes from its own distribution, as it does in the engine;
-        # sampling the proposals otherwise would test a procedure never run.
+        # The draft proposes from its own distribution, as it does in the engine.
         proposals = torch.multinomial(draft, num_proposals, replacement=True, generator=generator)
         emitted, _accepted = accept_proposals(target_rows, draft_rows, proposals,
                                               generator=generator)
@@ -96,9 +85,7 @@ def test_the_emitted_token_matches_the_target_distribution(num_proposals: int):
 
     expected = target * trials
     chi_square = float(((counts - expected) ** 2 / expected).sum())
-    # 4 degrees of freedom: the 99.9th percentile of chi-square(4) is 18.47. A correct
-    # implementation sits near 4; one that trusts the draft lands in the hundreds of
-    # thousands.
+    # chi-square(4) at the 99.9th percentile is 18.47; a correct sampler sits near 4.
     assert chi_square < 18.47, (
         f"chi-square {chi_square:.2f} rejects the target distribution; "
         f"got {(counts / trials).tolist()}, wanted {target.tolist()}"
@@ -106,8 +93,7 @@ def test_the_emitted_token_matches_the_target_distribution(num_proposals: int):
 
 
 def test_a_matching_draft_is_always_accepted():
-    """q == p makes the ratio 1: the self-draft case, and why acceptance rate is a
-    meaningful diagnostic."""
+    """q == p makes the ratio 1: the self-draft case."""
     target = distribution(0.5, 0.3, 0.2)
     generator = torch.Generator().manual_seed(7)
 
@@ -133,8 +119,7 @@ def test_a_step_always_emits_at_least_one_token():
 
 
 def test_rejection_truncates_rather_than_skipping():
-    """Proposals after a rejection were conditioned on a token that no longer exists;
-    keeping them would be the subtlest possible way to corrupt the output."""
+    """Proposals after a rejection were conditioned on a token that no longer exists."""
     certain = distribution(1.0, 0.0)
     target_rows = rows(certain, certain, certain)
     draft_rows = rows(distribution(0.0, 1.0), certain)
@@ -174,11 +159,8 @@ def test_the_shape_contracts_are_enforced():
         accept_proposals(rows(probability, probability), rows(distribution(0.3, 0.3, 0.4)), [0])
 
 
-# --- Speculative bookkeeping -------------------------------------------------
-
 def decoding_sequence(prompt: int = 4, outputs: int = 1, **kwargs) -> Sequence:
-    """A sequence past prefill with one uncommitted token — the state a decode step
-    sees: the last sampled token has been chosen but not yet run through the model."""
+    """A sequence past prefill with one uncommitted token: the state a decode step sees."""
     sequence = Sequence(prompt_token_ids=list(range(1, prompt + 1)), max_tokens=64, **kwargs)
     sequence.set_status(SequenceStatus.RUNNING)
     sequence.output_token_ids = [100 + index for index in range(outputs)]
@@ -198,8 +180,7 @@ def test_proposals_lengthen_the_sequence_without_joining_the_output():
 
 
 def test_a_proposed_stop_token_does_not_finish_the_sequence():
-    """If a speculated end-of-text could set `is_done`, a request would be returned on
-    the strength of a guess the target model was about to reject."""
+    """A speculated end-of-text must not return a request on a guess."""
     sequence = decoding_sequence(eos_token_id=999)
     sequence.propose([999])
     assert not sequence.is_done()
@@ -216,8 +197,7 @@ def test_accepting_everything_commits_the_run_and_the_bonus():
 
     assert to_trim == 0, "nothing was rejected, so nothing is given back"
     assert sequence.output_token_ids[-4:] == [201, 202, 203, 204]
-    # The forward computed the pending token and all three proposals; the bonus is not
-    # computed, which restores the usual one-uncommitted-token invariant.
+    # The bonus is not computed, which restores the one-uncommitted-token invariant.
     assert sequence.num_computed_tokens == computed_before + 4
     assert sequence.num_uncomputed_tokens == 1
 
@@ -255,8 +235,7 @@ def test_accept_rejects_tokens_that_were_never_proposed():
 
 
 def test_preemption_drops_unverified_proposals():
-    """They never belonged to the request, so a recomputed prefill must not include
-    them."""
+    """They never belonged to the request, so a recomputed prefill must not include them."""
     sequence = decoding_sequence()
     sequence.propose([201, 202])
     length_with_proposals = len(sequence)
@@ -268,9 +247,8 @@ def test_preemption_drops_unverified_proposals():
 
 
 def test_a_full_speculative_round_trip_leaks_no_blocks():
-    """Propose, reject most of it, roll back, repeat: a speculative step that goes
-    badly costs nothing permanent. Twelve rounds, because a leak of one page per step
-    is invisible once and fatal a thousand times."""
+    """Propose, reject most of it, roll back, repeat: twelve rounds, because a leak of
+    one page per step is invisible once and fatal a thousand times."""
     manager = BlockManager(num_blocks=32, block_size=4)
     sequence = Sequence(prompt_token_ids=[1, 2, 3, 4], max_tokens=256)
     sequence.set_status(SequenceStatus.RUNNING)
@@ -307,20 +285,13 @@ def test_trim_tokens_reports_but_does_not_release():
     assert table.num_blocks == 3
 
 
-# --- The LLM API -------------------------------------------------------------
-
 @pytest.fixture(scope="module")
 def llm():
-    """One fp32 engine for the whole module: the weights are 2.4 GB in fp32.
+    """One fp32 engine for the whole module.
 
-    fp32 rather than the bf16 the engine serves in, for one reason: in bf16 the top two
-    logits of a Qwen3 step are frequently one rounding apart, so greedy decoding has
-    genuine ties and two correct implementations pick differently. fp32 removes the
-    ambiguity, so a disagreement here means a bug rather than a rounding.
+    fp32 rather than the bf16 the engine serves in: bf16 greedy decoding has genuine
+    ties, so a disagreement here means a bug rather than a rounding.
     """
-    from mini_vllm import LLM
-    from mini_vllm.model import resolve_model_path
-
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
         pytest.skip("Qwen3-0.6B weights are not downloaded")
@@ -355,19 +326,8 @@ REAL_PROMPTS = [
 
 @pytest.mark.oracle
 def test_greedy_output_matches_transformers_for_sixteen_prompts(llm):
-    """Sixteen varied prompts, batched through the engine, against
-    `transformers.generate` one prompt at a time, token for token.
-
-    Continuous batching, chunked prefill, a paged cache and hand-written kernels on
-    one side; the reference running each request alone on the other. Greedy decoding
-    makes the comparison exact: either the engine is right or it is not. The reference
-    runs unbatched deliberately — left-padding changes its own answer, which would
-    make a disagreement ambiguous.
-    """
-    from transformers import AutoModelForCausalLM
-
-    from mini_vllm.model import resolve_model_path
-
+    """Sixteen prompts batched through the engine against `transformers.generate` one at
+    a time: the reference runs unbatched because left-padding changes its own answer."""
     theirs = AutoModelForCausalLM.from_pretrained(resolve_model_path(), dtype=llm.config.dtype)
     theirs = theirs.to(llm.device).eval()
     try:
@@ -382,8 +342,7 @@ def test_greedy_output_matches_transformers_for_sixteen_prompts(llm):
                 msg=f"prompt: {prompt!r}\nours:   {completion.text!r}",
             )
     finally:
-        # Both models fp32 on one card is 5 GB, so the reference does not outlive the
-        # test that needed it.
+        # Both models fp32 on one card is 5 GB, so the reference does not outlive this test.
         del theirs
         torch.cuda.empty_cache()
 
@@ -407,8 +366,7 @@ def test_the_batch_api_is_the_streaming_api_drained(llm):
 
 @pytest.mark.oracle
 def test_a_stream_is_interleaved_across_prompts(llm):
-    """A stream that delivered one request at a time would be a batch API with extra
-    steps, and would mean the engine was not batching."""
+    """A stream that delivered one request at a time would mean the engine is not batching."""
     updates = list(llm.generate_stream(
         ["The capital of France is", "def fibonacci(n):"], max_tokens=8))
     indices = [update.index for update in updates]
@@ -435,9 +393,7 @@ def test_a_completion_says_why_it_stopped(llm):
 
 @pytest.mark.oracle
 def test_an_abandoned_stream_returns_its_blocks(llm):
-    """A caller that stops reading must not cost the engine a request's worth of pages
-    — the difference between a web server surviving disconnects and one that stops
-    admitting after a few hundred of them."""
+    """A caller that stops reading must not cost the engine a request's worth of pages."""
     before = llm.manager.num_free_blocks
 
     for _update in llm.generate_stream(["Once upon a time"] * 4, max_tokens=64):
@@ -460,8 +416,7 @@ def test_sampling_parameters_are_per_request(llm):
 
 @pytest.mark.oracle
 def test_parallel_sampling_returns_n_greedy_branches_identical_to_solo(llm):
-    """`n=4` greedy branches of one prompt: one prefill, four forks sharing its pages
-    through copy-on-write, each branch identical to a solo run."""
+    """`n=4` greedy branches: one prefill, four forks sharing its pages."""
     prompt = "The capital of France is"
     solo = llm.generate(prompt, max_tokens=12)[0]
 
@@ -485,13 +440,9 @@ def test_the_engine_reports_what_it_did(llm):
     assert llm.kv_cache_bytes > 0
 
 
-# --- Prefix caching, engine level --------------------------------------------
-
 @pytest.mark.oracle
 def test_a_prefix_cache_hit_changes_nothing_it_produces():
-    """The whole invariant of a cache: it changes how much is computed, never what
-    comes out. The second run of a shared preamble hits, and must reproduce the first
-    token for token."""
+    """A cache changes how much is computed, never what comes out."""
     with real_engine(dtype=torch.float32, enable_prefix_caching=True) as llm:
         preamble = "You are a careful assistant. Answer concisely and correctly. " * 6
         prompt = preamble + "The capital of France is"
@@ -507,8 +458,7 @@ def test_a_prefix_cache_hit_changes_nothing_it_produces():
 
 @pytest.mark.oracle
 def test_prefix_caching_matches_the_uncached_engine():
-    """Caching on must not perturb even a cold run against caching off. Two engines,
-    strictly one at a time: both do not fit on 8 GB."""
+    """Caching on must not perturb even a cold run; two engines, strictly one at a time."""
     prompt = "The capital of France is"
     with real_engine(dtype=torch.float32, enable_prefix_caching=True) as llm:
         cached = llm.generate(prompt, sampling_params=GREEDY, max_tokens=16)[0]
@@ -517,8 +467,6 @@ def test_prefix_caching_matches_the_uncached_engine():
 
     assert cached.token_ids == plain.token_ids
 
-
-# --- Speculation, end to end -------------------------------------------------
 
 def assert_no_spec_leaks(llm) -> None:
     """Both pools back to full: the target's and the draft's."""
@@ -532,9 +480,8 @@ def assert_no_spec_leaks(llm) -> None:
 def test_greedy_speculative_output_is_identical_to_non_speculative():
     """The whole claim, as an exact token comparison.
 
-    fp32 rather than bf16: a speculative run reduces in a different order from a plain
-    one, so in bf16 the two could differ by a rounding tie without either being wrong.
-    fp32 leaves the comparison meaning what it says.
+    fp32 rather than bf16: a speculative run reduces in a different order, so in bf16 the
+    two could differ by a rounding tie without either being wrong.
     """
     prompt = "The capital of France is"
 
@@ -554,11 +501,10 @@ def test_greedy_speculative_output_is_identical_to_non_speculative():
 
 @pytest.mark.oracle
 def test_a_self_draft_is_accepted_every_time():
-    """A draft that *is* the target must agree with it on every proposal.
+    """A draft that is the target must agree with it on every proposal.
 
-    Acceptance below 1.0 here means a misaligned verification row or a `q` that is not
-    the distribution the proposal was drawn from — the sharpest available check on the
-    plumbing, separate from whether the output is right.
+    Acceptance below 1.0 means a misaligned verification row or a `q` that is not the
+    distribution the proposal was drawn from — the sharpest check on the plumbing.
     """
     with real_engine(dtype=torch.float32, num_speculative_tokens=4) as llm:
         llm.generate("The capital of France is", sampling_params=GREEDY, max_tokens=24)
@@ -574,9 +520,7 @@ def test_a_self_draft_is_accepted_every_time():
 
 @pytest.mark.oracle
 def test_speculation_streams_the_whole_accepted_run_in_order():
-    """A step yields several tokens and the stream must show all of them: a step that
-    emitted only its last token would finish with the right output but stream a
-    truncated version of it."""
+    """A step yields several tokens and the stream must show all of them."""
     with real_engine(dtype=torch.float32, num_speculative_tokens=4) as llm:
         updates = list(llm.generate_stream("The capital of France is",
                                            sampling_params=GREEDY, max_tokens=20))
@@ -591,10 +535,8 @@ def test_speculation_streams_the_whole_accepted_run_in_order():
 
 @pytest.mark.oracle
 def test_a_weak_draft_is_rejected_and_leaves_nothing_behind():
-    """The case rollback exists for, driven hard: a 4-layer prefix of Qwen3-0.6B is a
-    genuinely bad draft, rejected almost always. Every rejected proposal wrote KV in
-    both pools and must give it back — and the output must still be correct, because
-    rejection sampling does not care how bad the draft is."""
+    """A 4-layer prefix of Qwen3-0.6B is a bad draft, rejected almost always: every
+    rejected proposal wrote KV in both pools and must give it back."""
     prompt = "The capital of France is"
 
     with real_engine(dtype=torch.float32, num_speculative_tokens=4, num_draft_layers=4) as llm:
@@ -614,9 +556,7 @@ def test_a_weak_draft_is_rejected_and_leaves_nothing_behind():
 
 @pytest.mark.oracle
 def test_stochastic_speculation_stays_in_the_vocabulary_and_leaks_nothing():
-    """The residual path end to end. Temperature sampling has no fixed answer, so what
-    is checked is real tokens, the requested count, and balanced pools; the
-    *distribution* is proven far more sharply by the chi-square test above."""
+    """The residual path end to end; the distribution itself is proven by the chi-square."""
     warm = SamplingParams(temperature=0.9, top_p=0.95)
     with real_engine(num_speculative_tokens=3) as llm:
         completions = llm.generate(
@@ -632,10 +572,8 @@ def test_stochastic_speculation_stays_in_the_vocabulary_and_leaks_nothing():
 
 @pytest.mark.oracle
 def test_speculation_survives_chunked_prefill_beside_it():
-    """A long prompt chunking through the batch while other sequences speculate: the
-    two features touch the same budget from opposite ends (a chunk wants every token
-    it can get; a speculative group is atomic) and must share an iteration without
-    corrupting either."""
+    """The two features touch the same budget from opposite ends: a chunk wants every
+    token it can get, a speculative group is atomic."""
     long_prompt = "In a distant kingdom by the sea, the old chronicles record that " * 12
     with real_engine(num_speculative_tokens=4, chunk_size=64, max_batched_tokens=128) as llm:
         completions = llm.generate(
@@ -651,10 +589,8 @@ def test_speculation_survives_chunked_prefill_beside_it():
 
 @pytest.mark.oracle
 def test_speculation_survives_preemption():
-    """A pool the requests almost exactly fill, so decodes crossing page boundaries
-    force preemption. A preempted sequence discards its unverified proposals and
-    recomputes only what it really committed; keeping the proposals would put tokens
-    in the recomputed prefill the caller never received."""
+    """A preempted sequence discards its unverified proposals and recomputes only what
+    it really committed, so the caller never sees a token it did not receive."""
     prompts = [f"Tell me about the number {index} and why it matters. " * 6
                for index in range(6)]
     with real_engine(num_blocks=20, num_speculative_tokens=3, max_sequences=6) as llm:
@@ -669,8 +605,7 @@ def test_speculation_survives_preemption():
 
 @pytest.mark.oracle
 def test_the_draft_pool_is_shallower_than_the_target_and_costs_less():
-    """A self-draft shares weights, so the only memory it adds is its own KV — and its
-    pool has the draft's layer count, which is why the arrangement fits at all."""
+    """A self-draft shares weights, so the only memory it adds is its own shallower KV."""
     with real_engine(num_speculative_tokens=2, num_draft_layers=4) as llm:
         target_pool, draft_pool = llm.manager.kv, llm.spec.proposer.manager.kv
 
