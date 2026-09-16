@@ -1,11 +1,4 @@
-"""Every knob in the engine, in one file.
-
-Four surfaces: ModelConfig (architecture, parsed from a checkpoint),
-SchedulerConfig (per-iteration budgets), SamplingParams (per-request decoding),
-and EngineConfig (memory, features, wiring). EngineConfig is the single source
-of truth for defaults, and a wrong ModelConfig fails at load time rather than
-as a matmul error 28 layers deep.
-"""
+"""Every knob in the engine: model architecture, scheduler budgets, sampling, wiring."""
 
 from __future__ import annotations
 
@@ -26,21 +19,13 @@ __all__ = [
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 
-# Fraction of the memory still free after the weights are resident that goes to the KV
-# pool. Not 0.9: activations for a 2048-token batch, the logits tensor at 151k
-# vocabulary, and cuBLAS workspaces all come out of the remainder, and a pool sized to
-# the last byte turns a long prompt into an out-of-memory error rather than a queued
-# request.
+# Share of the memory left free by the weights; activations and logits use the rest.
 DEFAULT_KV_FRACTION = 0.5
 
-# Blocks to allocate when there is no device memory to measure. Enough for a handful of
-# short sequences, which is all a CPU run is ever going to want.
+# Blocks to allocate when there is no device memory to measure.
 CPU_BLOCKS = 512
 
-# KV-cache storage precision as a caller names it. "auto" keeps the model dtype; "fp8"
-# halves the resident cache at the cost of a rounding on every stored key and value,
-# dequantized inside the attention kernel. e4m3 is the only format offered because it
-# is the only one the kernels accelerate; see `kernels.FP8_KERNEL_DTYPE`.
+# e4m3 is the only quantized format the kernels accelerate; see kernels.FP8_KERNEL_DTYPE.
 KV_CACHE_DTYPES: dict[str, torch.dtype | None] = {
     "auto": None,
     "fp8": torch.float8_e4m3fn,
@@ -57,15 +42,8 @@ def resolve_kv_dtype(name: str) -> torch.dtype | None:
     return KV_CACHE_DTYPES[name]
 
 
-# --- 1. Model config ---------------------------------------------------------
-
 def _rope_theta(raw: dict) -> float:
-    """Read the RoPE base, wherever this config generation happens to keep it.
-
-    Older configs put it at the top level, transformers 5.x nests it under
-    rope_parameters, and for a time under rope_scaling. All three appear in the
-    wild, and a wrong base silently changes every position encoding.
-    """
+    """Read the RoPE base, wherever this config generation happens to keep it."""
     if raw.get("rope_theta") is not None:
         return float(raw["rope_theta"])
 
@@ -120,8 +98,7 @@ class ModelConfig:
     def from_dict(cls, raw: dict) -> ModelConfig:
         hidden_size = raw["hidden_size"]
         num_heads = raw["num_attention_heads"]
-        # head_dim is explicit in Qwen3; fall back to the usual assumption so configs
-        # that omit it still load.
+        # head_dim is explicit in Qwen3; fall back to the usual assumption without it.
         head_dim = raw.get("head_dim") or hidden_size // num_heads
 
         stated_dtype = raw.get("torch_dtype") or raw.get("dtype") or "bfloat16"
@@ -147,8 +124,6 @@ class ModelConfig:
         return cls.from_dict(json.loads(path.read_text()))
 
 
-# --- 2. Scheduler config -----------------------------------------------------
-
 @dataclass(frozen=True)
 class SchedulerConfig:
     """Admission limits for one iteration."""
@@ -157,11 +132,7 @@ class SchedulerConfig:
     max_sequences: int = 16            # how many requests may be in flight
     chunk_size: int = 512              # one prefill's share of an iteration
     enable_chunked_prefill: bool = True  # off = the tests' single-pass reference
-    # Prompts before decodes: what vLLM shipped before chunked prefill, and the
-    # baseline the benchmarks measure against. Off by default -- a prompt large
-    # enough to consume the budget leaves nothing for sequences a caller is already
-    # reading. Kept reachable so the cost is measurable.
-    prefill_priority: bool = False
+    prefill_priority: bool = False     # prompts before decodes: the pre-chunking baseline
 
     def __post_init__(self) -> None:
         if self.max_batched_tokens < 1:
@@ -172,20 +143,15 @@ class SchedulerConfig:
             raise ValueError(f"chunk_size must be >= 1, got {self.chunk_size}")
 
 
-# --- 3. Sampling params ------------------------------------------------------
-
 @dataclass(frozen=True)
 class SamplingParams:
-    """One request's sampling configuration. temperature=0 is greedy; top_k=0 and
-    top_p=1.0 both mean disabled, so the default is plain temperature-1 sampling.
-    """
+    """One request's sampling configuration; temperature=0 is greedy, top_k=0 and top_p=1
+    disable truncation."""
 
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
-    # Completions per prompt. n > 1 prefills once and forks the block table, so the
-    # branches share KV until one writes -- copy-on-write on the serving path.
-    n: int = 1
+    n: int = 1  # completions per prompt: one prefill, n forked branches
 
     def __post_init__(self) -> None:
         if self.temperature < 0:
@@ -202,16 +168,9 @@ class SamplingParams:
         return self.temperature == 0.0
 
 
-# --- 4. Engine config --------------------------------------------------------
-
 @dataclass(frozen=True)
 class EngineConfig:
-    """Everything LLM accepts, as one frozen record.
-
-    LLM(model, **overrides) builds one internally, so keyword arguments and an
-    explicit EngineConfig are the same thing; the dataclass exists so the defaults
-    live in one place and a configuration can be logged, compared, or replayed.
-    """
+    """Everything LLM accepts, as one frozen record; LLM(model, **overrides) builds one."""
 
     model: str = DEFAULT_MODEL_ID
     device: str = "cuda"
@@ -238,8 +197,7 @@ class EngineConfig:
     draft_blocks: int | None = None
     use_cuda_kernels: bool = True
 
-    # Reproducibility. None leaves sampling on the global RNG; greedy is
-    # deterministic either way.
+    # None leaves sampling on the global RNG; greedy is deterministic either way.
     seed: int | None = None
 
     def __post_init__(self) -> None:

@@ -1,11 +1,4 @@
-"""Continuous batching: sequences, ragged batches, and the per-iteration policy.
-
-Five layers: Sequence, ForwardBatch, SchedulerConfig and SchedulerOutput,
-Scheduler (Orca-style iteration-level scheduling, chunked prefill, piggyback
-decoding, preemption by recomputation), and DenseModelRunner, the oracle
-showing what paging buys. A scheduling decision may change timing, never
-output, and the tests assert that token for token.
-"""
+"""Continuous batching: sequences, ragged batches, and the per-iteration policy."""
 
 from __future__ import annotations
 
@@ -32,14 +25,8 @@ __all__ = [
 ]
 
 
-# --- 1. Sequence states ------------------------------------------------------
-
 class SequenceStatus(enum.Enum):
-    """Where a request is in its life cycle. PREEMPTED is distinct from WAITING though
-    both queue for admission: a preempted sequence has output already emitted to its
-    caller and must be recomputed over prompt plus that output, while a waiting one
-    has nothing behind it. Collapsing the two loses tokens the caller has seen.
-    """
+    """Where a request is in its life cycle."""
 
     WAITING = "waiting"
     RUNNING = "running"
@@ -47,44 +34,32 @@ class SequenceStatus(enum.Enum):
     FINISHED = "finished"
 
 
-# Legal transitions, as data rather than as `if` statements spread through the
-# scheduler, so an illegal move raises from one place.
+# Legal transitions as data rather than `if` statements spread through the scheduler.
 _LEGAL_TRANSITIONS: dict[SequenceStatus, frozenset[SequenceStatus]] = {
     SequenceStatus.WAITING: frozenset({SequenceStatus.RUNNING, SequenceStatus.FINISHED}),
     SequenceStatus.RUNNING: frozenset(
         {SequenceStatus.PREEMPTED, SequenceStatus.FINISHED, SequenceStatus.WAITING}
     ),
     SequenceStatus.PREEMPTED: frozenset({SequenceStatus.RUNNING, SequenceStatus.FINISHED}),
-    # Terminal: a finished sequence's blocks have been freed, so it can never resume.
-    SequenceStatus.FINISHED: frozenset(),
+    SequenceStatus.FINISHED: frozenset(),  # terminal: its blocks have been freed
 }
 
 _next_seq_id = itertools.count()
 
 
-# --- 2. Per-request state ----------------------------------------------------
-
 @dataclass
 class Sequence:
-    """A request in flight.
+    """A request in flight: its tokens, how much of them is cached, and its pages.
 
-        prompt_token_ids     what the caller sent
-        output_token_ids     what has been sampled so far
-        token_ids            the concatenation -- what the model attends over
-        num_computed_tokens  how much of token_ids is already in the KV cache
-
-    The last two are tracked separately, and their difference is chunked prefill:
-    everything needed to resume a sequence with 2000 prompt tokens and 512 computed
-    derives from that one counter, which keeps chunking a scheduler concern rather
-    than a change to this class.
+    `token_ids` is prompt + output + proposals, and `num_computed_tokens` says how much
+    of it the KV cache holds; their difference is what chunked prefill works in.
     """
 
     prompt_token_ids: list[int]
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
     max_tokens: int = 16
     eos_token_id: int | None = None
-    # Qwen3 ends a turn with either `<|im_end|>` or `<|endoftext|>`, so one id is not
-    # enough: honouring only `tokenizer.eos_token_id` generates past the end of a turn.
+    # Qwen3 ends a turn with `<|im_end|>` or `<|endoftext|>`, so one id is not enough.
     stop_token_ids: tuple[int, ...] = ()
     seq_id: int = field(default_factory=lambda: next(_next_seq_id))
 
@@ -92,20 +67,13 @@ class Sequence:
     num_computed_tokens: int = 0
     status: SequenceStatus = SequenceStatus.WAITING
 
-    # Speculative decoding: tokens the draft model has proposed but the target has not
-    # yet verified. Kept out of `output_token_ids` so a proposal cannot finish a
-    # sequence — a speculated end-of-text token would otherwise set `is_done` and
-    # return the request on a guess the target was about to reject.
+    # Speculated but unverified: kept out of the output so a guess cannot finish a request.
     proposed_token_ids: list[int] = field(default_factory=list)
 
-    # Parallel sampling: a forked branch records the id of the request it split from,
-    # so the engine can group a prompt's `n` completions back together. None for an
-    # ordinary request, which is its own group of one.
+    # The request a parallel-sampling branch split from; None for an ordinary request.
     parent_id: int | None = None
 
-    # The sequence's pages, and the single home for them: the block manager reads and
-    # writes this field rather than keeping a registry of its own, so there is only one
-    # record of which blocks a sequence holds and when they may be freed.
+    # The single home for the sequence's pages: the block manager keeps no registry.
     block_table: BlockTable | None = None
 
     def __post_init__(self) -> None:
@@ -114,14 +82,9 @@ class Sequence:
         if self.max_tokens < 1:
             raise ValueError(f"max_tokens must be >= 1, got {self.max_tokens}")
 
-    # --------------------------------------------------------------- lengths
     @property
     def token_ids(self) -> list[int]:
-        """Prompt, output, then any live proposals: what the model attends over. Proposals
-        are included because the verifying pass has to score them, so they need
-        positions, slots and KV like any other token; they become output only when
-        accept records which survived.
-        """
+        """Prompt, output, then any live proposals: what the model attends over."""
         return self.prompt_token_ids + self.output_token_ids + self.proposed_token_ids
 
     def __len__(self) -> int:
@@ -144,13 +107,8 @@ class Sequence:
         """How many tokens still need a forward pass — the next chunk's ceiling."""
         return len(self) - self.num_computed_tokens
 
-    # ----------------------------------------------------------------- phase
     def is_prefill(self) -> bool:
-        """True while any prompt token has yet to be computed. A statement about the
-        prompt, not about the output being empty, which is the form that survives
-        chunking: the first decode step happens once num_computed_tokens reaches
-        num_prompt_tokens, however many chunks it took.
-        """
+        """True while any prompt token has yet to be computed, chunked or not."""
         return self.num_computed_tokens < self.num_prompt_tokens
 
     def is_done(self) -> bool:
@@ -172,13 +130,8 @@ class Sequence:
             return "stop"
         return "length" if self.num_output_tokens >= self.max_tokens else None
 
-    # -------------------------------------------------------------- mutation
     def append_token(self, token_id: int) -> None:
-        """Record a sampled token, without advancing num_computed_tokens: the token has
-        been chosen but no forward pass has consumed it, so its KV is not yet cached.
-        Conflating the two makes a decode step skip a position, surfacing as a repeated
-        or dropped token rather than a crash.
-        """
+        """Record a sampled token; its KV is not cached, so num_computed_tokens stands."""
         if self.status is SequenceStatus.FINISHED:
             raise ValueError(f"sequence {self.seq_id} is finished and cannot take more tokens")
         self.output_token_ids.append(token_id)
@@ -188,10 +141,7 @@ class Sequence:
         return len(self.proposed_token_ids)
 
     def propose(self, token_ids: Iterable[int]) -> None:
-        """Attach a draft model's speculated tokens, pending verification. They lengthen
-        the sequence immediately, so the scheduler reserves slots and the runner
-        forwards them, but they stay out of the output until accept.
-        """
+        """Attach a draft model's speculated tokens, pending verification."""
         if self.proposed_token_ids:
             raise ValueError(
                 f"sequence {self.seq_id} already holds {len(self.proposed_token_ids)} "
@@ -205,11 +155,7 @@ class Sequence:
         self.proposed_token_ids = [int(token) for token in token_ids]
 
     def discard_proposals(self) -> int:
-        """Drop the proposals without committing any, returning how many were dropped.
-
-        For paths that abandon a speculative step rather than verifying it: preemption,
-        or shutdown mid-flight.
-        """
+        """Drop the proposals without committing any, returning how many were dropped."""
         dropped = len(self.proposed_token_ids)
         self.proposed_token_ids = []
         return dropped
@@ -217,11 +163,8 @@ class Sequence:
     def accept(self, token_ids: list[int], num_accepted: int) -> int:
         """Commit a verified step's tokens, returning how many cache slots to give back.
 
-        token_ids is the rejection sampler's output; num_accepted separates the
-        surviving proposals, which the verifying pass already computed into the cache,
-        from the final token, which it did not. Hence the return value -- the pass
-        computed all k + 1 positions but only num_accepted + 1 remain computed. A stop
-        token among them truncates here, dropping what follows.
+        The verifying pass computed all k + 1 positions, but only the accepted proposals
+        plus the previously pending token remain computed.
         """
         num_proposed = len(self.proposed_token_ids)
         if not 0 <= num_accepted <= num_proposed:
@@ -240,8 +183,7 @@ class Sequence:
         computed_before = self.num_computed_tokens
         self.proposed_token_ids = []
 
-        # Append until a stop token or the length limit ends the sequence, counting the
-        # surviving proposals: only those are already in the cache.
+        # Append until a stop token or the limit ends it, counting surviving proposals.
         kept_proposals = 0
         for index, token in enumerate(token_ids):
             self.output_token_ids.append(int(token))
@@ -250,8 +192,6 @@ class Sequence:
             if self.is_done():
                 break
 
-        # The forward pass computed the one previously-uncommitted token plus every
-        # proposal; what remains computed is that token plus the survivors.
         self.num_computed_tokens = computed_before + 1 + kept_proposals
         return num_proposed - kept_proposals
 
@@ -277,11 +217,7 @@ class Sequence:
         self.status = status
 
     def fork(self, first_output_token: int | None = None) -> Sequence:
-        """A new branch sharing this sequence's prompt, for parallel sampling. Copies the
-        prompt and the computed-token count so the child starts with the same prefix
-        cached; the pages are shared by BlockManager.fork, which copies no KV. It does
-        not copy the block table -- that is the manager's to set as it increfs.
-        """
+        """A new branch sharing this sequence's prompt and computed count, for n > 1."""
         child = Sequence(
             prompt_token_ids=list(self.prompt_token_ids),
             sampling_params=self.sampling_params,
@@ -297,13 +233,7 @@ class Sequence:
         return child
 
     def reset_for_recompute(self) -> None:
-        """Drop everything cached, keeping the tokens. Used when preempting.
-
-        Preemption is by recomputation rather than by swapping to host memory, trading
-        the compute already spent for having no swap path. Dropping the table is not the
-        same as releasing the blocks, and this refuses the first without the second --
-        losing the pointer to pages the pool still counts as held leaks them.
-        """
+        """Drop everything cached, keeping the tokens: preemption is by recomputation."""
         if self.block_table is not None:
             raise ValueError(
                 f"sequence {self.seq_id} still holds {self.block_table.num_blocks} blocks; "
@@ -311,9 +241,7 @@ class Sequence:
             )
         self.set_status(SequenceStatus.PREEMPTED)
         self.num_computed_tokens = 0
-        # Unverified proposals do not survive a preemption: their KV went back to the
-        # pool with the rest, and they were never part of the request, so keeping them
-        # would make the recomputed prefill longer than what the caller asked for.
+        # Unverified proposals were never part of the request, so they do not survive.
         self.proposed_token_ids = []
 
     def __repr__(self) -> str:
@@ -324,11 +252,7 @@ class Sequence:
         )
 
 
-# --- 3. Ragged forward batches -----------------------------------------------
-
-# What an unused block-table entry holds. A kernel bounded by `context_lens` never
-# reads it, so a read is a bug, and -1 is an impossible block id rather than a silent
-# alias for block 0.
+# What an unused block-table entry holds: impossible, not a silent alias for block 0.
 PADDING_BLOCK = -1
 
 
@@ -344,11 +268,7 @@ def _check_metadata(
     num_tables: int | None,
     empty_tables: list[int],
 ) -> None:
-    """Check one batch's metadata for consistency, in plain integers -- which is why
-    this is a free function. On device tensors each check would cost a
-    device-to-host read, and reading a CUDA tensor waits for the previous
-    iteration's twenty-eight layers, to recover numbers the scheduler already held.
-    """
+    """Check one batch's metadata for consistency, in plain integers rather than tensors."""
     if not num_sequences:
         raise ValueError("a forward batch needs at least one sequence")
 
@@ -368,9 +288,7 @@ def _check_metadata(
             "they index the same tokens"
         )
 
-    # The offsets must describe the token axis they index into. This catches a scheduler
-    # that admitted a sequence but did not extend the flattened ids, which would
-    # otherwise read whatever tokens sit at the end of the batch.
+    # The offsets must describe the token axis they index, or a short batch reads garbage.
     if offsets[0] != 0:
         raise ValueError("cu_seqlens_q must start at 0")
     if offsets[-1] != num_tokens:
@@ -380,9 +298,7 @@ def _check_metadata(
     if lengths != seq_lens:
         raise ValueError(f"cu_seqlens_q differences {lengths} disagree with seq_lens {seq_lens}")
 
-    # S >= L follows from causality: a pass cannot compute more tokens than it may
-    # attend over, and a kernel given S < L masks every query in the overhang to
-    # nothing.
+    # S >= L is causality: a pass cannot compute more tokens than it may attend over.
     if any(context < length for context, length in zip(context_lens, seq_lens, strict=True)):
         raise ValueError(f"context_lens {context_lens} must be >= seq_lens {seq_lens} elementwise")
     if any(length < 1 for length in seq_lens):
@@ -400,11 +316,7 @@ def _check_metadata(
 
 
 def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> torch.Tensor:
-    """Stack per-sequence block tables into one right-padded rectangle, because the
-    kernel indexes block_tables[seq, logical_block] and a ragged tensor of pointers
-    would add a second indirection inside the inner loop. The width is the widest
-    table in this batch rather than the maximum sequence length.
-    """
+    """Stack per-sequence block tables into one right-padded rectangle for the kernel."""
     widest = max((len(table) for table in tables), default=0)
     padded = [list(table) + [PADDING_BLOCK] * (widest - len(table)) for table in tables]
     return torch.tensor(padded, dtype=torch.int32, device=device).reshape(len(tables), widest)
@@ -414,16 +326,9 @@ def _pad_tables(tables: list[tuple[int, ...]], device: torch.device | str) -> to
 class ForwardBatch:
     """Everything the model and the kernels need for one ragged forward pass.
 
-        for a mixed batch [prefill(A, 300), decode(B, 1), decode(C, 1)]:
-          input_ids     300 + 1 + 1 = 302 tokens, concatenated
-          cu_seqlens_q  [0, 300, 301, 302]   query-token offsets
-          seq_lens      [300, 1, 1]          new tokens per sequence   (L)
-          context_lens  [300, 512, 47]       total attended tokens     (S)
-
-    Flattened rather than padded: a 3 x 300 rectangle would waste 598 token-slots,
-    the argument paging makes about memory applied to compute. The paged kernels
-    read cu_seqlens_q and context_lens and serve the whole batch in one launch, so
-    this is built in their layout.
+    For a mixed batch [prefill(A, 300), decode(B, 1), decode(C, 1)]: 302 flattened
+    tokens, cu_seqlens_q [0, 300, 301, 302], seq_lens [300, 1, 1] and context_lens
+    [300, 512, 47]. Flattened rather than padded, in the paged kernels' own layout.
     """
 
     input_ids: torch.Tensor  # int64 [total_tokens], flattened across sequences
@@ -434,38 +339,22 @@ class ForwardBatch:
     seq_ids: tuple[int, ...]
     sampling_params: tuple[SamplingParams, ...]
 
-    # Paging metadata from the block manager. Optional: the dense runner has no use for
-    # it, and pure-scheduling tests should not need a block manager to build a batch.
-    #
-    #   slot_mapping  int32 [total_tokens]        where each new K/V is written
-    #   block_tables  int32 [num_sequences, max]  right-padded with -1
-    #
-    # Padding is -1 rather than 0 so an out-of-bounds read is visible: a kernel bounds
-    # its walk by `context_lens` and never reads the padding, so a read that does
-    # happen is a bug rather than a quiet read of whichever sequence owns block 0.
+    # Paging metadata: the slot per token, and block tables padded with PADDING_BLOCK.
     slot_mapping: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 
-    # The longest `L` and `S` in the batch. They size the prefill kernel's grid and the
-    # decode kernel's split count, so they must be host integers: reading them off
-    # `seq_lens` synchronizes, and 28 layers asking means 28 syncs per iteration.
-    # `from_scheduled` fills them from the lists it built the batch from; left unset,
-    # they are computed once here.
+    # The longest L and S: host integers, since reading a device tensor would synchronize.
     max_query_len: int | None = None
     max_context_len: int | None = None
 
-    # Set by `from_scheduled`, which already checked the same invariants against its own
-    # Python integers. See `_check_metadata` for why that is worth a field.
+    # Set by `from_scheduled`, which already checked these invariants on plain integers.
     checked: bool = False
 
     def __post_init__(self) -> None:
         if not self.checked:
             count = len(self.seq_ids)
             offsets = self.cu_seqlens_q.tolist()
-            # Whether a row holds enough blocks for its context needs the block size,
-            # which belongs to the manager, and the attention path checks it against
-            # the pool it is about to read. Checkable here: a sequence with a context
-            # holds at least one page.
+            # Only emptiness is checkable here; sufficiency needs the manager's block size.
             tables = [] if self.block_tables is None else self.block_tables.tolist()
             _check_metadata(
                 num_sequences=count,
@@ -488,18 +377,12 @@ class ForwardBatch:
             object.__setattr__(self, "max_query_len", int(self.seq_lens.max()))
         if self.max_context_len is None:
             object.__setattr__(self, "max_context_len", int(self.context_lens.max()))
-        # Computed on the device, so no synchronization: the row indices stay on the
-        # GPU, where `index_select` wants them.
+        # Computed on the device, so no synchronization and no host round trip.
         object.__setattr__(self, "_last_row_indices", self.cu_seqlens_q[1:].to(torch.int64) - 1)
 
-    # ------------------------------------------------------------ properties
     @property
     def last_row_indices(self) -> torch.Tensor:
-        """Row of each sequence's last computed token in the flattened axis: where the LM
-        head is applied and where a sampled token comes from. The only row for a decode
-        step, the end of the chunk for a prefill, which is why a mid-prompt chunk's
-        logits are computed and discarded.
-        """
+        """Row of each sequence's last computed token: where the LM head is applied."""
         return self._last_row_indices  # type: ignore[attr-defined]
 
     @property
@@ -512,11 +395,7 @@ class ForwardBatch:
 
     @property
     def is_pure_decode(self) -> bool:
-        """Every sequence contributes exactly one token.
-
-        The common case: the batch is a rectangle, so the decode kernel's
-        `B x H x 1 x D` shape applies with no ragged handling.
-        """
+        """Every sequence contributes exactly one token: the common case."""
         return bool((self.seq_lens == 1).all())
 
     @property
@@ -536,7 +415,6 @@ class ForwardBatch:
             parts.append(f"{seq_id}:{phase}/{int(self.context_lens[i])}")
         return f"batch[{self.total_tokens} tokens] " + " ".join(parts)
 
-    # -------------------------------------------------------------- builders
     @classmethod
     def from_scheduled(
         cls,
@@ -546,11 +424,8 @@ class ForwardBatch:
     ) -> ForwardBatch:
         """Build from (sequence, tokens to compute now) pairs, in one pass.
 
-        The token count is the scheduler's decision, not the sequence's, so chunking
-        changes the caller rather than this object. Positions start at each sequence's
-        num_computed_tokens, which is why RoPE takes an explicit position tensor. Pass
-        manager to fill in the paging metadata; it is optional so a scheduling test can
-        build a batch without a pool.
+        Positions start at each sequence's num_computed_tokens; pass a manager to fill in
+        the paging metadata.
         """
         input_ids: list[int] = []
         positions: list[int] = []
@@ -627,20 +502,9 @@ class ForwardBatch:
         )
 
 
-# --- 4. Scheduler config and output ------------------------------------------
-
-#
-# `SchedulerConfig` is defined in `config.py` with the other configuration dataclasses
-# and re-exported here: the policy it parameterizes lives in this file.
-
-
 @dataclass
 class SchedulerOutput:
-    """What one iteration decided to run. scheduled pairs each sequence with how many
-    of its tokens this pass covers: 1 for a decode step, up to chunk_size for a
-    prefill chunk. The pair is the unit the rest of the engine works in, since the
-    sequence list alone does not describe a ragged batch.
-    """
+    """What one iteration decided to run: each sequence with how many tokens it takes."""
 
     scheduled: list[tuple[Sequence, int]] = field(default_factory=list)
     preempted: list[Sequence] = field(default_factory=list)
@@ -663,11 +527,7 @@ class SchedulerOutput:
         return sum(1 for _, count in self.scheduled if count == 1)
 
     def tokens_for(self, sequence: Sequence) -> int:
-        """This iteration's token count for one sequence, or 0 if it is not in it. A linear
-        scan over at most max_sequences entries: Sequence is a mutable dataclass and
-        therefore unhashable, and keying by seq_id would add a second index to keep
-        consistent.
-        """
+        """This iteration's token count for one sequence, or 0 if it is not in it."""
         for scheduled, count in self.scheduled:
             if scheduled is sequence:
                 return count
@@ -677,30 +537,21 @@ class SchedulerOutput:
         return ForwardBatch.from_scheduled(self.scheduled, device)
 
 
-# --- 5. Continuous-batching policy -------------------------------------------
-
 class Scheduler:
-    """FCFS waiting and running queues, re-decided every iteration.
+    """FCFS waiting and running queues, re-decided every iteration, Orca-style.
 
-    Iteration-level scheduling, following Orca: the batch is re-formed every
-    iteration rather than held for a request's lifetime. Under static batching a
-    batch of sixteen where fifteen want 20 tokens and one wants 500 spends 96% of
-    its iterations mostly idle. No tensors, no model, no device.
+    No tensors, no model, no device: a scheduling decision may change timing, never
+    output.
     """
 
     def __init__(self, config: SchedulerConfig | None = None, manager=None) -> None:
-        """manager is a cache.BlockManager, or None for a scheduler with no memory limit.
-        Optional so fairness, chunking and budget behaviour can be tested without a pool
-        and therefore without a GPU. With one, the same policy runs under a second
-        constraint: a decode step needs a slot, and a slot can be unavailable.
-        """
+        """manager is a cache.BlockManager, or None for a scheduler with no memory limit."""
         self.config = config or SchedulerConfig()
         self.manager = manager
         self.waiting: deque[Sequence] = deque()
         self.running: list[Sequence] = []
         self.finished: list[Sequence] = []
 
-    # -------------------------------------------------------------- queueing
     def add(self, sequence: Sequence) -> None:
         """Enqueue a request. FCFS, so arrival order is service order."""
         if sequence.status is not SequenceStatus.WAITING:
@@ -719,28 +570,17 @@ class Scheduler:
     def num_unfinished(self) -> int:
         return len(self.waiting) + len(self.running)
 
-    # ------------------------------------------------------------ scheduling
     def schedule(self) -> SchedulerOutput:
         """Decide this iteration's batch: decodes, then prefill chunks, then arrivals.
 
-        Decodes first -- together they cost less than a single chunk, and their callers
-        are already reading output. Then chunks for admitted sequences, since a prefill
-        in progress holds cache until it completes. Then admissions, FCFS, with what is
-        left. The first two form the piggyback: one ragged pass carrying a 300-token
-        chunk beside a dozen decodes. With a block manager a second budget behaves
-        differently -- exhausting tokens postpones a sequence, exhausting blocks
-        requires someone to release theirs, so a decode that cannot obtain its slot
-        preempts the newest running sequence. prefill_priority runs the same passes in
-        the opposite order, as a baseline rather than an alternative.
+        Decodes first because together they cost less than one chunk and their callers
+        are already reading output; `prefill_priority` runs the same passes in the
+        opposite order as the pre-chunking baseline.
         """
         output = SchedulerOutput()
         budget = self.config.max_batched_tokens
 
-        # Blocks this iteration has already promised, per sequence. Pages are not taken
-        # until the runner reserves them, so without this every sequence in the pass
-        # would be checked against the same free count: two sequences needing three
-        # pages each would both be admitted against four free, and the second would
-        # fail inside the forward pass with the first already committed.
+        # Blocks promised so far, so two sequences cannot be admitted against one page.
         promised: dict[int, int] = {}
 
         decoding, prefilling = [], []
@@ -757,10 +597,7 @@ class Scheduler:
             budget = self._admit(output, budget, promised)
 
         if not output.scheduled and self.has_work and self.manager is not None:
-            # No other empty iteration is reachable: the token budget is at least 1 and
-            # a queue is non-empty, so something would have been scheduled. This case
-            # means the pool cannot back a single sequence of this length, and an empty
-            # batch would leave the engine spinning on it indefinitely.
+            # The budget is >= 1 and a queue is non-empty, so only the pool can be at fault.
             raise OutOfBlocks(
                 f"nothing can run: {len(self.running)} running and {len(self.waiting)} waiting "
                 f"sequences with {self.manager.num_free_blocks} of "
@@ -769,7 +606,6 @@ class Scheduler:
             )
         return output
 
-    # ------------------------------------------------------------ the passes
     def _advance(
         self,
         sequences: list[Sequence],
@@ -778,24 +614,17 @@ class Scheduler:
         promised: dict[int, int],
     ) -> int:
         """Give each already-running sequence its next tokens, returning what is left of
-        the budget. It can grow: preempting a victim already scheduled this iteration
-        hands its tokens back, hence the budget is threaded through rather than a field.
-        """
+        the budget; it can grow, since preempting a scheduled victim hands its tokens back."""
         for sequence in sequences:
             if not sequence.is_prefill() and sequence.num_uncomputed_tokens == 0:
                 # Nothing to feed and not finished, so the loop would spin forever.
-                # The cause is `commit` being called without the sampled token for a
-                # sequence whose prompt was complete; raising here beats an engine that
-                # makes no progress.
                 raise ValueError(
                     f"sequence {sequence.seq_id} is running with nothing to compute; "
                     "commit() needs the token sampled for it"
                 )
             count = self._tokens_for(sequence, budget)
             if count == 0:
-                # The budget ran out mid-batch. The sequence keeps its cache and its
-                # place; it simply does not advance this iteration.
-                continue
+                continue  # the budget ran out; the sequence keeps its cache and its place
             refund = self._make_room_for(sequence, count, output, promised)
             if refund is None:
                 continue
@@ -807,9 +636,7 @@ class Scheduler:
         """Take arrivals off the front of the waiting queue while they fit."""
         while self.waiting and len(self.running) < self.config.max_sequences:
             candidate = self.waiting[0]
-            # A prefix-cache hit is resolved here, before the prefill is sized, so the
-            # reused prefix is already out of `num_uncomputed_tokens` and the chunk
-            # this iteration schedules is only the part the cache did not hold.
+            # Resolved before the prefill is sized, so only the uncached part is scheduled.
             if self.manager is not None:
                 self.manager.maybe_apply_prefix_cache(candidate)
             count = self._tokens_for(candidate, budget)
@@ -817,15 +644,10 @@ class Scheduler:
             if count == 0:
                 if output.scheduled:
                     break  # no room left this iteration; it goes next time
-                # Chunking is off, nothing else is running, and the prompt does not fit
-                # whole in the budget. Refusing it would deadlock the queue, so it runs
-                # alone and overruns the budget: the head-of-line stall chunking
-                # removes, kept reachable so the tests can exhibit it.
+                # Chunking off and nothing running: it overruns the budget, not deadlocks.
                 count = candidate.num_uncomputed_tokens
 
-            # Admission declines memory pressure rather than resolving it: a request
-            # that has not started holds nothing and costs nothing to leave queued, so
-            # preempting a running sequence for it would discard completed work.
+            # A queued request holds nothing, so preempting for it would discard work.
             if not self._fits(candidate, count, promised):
                 break
 
@@ -836,7 +658,6 @@ class Scheduler:
             budget -= count
         return budget
 
-    # ------------------------------------------------------- memory pressure
     def _schedule(
         self, output: SchedulerOutput, sequence: Sequence, count: int, promised: dict[int, int]
     ) -> None:
@@ -846,11 +667,7 @@ class Scheduler:
             promised[sequence.seq_id] = self.manager.blocks_needed(sequence, count)
 
     def _fits(self, sequence: Sequence, count: int, promised: dict[int, int]) -> bool:
-        """Whether the pool can back `count` more tokens of this sequence.
-
-        Measured against the free count minus this iteration's outstanding promises,
-        which is what the runner will find when it reserves them.
-        """
+        """Whether the pool can back `count` more tokens, net of outstanding promises."""
         if self.manager is None:
             return True
         available = self.manager.num_free_blocks - sum(promised.values())
@@ -859,20 +676,14 @@ class Scheduler:
     def _make_room_for(
         self, sequence: Sequence, count: int, output: SchedulerOutput, promised: dict[int, int]
     ) -> int | None:
-        """Preempt until count tokens of sequence fit, or give up on it.
-
-        Victims come from the back of the running list, most recently admitted first,
-        and each releases every block it holds. Returns the budget freed by
-        un-scheduling them, or None when the only remaining victim is sequence itself --
-        the pool cannot hold one sequence of this length, which the caller raises on.
-        """
+        """Preempt from the back of the running list until count tokens fit, returning the
+        budget that freed, or None when the only remaining victim is sequence itself."""
         refund = 0
         while not self._fits(sequence, count, promised):
             victim = next((s for s in reversed(self.running) if s is not sequence), None)
             if victim is None:
                 return None
-            # A victim already scheduled this iteration must come back out: it is about
-            # to lose the blocks the forward pass would have written into.
+            # A victim scheduled this iteration must come back out with its blocks.
             refund += output.tokens_for(victim)
             promised.pop(victim.seq_id, None)
             output.scheduled = [pair for pair in output.scheduled if pair[0] is not victim]
@@ -881,25 +692,15 @@ class Scheduler:
         return refund
 
     def _tokens_for(self, sequence: Sequence, budget: int) -> int:
-        """How many of this sequence's tokens fit in what is left of the budget. With
-        chunking on a partial count is valid and the sequence resumes from
-        num_computed_tokens; with it off the answer is all or nothing, since splitting a
-        prefill without matching positions and a shifted mask produces wrong text, not
-        slow text. Zero defers the sequence.
-        """
+        """How many of this sequence's tokens fit in what is left of the budget."""
         wanted = sequence.num_uncomputed_tokens
         if sequence.proposed_token_ids:
-            # A speculative group is atomic: the pending token and all `k` proposals go
-            # through one pass or none do. Splitting it is wrong rather than slow — the
-            # draft's `q` was computed for one specific context, and the verifier reads
-            # a sequence's `k + 1` distributions as consecutive rows of a single
-            # forward, so a partial group misaligns both.
+            # A speculative group is atomic: the verifier reads its k + 1 rows together.
             return wanted if wanted <= budget else 0
         if not self.config.enable_chunked_prefill:
             return wanted if wanted <= budget else 0
         return min(wanted, self.config.chunk_size, max(budget, 0))
 
-    # ------------------------------------------------------------ committing
     def commit(
         self,
         output: SchedulerOutput,
@@ -908,10 +709,8 @@ class Scheduler:
     ) -> list[Sequence]:
         """Record an iteration's results and retire whatever finished.
 
-        Still-prefilling sequences never receive a token: their pass produced logits for
-        a mid-prompt position, and sampling from those would invent a token the prompt
-        then contradicts. verified names sequences a speculative step already settled,
-        whose counters this method has no view of, so only the finish check applies.
+        Still-prefilling sequences never receive a token, and `verified` names sequences
+        a speculative step already settled, so only the finish check applies to them.
         """
         sampled = tokens if tokens is not None else [None] * len(output.scheduled)
         if len(sampled) != len(output.scheduled):
@@ -921,11 +720,7 @@ class Scheduler:
 
         for (sequence, count), token in zip(output.scheduled, sampled, strict=True):
             if sequence.seq_id in verified:
-                # A verified speculative step has already done both halves:
-                # `Sequence.accept` appended the surviving tokens and set the computed
-                # count to match, since only it knows how many proposals were kept.
-                # Advancing again would double-count them.
-                continue
+                continue  # `Sequence.accept` already appended and advanced this one
             sequence.advance(count)
             if sequence.is_prefill():
                 continue  # mid-prompt: no token to take, and none was sampled
@@ -941,13 +736,7 @@ class Scheduler:
         return just_finished
 
     def preempt(self, sequence: Sequence) -> None:
-        """Evict a running sequence, to be recomputed when it is readmitted.
-
-        Requeued at the front, not the back: it has been served before and its caller
-        has seen output, so placing it behind requests that have never run would make
-        preemption a demotion, and under sustained pressure a sequence could be
-        preempted repeatedly without finishing.
-        """
+        """Evict a running sequence, requeued at the front to be recomputed later."""
         if sequence not in self.running:
             raise ValueError(f"sequence {sequence.seq_id} is not running")
         self.running.remove(sequence)
@@ -960,18 +749,9 @@ class Scheduler:
         return f"Scheduler(waiting={len(self.waiting)}, running={len(self.running)})"
 
 
-# --- 6. Dense-cache oracle ---------------------------------------------------
-
 class DenseModelRunner:
-    """Executes a SchedulerOutput against the dense per-sequence cache.
-
-    A DenseKvCache is one contiguous tensor per sequence, and two sequences at
-    different lengths cannot share one, so a scheduled batch of n becomes n separate
-    forward passes: continuous batching then buys scheduling fairness and no GPU
-    efficiency. Retained beside the paged runner as the oracle it is diffed against,
-    since the scheduler tests assert that batching, chunking and preemption change
-    no tokens.
-    """
+    """Executes a SchedulerOutput against the dense per-sequence cache: one pass per
+    sequence, and the oracle the paged runner is diffed against."""
 
     def __init__(self, model, device: torch.device | str | None = None) -> None:
         self.model = model
@@ -988,20 +768,14 @@ class DenseModelRunner:
         self.caches.pop(sequence.seq_id, None)
 
     def execute(self, output: SchedulerOutput) -> torch.Tensor:
-        """Run every scheduled sequence, returning num_scheduled x V -- the last position
-        each computed, its only one for a decode step and the end of the chunk for a
-        prefill. Only the final chunk's row is ever sampled from, but returning one
-        uniformly means the caller need not know which chunk it is looking at.
-        """
+        """Run every scheduled sequence, returning num_scheduled x V: its last position."""
         rows = []
         for sequence, count in output.scheduled:
             caches = self.caches_for(sequence)
             start = sequence.num_computed_tokens
 
             if start == 0 and caches[0].offset > 0:
-                # Readmitted after preemption: the sequence recomputes from token zero,
-                # so the stale cache must be dropped. This is the concrete cost of
-                # recompute-based preemption.
+                # Readmitted after preemption: drop the stale cache and recompute.
                 for cache in caches:
                     cache.reset()
             elif caches[0].offset != start:
@@ -1020,10 +794,7 @@ class DenseModelRunner:
         return torch.stack(rows)
 
     def sample_tokens(self, output: SchedulerOutput, logits: torch.Tensor) -> list[int]:
-        """Sample one token per scheduled sequence, honouring per-row parameters. Sequences
-        still mid-prefill get a token sampled and discarded by Scheduler.commit: one
-        wasted row of a V-wide sample instead of a branch in the hot path.
-        """
+        """Sample one token per scheduled sequence, honouring per-row parameters."""
         params = [sequence.sampling_params for sequence, _ in output.scheduled]
         if all(parameter.is_greedy for parameter in params):
             return logits.argmax(dim=-1).tolist()

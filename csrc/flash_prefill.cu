@@ -1,28 +1,4 @@
-// Flash prefill: many query tokens against many keys, causally masked.
-//
-// Same online-softmax recurrence as the decode attention kernel, but `L > 1` adds a
-// second axis to tile, and two consequences follow.
-//
-// Shared memory pays off. In decode each K element feeds exactly one dot product, so
-// staging it would be a pure copy. Here every K and V element is touched by all
-// `kQueryTile` queries in the block, so a tile is loaded from global once (coalesced) and
-// read `kQueryTile` times from shared. That reuse also lets each thread own a whole
-// `(query, key)` dot product with no cross-lane reduction, unlike the decode kernel where
-// the warp must shuffle because K comes straight from global.
-//
-// Half the work does not exist. Query `i` may attend only to keys up to `(S - L) + i`, so
-// key tiles strictly above the diagonal are skipped rather than computed and masked —
-// half the flops for a square prefill. Only the tile on the diagonal needs the
-// per-element mask; an off-by-one there lets a token attend to its own future, which
-// lowers loss and generates nonsense.
-//
-// Shared layouts, chosen for bank behaviour:
-//
-//   q_shared[i][d]      row-major   threads in a warp share `i`, so this broadcasts
-//   k_shared[d][j]      transposed  threads in a warp differ in `j`, so this is
-//                                   consecutive — padded by one so the coalesced
-//                                   store does not conflict either
-//   v_shared[j][d]      row-major   the P·V phase has threads differ in `d`
+// Flash prefill: causal attention for many query tokens, tiled through shared memory.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -73,9 +49,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   const int64_t sequence = blockIdx.z;
   const int64_t kv_head = query_head / group_size;
 
-  // The offset form of the PyTorch reference's causal mask: with a filled cache the `L`
-  // queries are the last `L` positions of the sequence, so the diagonal shifts right by
-  // S - L.
+  // The reference's causal mask as an offset: the diagonal shifts right by S - L.
   const int64_t offset = source_len - query_len;
 
   const scalar_t* query = q + sequence * q_strides.batch + query_head * q_strides.head;
@@ -92,26 +66,15 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   float* correction = running_sum + kQueryTile;
 
   const int thread = threadIdx.x;
-  // The score phase's decomposition, fixed for the whole kernel: a warp spans two
-  // query rows of 16 keys, so lanes differ in `j` and share `i` in pairs.
+  // A warp spans two query rows of 16 keys, so lanes differ in `j` and share `i` in pairs.
   const int score_query = thread / kKeyTile;
   const int score_key = thread % kKeyTile;
 
-  // The accumulator stays in registers; another kQueryTile x D floats of shared memory
-  // would not fit beside the three tiles. Thread `t` owns the `(query, dimension)` pairs
-  // `t, t + kThreads, ...`, one register each.
-  //
-  // Every loop over these slots is bounded by a compile-time count and exits on a runtime
-  // predicate rather than being bounded by the runtime count directly: `accumulator[slot]`
-  // must be a constant index for the array to live in registers, and a runtime trip count
-  // spills it to local memory, which is correct but several times slower.
+  // The accumulator stays in registers, so every loop over it needs a compile-time bound.
   constexpr int kSlots = (kQueryTile * kMaxHeadDim + kThreads - 1) / kThreads;
   float accumulator[kSlots];
 
-  // Which `(query, dimension)` each slot is, resolved once here rather than per tile.
-  // `head_dim` is a runtime value, so `index / head_dim` is a real integer division of
-  // around twenty instructions and does not belong in a loop whose body is one
-  // multiply-add.
+  // Which (query, dimension) each slot is, resolved once: the division is not cheap.
   int slot_query[kSlots];
   int slot_dim[kSlots];
   const int64_t owned = kQueryTile * head_dim;
@@ -137,8 +100,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
   }
   __syncthreads();
 
-  // Every key tile any query in this tile can see. The last query has the longest reach,
-  // so its bound is the block's bound; skipping the rest is the causal speedup itself.
+  // The last query has the longest reach, so its bound is the block's bound.
   const int64_t last_key = offset + query_begin + kQueryTile - 1;
   const int64_t key_limit = last_key + 1 < source_len ? last_key + 1 : source_len;
 
@@ -146,9 +108,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
     const int64_t keys_here =
         (key_limit - key_begin) < kKeyTile ? (key_limit - key_begin) : kKeyTile;
 
-    // --- stage the tile. Reads are coalesced along `d`; the K store goes
-    // transposed into a padded row so neither the store nor the later read
-    // collides on a bank.
+    // Stage the tile: coalesced along `d`, K transposed into a padded row for the banks.
     for (int64_t index = thread; index < kKeyTile * head_dim; index += kThreads) {
       const int64_t j = index / head_dim;
       const int64_t d = index % head_dim;
@@ -160,25 +120,21 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
     }
     __syncthreads();
 
-    // --- QKᵀ for this tile: one thread, one dot product, all of it from shared.
+    // QKᵀ: one thread, one dot product, all of it from shared memory.
     {
       const int64_t position = query_begin + score_query;
       float dot = 0.0f;
       for (int64_t d = 0; d < head_dim; ++d) {
         dot += q_shared[score_query * head_dim + d] * k_shared[d * kKeyStride + score_key];
       }
-      // Masked and out-of-range entries become -inf, which the recurrence turns
-      // into a zero weight without a branch. `keys_here` covers the ragged end of
-      // the cache; the causal test covers the diagonal.
+      // Masked and out-of-range entries become -inf, which the recurrence zeroes.
       const bool visible = score_key < keys_here && position < query_len &&
                            (key_begin + score_key) <= offset + position;
       scores[score_query * kKeyTile + score_key] = visible ? dot * scale : -INFINITY;
     }
     __syncthreads();
 
-    // --- the per-query softmax update. Sixteen threads each scan their own row of
-    // sixteen scores: a cross-lane reduction over so few values would cost more in
-    // barriers than the serial scan costs in arithmetic.
+    // The per-query softmax update: one thread per row, too few values to reduce.
     if (thread < kQueryTile) {
       float* row = scores + thread * kKeyTile;
 
@@ -187,8 +143,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
         tile_max = fmaxf(tile_max, row[j]);
       }
 
-      // A query whose whole tile is masked keeps its running max and gets a
-      // correction of exactly 1, so an all -inf row needs no special case.
+      // An all -inf row keeps its running max and gets a correction of exactly 1.
       const float new_max = fmaxf(running_max[thread], tile_max);
       float tile_sum = 0.0f;
       for (int j = 0; j < kKeyTile; ++j) {
@@ -206,8 +161,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
     }
     __syncthreads();
 
-    // --- P·V. Threads differ in `d`, so both the shared read and the register
-    // slot they own stay contiguous.
+    // P·V: threads differ in `d`, so the shared read and the register slot stay adjacent.
 #pragma unroll
     for (int slot = 0; slot < kSlots; ++slot) {
       if (slot >= live_slots) {
@@ -221,9 +175,7 @@ __global__ void flash_prefill_kernel(const scalar_t* __restrict__ q,
       }
       accumulator[slot] = total;
     }
-    // The next tile overwrites k_shared, v_shared and scores, all of which the
-    // loops above are still reading.
-    __syncthreads();
+    __syncthreads();  // the next tile overwrites what the loops above are reading
   }
 
   scalar_t* destination = out + sequence * out_strides.batch + query_head * out_strides.head;

@@ -1,15 +1,4 @@
-// SwiGLU's elementwise half: out = silu(gate) * up.
-//
-// The two projections stay on cuBLAS. What is worth fusing is this part: three full
-// passes over a `(B·L) x intermediate` tensor (sigmoid, then two multiplies) for four
-// flops per element, which is pure memory traffic. Qwen3-0.6B's intermediate width is
-// 3072, three times the hidden size, making this the widest activation in the model.
-//
-// The oracle is `silu(gate) * up` in mini_vllm/kernels/ops.py, built from
-// `mini_vllm.basics.silu`. Matching it means rounding where PyTorch rounds: it evaluates
-// three separate ops, each landing back in the input dtype, so a kernel carrying fp32 all
-// the way to the store would be more accurate than the reference and the differential
-// test could not distinguish that from a bug.
+// SwiGLU's elementwise half: out = silu(gate) * up, rounded where PyTorch rounds.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -23,8 +12,7 @@ using namespace mini_vllm;
 
 constexpr int kThreads = 256;
 
-// Pure elementwise, so there is no row structure to respect: one thread per 16-byte chunk
-// of a flat buffer, the shape that saturates bandwidth.
+// Pure elementwise: one thread per 16-byte chunk of a flat buffer.
 template <typename scalar_t, typename chunk_t>
 __global__ void swiglu_kernel(const scalar_t* __restrict__ gate,
                               const scalar_t* __restrict__ up,
@@ -44,10 +32,7 @@ __global__ void swiglu_kernel(const scalar_t* __restrict__ gate,
   for (int j = 0; j < kLanes; ++j) {
     const float g = static_cast<float>(gate_chunk.lane[j]);
 
-    // Three roundings in the same three places PyTorch does them: after the sigmoid,
-    // after the silu multiply, and on the store. `expf` rather than `__expf`, since the
-    // fast intrinsic is a different function and would disagree in the last bits for no
-    // benefit on a memory-bound kernel.
+    // `expf`, not the fast intrinsic, which would disagree in the last bits for no gain.
     const scalar_t sigmoid = static_cast<scalar_t>(1.0f / (1.0f + expf(-g)));
     const scalar_t activated = static_cast<scalar_t>(g * static_cast<float>(sigmoid));
     result.lane[j] =

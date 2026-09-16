@@ -1,20 +1,4 @@
-// Quantize a step's keys and values into the FP8 cache in one pass.
-//
-// The PyTorch path this replaces takes two: `(k.float() / scale).to(fp8)` builds a whole
-// quantized copy in a temporary, and `index_copy_` scatters that temporary into the pool.
-// Two full reads and two full writes of the step's KV for a few flops an element
-// (division, a cast, a store), with a temporary that exists only to be consumed
-// immediately — the same pure memory traffic the SwiGLU and RMSNorm kernels fuse away.
-//
-// This kernel reads the activation-dtype key and value once, divides by the scale, casts
-// to FP8, and writes straight to the slot the token maps to: no temporary, one pass. The
-// scatter uses the same slot arithmetic the attention kernel reads back with,
-//
-//   dest = slot_mapping[token] * (H_k * D) + (h * D + d)
-//
-// so a key written here is the key that read finds. The PyTorch version remains the
-// oracle — `ops.quantize_scatter` falls back to it off the GPU and the tests diff the
-// two — so its quantization must agree bit for bit.
+// Quantize a step's keys and values straight into the FP8 cache, in one pass.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -42,8 +26,7 @@ __global__ void kv_quantize_scatter_kernel(const scalar_t* __restrict__ key,
   const int64_t within = element - token * inner;
   const int64_t dest = slot_mapping[token] * inner + within;
 
-  // Divide by the scale in fp32, then let the FP8 constructor round to nearest even: the
-  // same two steps in the same order as the PyTorch oracle.
+  // Divide in fp32, then round to nearest even: the oracle's two steps, in its order.
   key_pool[dest] = static_cast<cache_t>(static_cast<float>(key[element]) * inv_k_scale);
   value_pool[dest] = static_cast<cache_t>(static_cast<float>(value[element]) * inv_v_scale);
 }
@@ -128,9 +111,7 @@ void kv_quantize_scatter(const torch::Tensor& key,
 
   const float inv_k_scale = static_cast<float>(1.0 / k_scale);
   const float inv_v_scale = static_cast<float>(1.0 / v_scale);
-  // e4m3 only, matching the attention kernel. e5m2 is a legal storage dtype that takes the
-  // PyTorch path, leaving one accelerated FP8 format rather than two half-supported ones,
-  // and one fewer set of instantiations for nvcc to hold in memory.
+  // e4m3 only, matching the attention kernel; an e5m2 pool takes the PyTorch path.
   TORCH_CHECK(key_pool.scalar_type() == at::kFloat8_e4m3fn,
               "kv_quantize_scatter: the pools must be FP8 e4m3, got ",
               key_pool.scalar_type());

@@ -1,12 +1,4 @@
-"""The CUDA kernels' front door: JIT build of csrc/ and the dispatch seam.
-
-load_extension JIT-compiles csrc/ on first use, after resolve_cuda_home finds
-or assembles a toolkit whose CUDA major version matches torch's; then one
-wrapper per op runs either the hand-written kernel or the ops.py reference, and
-the model never learns which. use_cuda=True means "where implemented, correct,
-and faster" -- an op whose kernel measures slower is listed in NOT_YET_FASTER
-and keeps the reference path.
-"""
+"""The CUDA kernels' front door: the JIT build of csrc/ and the dispatch seam."""
 
 from __future__ import annotations
 
@@ -32,19 +24,13 @@ TOOLKIT_DIR = BUILD_DIR / "cuda_toolkit"
 
 EXT_NAME = "mini_vllm_C"
 
-# Blackwell, the RTX 5070 Laptop of record (compute capability 12.0). Targeting a single
-# architecture keeps compiles fast.
+# Blackwell, the RTX 5070 Laptop of record. One architecture keeps compiles fast.
 CUDA_ARCH = "sm_120"
 
-# Translation units to compile at once. Ninja defaults to one job per core, which is wrong
-# here: nvcc on a template-heavy kernel peaks well past a gigabyte, this machine has 16
-# cores, and WSL2 gives the VM about half the host's RAM. Sixteen concurrent jobs exhaust
-# it and the build is OOM-killed, which presents as a crash with no failing test. Four
-# fits the budget and costs little wall clock given the small number of sources.
+# Translation units at once: ninja's one-job-per-core default OOMs on these kernels.
 DEFAULT_MAX_JOBS = 4
 
-# Memory budget for one nvcc invocation, used to lower the job count on a machine with
-# less memory than this one rather than assuming 15 GB.
+# Memory budget for one nvcc invocation, used to lower the job count on a smaller machine.
 BYTES_PER_JOB = 2 * 1024**3
 
 _extension: Any = None
@@ -71,8 +57,6 @@ __all__ = [
 class ToolchainError(RuntimeError):
     """Raised when no CUDA toolkit matching torch's CUDA version can be found."""
 
-
-# --- 1. Probing the toolchain ------------------------------------------------
 
 def torch_cuda_major() -> int:
     """The CUDA major version torch was built against, e.g. 13 for ``2.11.0+cu130``."""
@@ -105,11 +89,7 @@ def _nvidia_wheel_roots() -> list[Path]:
 
 
 class WheelToolkit:
-    """The pieces of a CUDA toolkit as pip scatters them. No single directory is
-    guaranteed to hold a usable one: on this machine nvcc and nvvm come from one
-    site-packages tree, the runtime headers from another, and the CCCL headers
-    cuda_fp16.h includes from a third. The search paths are therefore lists.
-    """
+    """The pieces of a CUDA toolkit as pip scatters them, hence lists of search paths."""
 
     def __init__(self, compiler_root: Path, include_dirs: list[Path], lib_dirs: list[Path]) -> None:
         self.compiler_root = compiler_root
@@ -121,8 +101,7 @@ def _find_wheel_toolkit(major: int) -> WheelToolkit | None:
     """Collect the wheel-provided toolkit pieces for CUDA ``major``."""
     candidates: list[Path] = []
     for root in _nvidia_wheel_roots():
-        # `cu13` is the current consolidated layout; the split
-        # `cuda_nvcc` / `cuda_runtime` / `cuda_cccl` layout is what older wheels use.
+        # `cu13` is the current consolidated layout; the split one is what older wheels use.
         candidates += [
             root / f"cu{major}",
             root / "cuda_nvcc",
@@ -137,16 +116,13 @@ def _find_wheel_toolkit(major: int) -> WheelToolkit | None:
     include_dirs = [c / "include" for c in candidates if (c / "include").is_dir()]
     lib_dirs = [c / "lib" for c in candidates if (c / "lib").is_dir()]
 
-    # Sort the tree holding cuda_runtime.h first so it wins name collisions during the
-    # merge; it is the authoritative copy of the core headers.
+    # Sort the tree holding cuda_runtime.h first so it wins name collisions in the merge.
     include_dirs.sort(key=lambda d: not (d / "cuda_runtime.h").is_file())
     if not include_dirs or not (include_dirs[0] / "cuda_runtime.h").is_file():
         return None
 
     return WheelToolkit(compiler, include_dirs, lib_dirs)
 
-
-# --- 2. Toolkit assembly -----------------------------------------------------
 
 def _relink(link: Path, target: Path) -> None:
     """Point ``link`` at ``target``, replacing whatever was there before."""
@@ -162,29 +138,17 @@ def _relink(link: Path, target: Path) -> None:
 
 
 def _ensure_real_dir(path: Path) -> None:
-    """Make ``path`` a real directory, replacing a symlink left by an older layout.
-
-    ``mkdir(exist_ok=True)`` on a path that is currently a symlink to a wheel's include
-    directory succeeds, which would scatter the symlinks inside site-packages.
-    """
+    """Make ``path`` a real directory, replacing a symlink left by an older layout."""
     if path.is_symlink():
         path.unlink()
     path.mkdir(parents=True, exist_ok=True)
 
 
 def synthesize_cuda_home(toolkit: WheelToolkit, dest: Path = TOOLKIT_DIR) -> Path:
-    """Assemble a directory that looks enough like a CUDA toolkit for torch:
+    """Assemble a directory that looks enough like a CUDA toolkit for torch.
 
-        dest/bin      -> compiler_root/bin     (nvcc, ptxas, cudafe++, crt/)
-        dest/nvvm     -> compiler_root/nvvm    (cicc and libdevice)
-        dest/include/ -> merged symlinks from every wheel include dir
-        dest/lib64/   -> merged symlinks from every wheel lib dir, plus sonames
-
-    Needed because cpp_extension refuses to compile when nvcc's CUDA major differs
-    from torch's, and the pip wheels that supply a matching compiler are split
-    across packages that may land in different site-packages trees, so no single
-    directory resembles a CUDA install. bin is linked as a whole directory because
-    nvcc locates its nvvm backend relative to the real path of the binary.
+    bin and nvvm are linked whole because nvcc locates its backend relative to the real
+    path of the binary; include and lib64 are merged symlinks from every wheel.
     """
     dest.mkdir(parents=True, exist_ok=True)
     _relink(dest / "bin", toolkit.compiler_root / "bin")
@@ -207,8 +171,7 @@ def synthesize_cuda_home(toolkit: WheelToolkit, dest: Path = TOOLKIT_DIR) -> Pat
             if src.is_dir():
                 continue
             _relink(lib64 / src.name, src)
-            # The wheels ship only versioned sonames (libcudart.so.13), but torch
-            # links with -lcudart, which needs the unversioned name to exist.
+            # The wheels ship only versioned sonames, but torch links with -lcudart.
             if ".so." in src.name:
                 bare = lib64 / (src.name.split(".so.")[0] + ".so")
                 if not bare.is_symlink():
@@ -220,15 +183,16 @@ def synthesize_cuda_home(toolkit: WheelToolkit, dest: Path = TOOLKIT_DIR) -> Pat
 
 def _candidate_homes() -> list[tuple[Path, str]]:
     """Existing toolkits to try before falling back to assembling one."""
+    # Imported here, not at module scope: importing cpp_extension probes for nvcc.
+    from torch.utils import cpp_extension
+
     candidates: list[tuple[Path, str]] = []
     for var in ("CUDA_HOME", "CUDA_PATH"):
         if os.environ.get(var):
             candidates.append((Path(os.environ[var]), f"${var}"))
 
-    from torch.utils.cpp_extension import CUDA_HOME as TORCH_CUDA_HOME
-
-    if TORCH_CUDA_HOME:
-        candidates.append((Path(TORCH_CUDA_HOME), "torch's detected CUDA_HOME"))
+    if cpp_extension.CUDA_HOME:
+        candidates.append((Path(cpp_extension.CUDA_HOME), "torch's detected CUDA_HOME"))
 
     nvcc = shutil.which("nvcc")
     if nvcc:
@@ -238,10 +202,7 @@ def _candidate_homes() -> list[tuple[Path, str]]:
 
 
 def resolve_cuda_home() -> tuple[Path, str]:
-    """Find a CUDA toolkit whose nvcc major version matches torch's.
-
-    Returns ``(cuda_home, how_it_was_found)``.
-    """
+    """Find a CUDA toolkit whose nvcc major matches torch's: (cuda_home, how it was found)."""
     want = torch_cuda_major()
 
     for home, how in _candidate_homes():
@@ -270,17 +231,12 @@ def resolve_cuda_home() -> tuple[Path, str]:
     )
 
 
-# --- 3. Loading the extension ------------------------------------------------
-
 def _available_bytes() -> int | None:
-    """RAM the machine will give a compile, or None if it does not report it.
-
-    ``MemAvailable`` rather than ``MemFree``: the page cache is reclaimable, so counting
-    only free memory would throttle the build needlessly.
-    """
+    """RAM the machine will give a compile, or None if it does not report it."""
     try:
         with open("/proc/meminfo") as meminfo:
             for line in meminfo:
+                # MemAvailable rather than MemFree: the page cache is reclaimable.
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
     except OSError:
@@ -289,11 +245,7 @@ def _available_bytes() -> int | None:
 
 
 def max_jobs() -> int:
-    """How many compiler processes to run at once, respecting an explicit override.
-
-    ``MAX_JOBS`` is the variable ``torch.utils.cpp_extension`` reads, so an explicit
-    setting passes through untouched.
-    """
+    """How many compiler processes to run at once, respecting an explicit MAX_JOBS."""
     override = os.environ.get("MAX_JOBS")
     if override:
         return max(1, int(override))
@@ -324,19 +276,16 @@ def load_extension(verbose: bool = False) -> Any:
 
     home, _how = resolve_cuda_home()
 
-    # Both are required. The environment variables are what nvcc and any subprocess see;
-    # the module attribute is what torch consults, and it is captured once at import time,
-    # so setting only the environment is ignored when cpp_extension was imported earlier.
     os.environ["CUDA_HOME"] = str(home)
     os.environ["CUDA_PATH"] = str(home)
     os.environ["PATH"] = f"{home / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
 
-    # Bound the compile before torch reads it; otherwise ninja fills every core and the
-    # build is OOM-killed instead of failing for a diagnosable reason.
+    # Bound the compile before torch reads it, or the build is OOM-killed instead.
     os.environ["MAX_JOBS"] = str(max_jobs())
 
     from torch.utils import cpp_extension
 
+    # The environment is what nvcc sees; this attribute is what torch consults.
     cpp_extension.CUDA_HOME = str(home)
 
     EXT_BUILD_DIR.mkdir(parents=True, exist_ok=True)
@@ -352,11 +301,7 @@ def load_extension(verbose: bool = False) -> Any:
 
 
 def rebuild(verbose: bool = True) -> Any:
-    """Discard the build cache and compile from scratch.
-
-    Exposed as `make ext`. The usual cause of a kernel edit having no effect is a stale
-    object file rather than a wrong kernel.
-    """
+    """Discard the build cache and compile from scratch. Exposed as `make ext`."""
     global _extension
     _extension = None
     if EXT_BUILD_DIR.exists():
@@ -386,14 +331,7 @@ def toolchain_report() -> dict[str, Any]:
     return report
 
 
-# --- 4. Dispatch policy ------------------------------------------------------
-
-# Which ops have a hand-written kernel, paired with the source file the dispatch report
-# names beside each one.
-#
-# The keys are the names the extension exports rather than synonyms: the test suite
-# looks each up in the compiled module, so a kernel cannot be claimed here while being
-# missing, misspelled, or renamed.
+# Which ops have a kernel, keyed by the name the extension exports so tests can check.
 CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "rmsnorm": (True, "csrc/rmsnorm.cu"),
     "rope": (True, "csrc/rope.cu"),
@@ -404,40 +342,23 @@ CUDA_KERNELS: dict[str, tuple[bool, str]] = {
     "kv_quantize_scatter": (True, "csrc/kv_quantize.cu"),
 }
 
-# The one FP8 format the kernels accelerate. e5m2 remains a legal storage dtype for the
-# pool and the PyTorch paths quantize and dequantize it correctly, but it does not justify
-# a second set of template instantiations in every kernel, so a pool in it degrades to the
-# oracle rather than being half-supported.
+# The one FP8 format the kernels accelerate; an e5m2 pool takes the reference path.
 FP8_KERNEL_DTYPE = torch.float8_e4m3fn
 
-# Kernels that are correct, tested, and not the default, with the reason measured by the
-# benchmark. A kernel earns the dispatch by being faster, and routing to a slower one
-# behind `use_cuda=True` is what `dispatch_report` exists to prevent.
-#
-# Prefill is listed because its inner loop is scalar FMA against cuBLAS on tensor cores,
-# a gap tuning does not close; replacing the loop with `mma.sync` would flip this entry.
-# The tests call the kernel directly through the extension, so its coverage does not
-# depend on routing.
+# Correct, tested kernels that are not the default: the dispatch is earned by speed.
 NOT_YET_FASTER: dict[str, str] = {
     "flash_prefill": "0.4x cuBLAS at L=512",
 }
 
-# The prefill kernel stages query, key and value tiles in shared memory simultaneously,
-# which bounds the head dimension it can serve. Qwen3-0.6B uses 128; anything wider goes
-# to the oracle.
+# The prefill kernel stages three tiles in shared memory, bounding the head dimension.
 MAX_KERNEL_HEAD_DIM = 192
 
-# The paged kernel holds the query and the accumulator in registers instead, `D / 32`
-# floats per lane of each, which is where its own ceiling comes from.
+# The paged kernel holds the query and the accumulator in registers instead.
 MAX_PAGED_HEAD_DIM = 256
 
 
 def _use_kernel(name: str, use_cuda: bool, x: torch.Tensor) -> bool:
-    """Whether ``name`` should run on the GPU for this call.
-
-    Requires an implemented kernel that is the default and CUDA tensors: the same model
-    object serves CPU tests and GPU runs.
-    """
+    """Whether ``name`` should run on the GPU for this call."""
     implemented, _source = CUDA_KERNELS[name]
     return use_cuda and implemented and name not in NOT_YET_FASTER and x.is_cuda
 
@@ -448,11 +369,7 @@ def cuda_kernel_names() -> list[str]:
 
 
 def dispatch_report(use_cuda: bool) -> str:
-    """One line per op saying which implementation a run would use. use_cuda=True means
-    use kernels where they exist, so an op with no kernel falls back silently, as
-    does any op called on CPU tensors -- and that silence is how a kernel that never
-    ran ends up in a benchmark.
-    """
+    """One line per op saying which implementation a run would use, and why."""
     lines = []
     for name, (implemented, source) in CUDA_KERNELS.items():
         if not implemented:
@@ -468,20 +385,14 @@ def dispatch_report(use_cuda: bool) -> str:
     return "\n".join(lines)
 
 
-# --- 5. Ops ------------------------------------------------------------------
-
 def rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """RMSNorm over the last dimension. Kernel: ``csrc/rmsnorm.cu``.
-
-    The kernel requires ``weight`` to have the same dtype as ``x``. PyTorch would promote
-    instead, and returning a different dtype than the oracle is worse than declining the
-    kernel. The model never mixes them.
-    """
+    """RMSNorm over the last dimension. Kernel: ``csrc/rmsnorm.cu``."""
+    # The kernel needs a matching weight dtype; PyTorch would promote instead.
     if _use_kernel("rmsnorm", use_cuda, x) and weight.dtype == x.dtype:
         return load_extension().rmsnorm(x, weight, eps)
     return reference.rms_norm(x, weight, eps)
@@ -494,25 +405,15 @@ def rope(
     sin: torch.Tensor,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Rotary embedding at explicit positions. Kernel: ``csrc/rope.cu``.
-
-    The kernel requires fp32 tables, which `ops.RoPE` builds regardless of the activation
-    dtype, and a head axis to broadcast the position across. Anything else goes to the
-    oracle.
-    """
+    """Rotary embedding at explicit positions. Kernel: ``csrc/rope.cu``."""
+    # The kernel needs fp32 tables, which `ops.RoPE` always builds, and a head axis.
     if _use_kernel("rope", use_cuda, x) and cos.dtype == torch.float32 and x.dim() >= 3:
         return load_extension().rope(x, positions, cos, sin)
     return reference.apply_rope(x, positions, cos, sin)
 
 
 def swiglu(gate: torch.Tensor, up: torch.Tensor, use_cuda: bool = False) -> torch.Tensor:
-    """silu(gate) * up, the elementwise half of the MLP. Kernel: csrc/swiglu.cu.
-
-    Takes the two projections rather than the input: those are ordinary matmuls
-    cuBLAS handles better than a hand-written kernel. What is worth fusing is this
-    part, two full passes over a B x L x intermediate tensor for a few flops per
-    element, which is pure memory traffic.
-    """
+    """silu(gate) * up, the elementwise half of the MLP. Kernel: csrc/swiglu.cu."""
     if _use_kernel("swiglu", use_cuda, gate) and gate.dtype == up.dtype:
         return load_extension().swiglu(gate, up)
     return reference.silu(gate) * up
@@ -525,12 +426,9 @@ def attention(
     mask: torch.Tensor | str | None = None,
     use_cuda: bool = False,
 ) -> torch.Tensor:
-    """Grouped-query attention, q [B, H_q, L, D] and k/v [B, H_k, S, D], with a
-    separate kernel for decode and for prefill.
+    """Grouped-query attention, q [B, H_q, L, D] and k/v [B, H_k, S, D].
 
-    Decode and prefill are different problems rather than different sizes of one:
-    decode has L = 1, no parallelism across queries and one long memory-bound pass
-    over the cache, while prefill has L = S, a matrix multiply worth tiling. Hence
+    Decode and prefill are different problems rather than different sizes of one, hence
     csrc/decode_attention.cu and csrc/flash_prefill.cu.
     """
     is_decode = q.shape[-2] == 1
@@ -560,16 +458,10 @@ def paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Ragged attention over a paged cache: q [T, H_q, D] over pools of
-    num_blocks x P x H_k x D. Kernel: csrc/paged_attention.cu.
+    """Ragged attention over a paged cache: q [T, H_q, D]. Kernel: csrc/paged_attention.cu.
 
-    The fallback differs in kind from the others here: it copies every sequence's
-    whole cache into a contiguous temporary first, which is the traffic paging
-    exists to remove, so it is the oracle rather than an alternative.
-    max_query_len and max_context_len are plain integers because they decide a grid
-    shape, and reading them off a device tensor would synchronize on the critical
-    path. With an FP8 pool the kernel dequantizes in registers, so the inner loops
-    are unchanged.
+    max_query_len and max_context_len are host integers because they decide a grid shape,
+    and reading them off a device tensor would synchronize on the critical path.
     """
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
@@ -615,10 +507,10 @@ def quantize_scatter(
     v_scale: float,
     use_cuda: bool = False,
 ) -> None:
-    """Quantize a step's KV to FP8 and scatter it into the pool, in place. Kernel:
-    csrc/kv_quantize.cu. The oracle is the two-pass PyTorch it replaces -- quantize
-    into a temporary, then index_copy_ -- and the two agree bit for bit, both
-    dividing by the scale in fp32 and rounding to nearest even.
+    """Quantize a step's KV to FP8 and scatter it into the pool, in place.
+
+    Kernel: csrc/kv_quantize.cu. The two-pass PyTorch below is its oracle, and the two
+    agree bit for bit: both divide by the scale in fp32 and round to nearest even.
     """
     if _use_kernel("kv_quantize_scatter", use_cuda, key) and key_pool.dtype is FP8_KERNEL_DTYPE:
         load_extension().kv_quantize_scatter(
@@ -639,18 +531,16 @@ def quantize_scatter(
     value_pool.view(torch.uint8).index_copy_(0, index, quant_values.view(torch.uint8))
 
 
-# --- 6. Dispatch guards ------------------------------------------------------
-
 def _kernel_can_page(
     q: torch.Tensor,
     key_pool: torch.Tensor,
     value_pool: torch.Tensor,
     block_tables: torch.Tensor,
 ) -> bool:
-    """Whether the paged kernel can serve this call. It walks the pools by slot
-    arithmetic rather than by stride, so they must be contiguous: a narrowed view
-    would read the wrong pages rather than read slowly. FP8 pools are served too, so
-    they may differ from the query in dtype provided they agree with each other.
+    """Whether the paged kernel can serve this call.
+
+    It walks the pools by slot arithmetic rather than by stride, so they must be
+    contiguous: a narrowed view would read the wrong pages rather than read slowly.
     """
     pools_match = key_pool.dtype == value_pool.dtype
     pool_is_fp8 = key_pool.dtype is FP8_KERNEL_DTYPE
@@ -671,20 +561,18 @@ def _kernel_can_attend(
     mask: torch.Tensor | str | None,
     is_decode: bool,
 ) -> bool:
-    """Whether the attention kernels can serve this exact call. Both encode the causal
-    structure in arithmetic rather than reading a mask tensor, so mask="causal" is
-    the only mask they can honour; an explicit tensor falls back to the oracle
-    rather than being ignored.
+    """Whether the attention kernels can serve this exact call.
+
+    Both encode the causal structure in arithmetic rather than reading a mask tensor, so
+    an explicit mask falls back to the oracle rather than being ignored.
     """
     is_causal_shorthand = isinstance(mask, str) and mask == "causal"
     if is_decode:
-        # A single query token may attend to every position cached before it, so the
-        # causal mask forbids nothing and `None` requests the same thing.
+        # A single query attends over everything cached, so a causal mask forbids nothing.
         if mask is not None and not is_causal_shorthand:
             return False
     elif not is_causal_shorthand:
-        # Prefill is the reverse: the kernel always masks causally, so it cannot serve
-        # an unmasked multi-token call either.
+        # Prefill always masks causally, so it cannot serve an unmasked multi-token call.
         return False
     if q.dim() != 4 or q.dtype != k.dtype or q.dtype != v.dtype or q.dtype == torch.float64:
         return False
@@ -692,8 +580,6 @@ def _kernel_can_attend(
         return False
     return k.shape[-2] > 0 and q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
 
-
-# --- 7. CLI: build and verify ------------------------------------------------
 
 def main() -> int:
     import argparse
@@ -708,8 +594,7 @@ def main() -> int:
 
     module = rebuild() if args.rebuild else load_extension(verbose=True)
 
-    # Verify the freshly built extension with a real kernel against its reference:
-    # rmsnorm on an actual model-sized input, rather than a synthetic smoke kernel.
+    # Verify the fresh build with a real kernel on a model-sized input.
     x = torch.randn(64, 1024, device="cuda", dtype=torch.float32)
     weight = torch.randn(1024, device="cuda", dtype=torch.float32)
     got = module.rmsnorm(x, weight, 1e-6)

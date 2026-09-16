@@ -25,6 +25,10 @@ Each file is one systems concept, sized to be read in a sitting:
 | `mini_vllm/benchmark.py` | measuring a GPU without fooling yourself |
 | `csrc/*.cu` | one kernel per file: fused elementwise ops and FlashAttention-style attention |
 
+Shape symbols, used throughout the code: `B` batch, `L` query length, `S` source
+(context) length, `D` head dim, `H_q` / `H_k` query and KV heads, `E` hidden size, `V`
+vocabulary, `T` total tokens of a ragged batch, `P` tokens per page.
+
 No architectural novelty is claimed; this is a correct, measured, single-GPU
 implementation of the ideas in vLLM's PagedAttention paper and Orca's continuous
 batching, written so each idea can be traced from the paper to the line of code.
@@ -105,8 +109,9 @@ pytest.ini           markers (cuda / oracle / slow) and pythonpath
 10. `tests/` — the differential evidence.
 11. `csrc/` — the kernels, in the same order as their wrappers.
 
-Each file opens with what it teaches, its inputs and outputs, which file to read next,
-and one invariant worth holding onto.
+Each file opens with a one-line statement of what it holds; the reasoning behind the
+design lives in this README, and the code carries only short notes on what is not
+obvious from it.
 
 ## 6. Dense versus paged KV caching
 
@@ -296,6 +301,18 @@ Differential testing at every seam, with the slow implementation as the oracle:
 - behavioral gates numerics cannot express: no leaked pages after every scenario,
   including a 2,000-request prefix-cache soak and a preemption-forcing stress run.
 
+Tolerances are shared in `tests/conftest.py` so no test picks its own. Single operators
+are compared elementwise at 1e-5 (fp32) or 1e-2 (bf16/fp16). Accumulated bf16 error is
+compared by relative norm instead, because one bf16 ULP at magnitude 512 is an absolute
+difference of 4, which says nothing about whether either side is right.
+`BF16_DRIFT_LIMIT` is 5% for a full 28-layer pass against HuggingFace: measured on real
+text, a correct model sits at 1.7% and a model given Qwen2's `rope_theta` in place of
+Qwen3's at 14%, so the limit is about 3x above the first and 3x below the second.
+`KERNEL_DRIFT_LIMIT` is 1% for the CUDA path against the PyTorch path — one bf16 ULP
+with headroom rather than an error budget, the kernels being the more accurate of the
+two by about one rounding. Where an exact check is available — greedy token ids, FP8
+bytes — it is used instead.
+
 195 tests. `cuda` tests skip without a GPU, `oracle` tests skip without the
 downloaded checkpoint, so the suite degrades cleanly on any machine.
 
@@ -405,7 +422,13 @@ The pinned `torch` is a CUDA 13 build from `https://download.pytorch.org/whl/cu1
 Its CUDA major version must match the nvcc that compiles `csrc/`; on machines whose
 system nvcc is older, the four `nvidia-cuda-*` wheels in `requirements.txt` supply a
 CUDA 13 toolchain and `kernels.py` assembles them into a usable `CUDA_HOME`.
-`requirements.txt` documents the two failure modes of mixing wheel minors.
+Pin all four `nvidia-cuda-*` wheels to the same CUDA minor and keep them there: they
+are separate wheels but one compiler, and pip will mix minors because the nvcc wheel's
+own bounds are loose. Two failures come from that — an nvvm or crt newer than nvcc makes
+ptxas report `Unsupported .version`, and a cccl that does not match nvcc gives
+`CUDA compiler and CUDA toolkit headers are incompatible`. `nvidia-cuda-cccl` is not
+optional: it provides the `<nv/target>` header that `cuda_fp16.h` includes and the nvcc
+wheel omits.
 
 ```bash
 # tests

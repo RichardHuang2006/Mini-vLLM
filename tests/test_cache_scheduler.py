@@ -1,12 +1,9 @@
 """The paged KV cache and the continuous-batching scheduler.
 
-Four groups, ordered the way cache.py and scheduler.py are: bookkeeping
-(refcounts, slot arithmetic, capacity -- integers, no GPU), copy-on-write and
-radix-tree prefix caching, the scheduler's policy, and identity, where batched,
-chunked, piggybacked and preempted runs are compared token-for-token against
-single-sequence runs. Every test that allocates ends with a leak check, since a
-leaked block is invisible until the pool runs dry thousands of iterations
-later.
+Four groups: bookkeeping (refcounts, slot arithmetic, capacity), copy-on-write and
+radix-tree prefix caching, the scheduler's policy, and identity, where batched, chunked,
+piggybacked and preempted runs are compared token-for-token against single-sequence runs.
+Every test that allocates ends with a leak check.
 """
 
 from __future__ import annotations
@@ -16,9 +13,11 @@ from collections.abc import Iterator
 import pytest
 import torch
 from conftest import (
+    FP8_MAX_ERROR,
     assert_allclose,
     assert_tokens_equal,
     config_from_hf,
+    relative_error,
     tiny_kv_manager,
     weights_from_hf,
 )
@@ -33,7 +32,7 @@ from mini_vllm.cache import (
     PrefixCache,
 )
 from mini_vllm.config import SamplingParams, SchedulerConfig
-from mini_vllm.engine import PagedModelRunner
+from mini_vllm.engine import PagedModelRunner, generate_ids_cached
 from mini_vllm.model import Qwen3Cached, Qwen3Paged
 from mini_vllm.scheduler import (
     PADDING_BLOCK,
@@ -57,8 +56,6 @@ def make(prompt_len: int, max_tokens: int = 4, **kwargs) -> Sequence:
 def tokens(token_ids: list[int], **kwargs) -> Sequence:
     return Sequence(prompt_token_ids=list(token_ids), sampling_params=GREEDY, **kwargs)
 
-
-# --- The block pool ----------------------------------------------------------
 
 def test_refcounts_allow_sharing_without_capacity():
     """Two holders of one block cost one block."""
@@ -106,8 +103,6 @@ def test_allocate_many_is_all_or_nothing():
     assert pool.num_free == 3, "a failed group allocation took blocks"
 
 
-# --- The block table ---------------------------------------------------------
-
 def test_the_slot_arithmetic():
     """position -> (block, offset) -> flat slot, through an out-of-order table."""
     table = BlockTable(block_size=4, block_ids=[7, 2, 9], num_tokens=10)
@@ -146,11 +141,9 @@ def test_copy_shares_blocks_without_touching_refcounts():
     assert forked.block_ids == (3, 5, 9)
 
 
-# --- The manager: lifetime and CoW -------------------------------------------
-
 @pytest.fixture
 def manager() -> Iterator[BlockManager]:
-    """A tiny pool: 8 blocks of 4 tokens. Exhaustion is reachable, which is the point."""
+    """A tiny pool: 8 blocks of 4 tokens, so exhaustion is reachable."""
     manager = BlockManager(num_blocks=8, block_size=4)
     yield manager
     manager.pool.check_consistency()
@@ -221,11 +214,7 @@ def test_forking_allocates_nothing(manager: BlockManager):
 
 
 def test_writing_after_a_fork_copies_exactly_one_page(manager: BlockManager):
-    """The other branch's mapping must not move, and only the partial page is copied.
-
-    Blocks 0 and 1 are full and will never be written to again, so they stay shared
-    for both sequences' lifetimes. Block 2 is the one both would write into.
-    """
+    """Blocks 0 and 1 are full and stay shared; block 2 is the one both would write into."""
     parent = tokens(list(range(10)))
     manager.allocate(parent)
     shared = manager.table(parent).block_ids
@@ -246,8 +235,7 @@ def test_writing_after_a_fork_copies_exactly_one_page(manager: BlockManager):
 
 
 def test_the_copy_carries_the_cached_keys_and_values():
-    """Copy-on-write moves data, not just ids. If it did not, a forked sequence would
-    attend over an uninitialized page and the divergence would look like sampling."""
+    """Copy-on-write moves data, not just ids; otherwise a fork attends over a blank page."""
     manager = BlockManager(num_blocks=4, block_size=4, num_layers=2, num_kv_heads=2, head_dim=8)
     parent = tokens(list(range(6)))
     manager.allocate(parent)
@@ -285,11 +273,7 @@ def test_a_fork_whose_last_block_is_full_needs_no_copy(manager: BlockManager):
 
 
 def test_admission_control_counts_the_copy(manager: BlockManager):
-    """A shared partial page costs a block to write into, and `blocks_needed` says so.
-
-    Leaving it out is how admission succeeds and the write then fails mid-iteration,
-    with half the batch already committed.
-    """
+    """A shared partial page costs a block to write into, and `blocks_needed` says so."""
     parent = tokens(list(range(6)))
     manager.allocate(parent)
     child = tokens(list(range(6)))
@@ -319,8 +303,6 @@ def test_speculative_trim_returns_spilled_pages(manager: BlockManager):
     assert manager.table(request).num_tokens == 3
     manager.free(request)
 
-
-# --- The paged-attention oracle seam -----------------------------------------
 
 def paged_batch(manager: BlockManager, requests, counts) -> ForwardBatch:
     for request, count in zip(requests, counts, strict=True):
@@ -363,12 +345,8 @@ def test_paged_attention_matches_a_dense_cache():
 
 
 def test_a_shuffled_block_table_changes_nothing():
-    """The real test of the block-table indirection.
-
-    The same tokens, written through a table whose physical order is reversed. If the
-    gather arithmetic is wrong this is where it shows: with an unshuffled table,
-    logical order and physical order coincide and almost any indexing bug looks right.
-    """
+    """The real test of the indirection: with an unshuffled table, logical and physical
+    order coincide and almost any indexing bug looks right."""
     heads, kv_heads, dim, length = 4, 2, 8, 12
     q = torch.randn(length, heads, dim)
     k = torch.randn(length, kv_heads, dim)
@@ -395,11 +373,7 @@ def test_a_shuffled_block_table_changes_nothing():
 
 
 def test_a_mixed_batch_matches_each_sequence_alone():
-    """A chunk beside two decodes, in one call, each row unaffected by its neighbours.
-
-    This is the shape the paged attention kernels have to serve in a single launch,
-    so the reference has to serve it too.
-    """
+    """A chunk beside two decodes in one call: the shape the paged kernels must serve."""
     heads, kv_heads, dim = 4, 2, 8
     manager = BlockManager(16, block_size=4, num_layers=1, num_kv_heads=kv_heads, head_dim=dim)
 
@@ -484,8 +458,6 @@ def test_the_slot_mapping_covers_this_iteration_only():
     assert second.block_tables.tolist() == [[0, 1]]
 
 
-# --- The radix tree ----------------------------------------------------------
-
 def test_match_returns_the_longest_cached_prefix():
     cache = PrefixCache(block_size=4)
     prompt = [10, 11, 12, 13, 20, 21, 22, 23]
@@ -561,8 +533,7 @@ def caching_manager() -> Iterator[BlockManager]:
 
 
 def _fill_kv(manager: BlockManager, seq: Sequence) -> None:
-    """A distinct key/value per position, a function of the token id, so a wrong
-    cross-block gather shows as the wrong number rather than passing by luck."""
+    """A distinct key/value per position, so a wrong gather shows the wrong number."""
     table = manager.table(seq)
     for position in range(table.num_tokens):
         slot = table.physical_slot(position)
@@ -665,8 +636,6 @@ def test_no_leaks_across_two_thousand_cached_requests(caching_manager: BlockMana
     manager.check_no_leaks()
 
 
-# --- The FP8 pool ------------------------------------------------------------
-
 def test_an_fp8_pool_stores_e4m3_and_halves_the_bytes():
     fp8 = PagedKvPool(1, 4, 4, 2, 8, dtype=torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
     assert fp8.is_fp8 and fp8.keys.dtype is torch.float8_e4m3fn
@@ -678,8 +647,6 @@ def test_an_fp8_pool_stores_e4m3_and_halves_the_bytes():
 
 def test_fp8_write_and_gather_round_trip_within_tolerance():
     """Quantize on write, dequantize on gather, with explicit scales."""
-    from conftest import FP8_MAX_ERROR, relative_error
-
     pool = PagedKvPool(
         1, 4, 4, 2, 8, dtype=torch.float32, kv_dtype=torch.float8_e4m3fn,
         k_scale=0.5, v_scale=0.25,
@@ -723,8 +690,6 @@ def test_fp8_copy_on_write_copies_raw_bytes():
     manager.check_no_leaks()
 
 
-# --- The scheduler policy ----------------------------------------------------
-
 def test_admission_is_fcfs_and_bounded():
     scheduler = Scheduler(SchedulerConfig(max_sequences=2))
     first, second, third = make(4), make(4), make(4)
@@ -744,8 +709,7 @@ def test_admission_stops_at_the_token_budget():
 
 
 def test_a_prompt_larger_than_the_budget_runs_alone_and_overruns_it():
-    """Refusing it would deadlock the queue. This is the head-of-line stall in its
-    purest form, kept reachable because it is what chunked prefill removes."""
+    """Refusing it would deadlock the queue: the head-of-line stall chunking removes."""
     scheduler = Scheduler(SchedulerConfig(max_batched_tokens=512, **WHOLE))
     huge = make(2000)
     scheduler.add(huge)
@@ -815,8 +779,7 @@ def decoding_scheduler(config: SchedulerConfig, count: int) -> tuple[Scheduler, 
 
 
 def test_decodes_ride_along_with_a_prefill_chunk():
-    """One forward pass carrying a 300-token chunk and three single-token decodes:
-    stall-free piggyback decoding, the shape the ragged ForwardBatch exists for."""
+    """One pass carrying a 300-token chunk and three decodes: piggyback decoding."""
     scheduler, decoders = decoding_scheduler(
         SchedulerConfig(max_batched_tokens=1024, chunk_size=300), count=3
     )
@@ -835,8 +798,7 @@ def test_decodes_ride_along_with_a_prefill_chunk():
 
 
 def test_a_decode_is_never_stalled_by_a_long_prefill():
-    """A sequence in decode advances one token every iteration while a 2000-token
-    prompt chunks beside it — the latency claim behind piggybacking."""
+    """A decode advances one token every iteration while a 2000-token prompt chunks."""
     scheduler, (decoder,) = decoding_scheduler(
         SchedulerConfig(max_batched_tokens=600, chunk_size=512), count=1
     )
@@ -909,8 +871,6 @@ def test_scheduler_output_and_config_contracts():
             SchedulerConfig(**kwargs)
 
 
-# --- Identity on the dense oracle --------------------------------------------
-
 @pytest.fixture
 def tiny_model(tiny_qwen3):
     """The tiny cached model on the CPU: scheduling is arithmetic, no GPU needed."""
@@ -938,8 +898,6 @@ def alone(model, prompt: list[int], max_tokens: int) -> list[int]:
 
 def test_one_sequence_matches_the_generate_loop(tiny_model):
     """Agree with `generate_ids_cached`, so the harness itself is trusted."""
-    from mini_vllm.engine import generate_ids_cached
-
     prompt = [3, 9, 4, 1, 7]
     expected = generate_ids_cached(tiny_model, torch.tensor([prompt]), max_tokens=8)
 
@@ -947,8 +905,7 @@ def test_one_sequence_matches_the_generate_loop(tiny_model):
 
 
 def test_a_batched_run_is_token_identical_to_running_each_alone(tiny_model):
-    """The invariant. Six requests of different lengths, interleaved: none of the
-    batching may reach the tokens."""
+    """The invariant: six requests of different lengths, interleaved, unchanged tokens."""
     prompts = [[1, 2, 3], [5], [7, 7, 7, 7, 7, 7, 7], [2, 4], [9, 8, 7, 6], [1]]
     expected = {index: alone(tiny_model, prompt, 6) for index, prompt in enumerate(prompts)}
 
@@ -983,8 +940,7 @@ def test_a_preempted_sequence_produces_the_same_tokens(tiny_model):
 
 
 def test_a_chunked_and_piggybacked_run_is_token_identical(tiny_model):
-    """Chunked prefills and decodes interleaved under a tight budget: every sequence
-    unaffected, no sequence seeing the same batch composition twice."""
+    """Chunked prefills and decodes interleaved under a tight budget, tokens unchanged."""
     prompts = [torch.randint(0, 512, (n,)).tolist() for n in (33, 5, 17, 1, 40, 2)]
     expected = [alone(tiny_model, prompt, 5) for prompt in prompts]
 
@@ -1019,13 +975,11 @@ def test_chunking_does_not_change_the_number_of_tokens_computed(tiny_model):
         assert computed == len(prompt) + 3, f"chunk size {chunk_size}"
 
 
-# --- Identity through the paged engine ---------------------------------------
-
 class Engine:
     """The engine loop over a tiny model, without a tokenizer or a checkpoint.
 
-    Exactly what `LLM.step` does — schedule, execute, sample, commit, free — spelled
-    out so a change to the engine's loop is reflected in a test that reads like it.
+    Exactly what `LLM.step` does — schedule, execute, sample, commit, free — spelled out
+    so a change to the engine's loop is reflected in a test that reads like it.
     """
 
     def __init__(self, model, manager: BlockManager, **config) -> None:
@@ -1079,7 +1033,6 @@ def test_the_paged_engine_is_token_identical_to_the_dense_one(tiny_qwen3):
 
     Between the two: a ragged batch, a paged cache with sequences interleaved across
     pages, and attention that resolves every key's address through a block table.
-    None of it may reach the tokens.
     """
     expected = dense_reference(tiny_qwen3, PROMPTS, max_tokens=6)
 
@@ -1095,10 +1048,8 @@ def test_the_paged_engine_is_token_identical_to_the_dense_one(tiny_qwen3):
 
 
 def test_a_small_pool_forces_preemption_and_changes_nothing(tiny_qwen3):
-    """Six requests through a pool that cannot hold them all at once: the scheduler
-    evicts the newest to keep the oldest moving, and a preempted sequence re-prefills
-    over its prompt and its own emitted output to exactly the tokens it would have
-    produced alone."""
+    """Six requests through a pool that cannot hold them all: a preempted sequence
+    re-prefills over its prompt and its own output to exactly the same tokens."""
     expected = dense_reference(tiny_qwen3, PROMPTS, max_tokens=12)
 
     engine, manager = paged_engine(tiny_qwen3, num_blocks=5,
@@ -1140,8 +1091,8 @@ def test_a_pool_too_small_for_one_sequence_says_so(tiny_qwen3):
 
 
 def test_admission_waits_rather_than_preempting_for_a_new_request(tiny_qwen3):
-    """Memory pressure preempts *for a sequence already in flight*, and merely
-    postpones one that has not started: a queued request holds nothing."""
+    """Memory pressure preempts for a sequence already in flight, and merely postpones
+    one that has not started: a queued request holds nothing."""
     engine, _manager = paged_engine(tiny_qwen3, num_blocks=4, max_sequences=8)
     running = Sequence(prompt_token_ids=[1] * 24, max_tokens=4, sampling_params=GREEDY)
     queued = Sequence(prompt_token_ids=[9] * 16, max_tokens=4, sampling_params=GREEDY)
@@ -1156,9 +1107,7 @@ def test_admission_waits_rather_than_preempting_for_a_new_request(tiny_qwen3):
 
 @pytest.mark.slow
 def test_a_deterministic_stress_run_completes_and_leaks_nothing(tiny_qwen3):
-    """A reduced soak: 120 requests of mixed sizes through a pool that forces steady
-    preemption, every request finishing with the right token count and the pool ending
-    where it started."""
+    """120 requests of mixed sizes through a pool that forces steady preemption."""
     engine, manager = paged_engine(tiny_qwen3, num_blocks=12,
                                    max_batched_tokens=32, max_sequences=6)
     generator = torch.Generator().manual_seed(0)

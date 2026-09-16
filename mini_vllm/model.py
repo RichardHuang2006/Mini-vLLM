@@ -1,11 +1,4 @@
-"""Qwen3, three ways: the dense oracle, the cached fork, and the paged fork.
-
-The weight loader, then three variants of one model -- Qwen3 recomputes
-everything, Qwen3Cached keeps a dense KV cache, and Qwen3Paged writes into
-cache.py's pool over a ragged token axis. Each is diffed against the last,
-greedy-token-identical, so every fast path is ultimately justified by agreeing
-with HuggingFace.
-"""
+"""Qwen3 three ways: the dense oracle, the dense-cache fork, and the paged fork."""
 
 from __future__ import annotations
 
@@ -15,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import torch
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
 from mini_vllm import kernels
@@ -26,7 +20,6 @@ from mini_vllm.ops import (
     linear,
     rms_norm,
     scaled_dot_product_attention_grouped,
-    silu,
 )
 from mini_vllm.scheduler import ForwardBatch
 
@@ -42,23 +35,7 @@ __all__ = [
     "Qwen3Paged",
 ]
 
-
-# --- 1. The loader -----------------------------------------------------------
-
-#
-# The load-bearing part is `load_weights` asserting the name mapping is total in both
-# directions: every tensor in the checkpoint is consumed, and every tensor the model
-# needs is produced.
-#
-# An unmapped weight does not crash. The model runs and produces fluent, confident,
-# wrong text because one projection is still at its random initialization — no stack
-# trace, no obviously broken output, and it presents as a subtle numerical problem. The
-# mapping is therefore checked rather than trusted, along with every shape against the
-# config.
-
-# Local names on the right, shortened where HF is verbose (`wq` rather than
-# `self_attn.q_proj.weight`) but structurally unchanged, so a checkpoint key and a local
-# key remain recognisably the same weight.
+# Local names on the right, shortened where HF is verbose but structurally unchanged.
 GLOBAL_NAMES: dict[str, str] = {
     "model.embed_tokens.weight": "embedding",
     "model.norm.weight": "final_norm",
@@ -78,10 +55,7 @@ LAYER_NAMES: dict[str, str] = {
     "mlp.down_proj.weight": "mlp.down",
 }
 
-# Qwen3-0.6B ships `lm_head.weight` even though `tie_word_embeddings` is true, and it is
-# bitwise identical to the embedding. Dropped rather than mapped: the model reads logits
-# off the embedding via `Embedding.as_linear`, and a second 155M-parameter copy would
-# cost 300 MB of an 8 GB card for the same numbers.
+# Dropped rather than mapped: it is bitwise identical to the tied embedding.
 TIED_LM_HEAD = "lm_head.weight"
 
 
@@ -110,10 +84,7 @@ def expected_names(config: ModelConfig) -> set[str]:
 
 
 def expected_shape(name: str, config: ModelConfig) -> tuple[int, ...]:
-    """The shape a given weight must have, derived from the config. Checked on load so
-    a config that disagrees with the checkpoint fails here, not as a matmul error
-    deep in the forward pass.
-    """
+    """The shape a given weight must have, derived from the config."""
     leaf = name.split(".")[-1]
     shapes: dict[str, tuple[int, ...]] = {
         "embedding": (config.vocab_size, config.hidden_size),
@@ -138,9 +109,6 @@ def resolve_model_path(model: str | Path = DEFAULT_MODEL_ID) -> Path:
     path = Path(model)
     if path.is_dir():
         return path
-
-    from huggingface_hub import snapshot_download
-
     return Path(snapshot_download(str(model)))
 
 
@@ -159,10 +127,7 @@ def shard_files(model_path: Path) -> list[Path]:
 
 
 def iter_weights(model_path: Path, device: str = "cpu") -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield (checkpoint_name, tensor) pairs, one shard at a time. safetensors
-    memory-maps the file, so tensors page in as they are read rather than
-    materializing the whole 1.2 GB at once.
-    """
+    """Yield (checkpoint_name, tensor) pairs from the memory-mapped shards."""
     for shard in shard_files(model_path):
         with safe_open(shard, framework="pt", device=device) as handle:
             for name in handle.keys():
@@ -174,10 +139,7 @@ def load_weights(
     config: ModelConfig | None = None,
     device: str = "cpu",
 ) -> tuple[dict[str, torch.Tensor], ModelConfig]:
-    """Load a checkpoint into the local naming scheme, verifying the mapping is total.
-    Returns the weights keyed by local names, plus the config they were checked
-    against.
-    """
+    """Load a checkpoint into the local naming scheme, verifying the mapping is total."""
     model_path = resolve_model_path(model)
     if config is None:
         config = ModelConfig.from_pretrained(model_path)
@@ -212,8 +174,6 @@ def load_weights(
     return weights, config
 
 
-# --- 2. Shared pieces --------------------------------------------------------
-
 def _layer_weights(weights: dict[str, torch.Tensor], layer: int) -> dict[str, torch.Tensor]:
     """One layer's weights, with the ``layers.N.`` prefix stripped."""
     prefix = f"layers.{layer}."
@@ -238,10 +198,7 @@ def _model_common(
 
 
 class _AttentionWeights:
-    """The six attention tensors, bound identically by all three variants:
-    wq (H_q*D x E), wk and wv (H_k*D x E), wo (E x H_q*D), and the QK-norm scales
-    q_norm and k_norm (D each, one per head element).
-    """
+    """The six attention tensors, bound identically by all three variants."""
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor], rope: RoPE) -> None:
         self.config = config
@@ -255,10 +212,7 @@ class _AttentionWeights:
 
 
 class Qwen3MLP:
-    """SwiGLU: down(silu(gate(x)) * up(x)), shared by all three variants. The
-    projections are ordinary matmuls cuBLAS handles well; the elementwise product is
-    what the fused kernel replaces, to avoid a second pass over the wide activation.
-    """
+    """SwiGLU: down(silu(gate(x)) * up(x)), shared by all three variants."""
 
     def __init__(self, weights: dict[str, torch.Tensor], use_cuda: bool = False) -> None:
         self.use_cuda = use_cuda
@@ -271,12 +225,8 @@ class Qwen3MLP:
         return linear(gated, self.down)
 
 
-# --- 3. The dense oracle -----------------------------------------------------
-
 class Qwen3Attention(_AttentionWeights):
-    """Grouped-query attention with QK-norm and RoPE, x and out both B x L x E. No
-    cache, pure ops.py.
-    """
+    """Grouped-query attention with QK-norm and RoPE, no cache: x and out are B x L x E."""
 
     def __call__(
         self,
@@ -287,14 +237,12 @@ class Qwen3Attention(_AttentionWeights):
         config = self.config
         batch, length, _ = x.shape
 
-        # B x L x (H·D) -> B x L x H x D. The head count differs between q and k/v:
-        # that asymmetry is GQA.
+        # B x L x (H·D) -> B x L x H x D; q and k/v differ in head count, which is GQA.
         q = linear(x, self.wq).reshape(batch, length, config.num_attention_heads, config.head_dim)
         k = linear(x, self.wk).reshape(batch, length, config.num_key_value_heads, config.head_dim)
         v = linear(x, self.wv).reshape(batch, length, config.num_key_value_heads, config.head_dim)
 
-        # QK-norm: normalize each head vector over D, before the rotation. Normalizing
-        # after RoPE would be a different function.
+        # QK-norm normalizes over D before the rotation; after RoPE it would differ.
         q = rms_norm(q, self.q_norm, config.rms_norm_eps)
         k = rms_norm(k, self.k_norm, config.rms_norm_eps)
 
@@ -311,14 +259,7 @@ class Qwen3Attention(_AttentionWeights):
 
 
 class Qwen3Block:
-    """One pre-norm transformer block of the dense oracle:
-
-        h   = x + attention(rmsnorm(x))
-        out = h + mlp(rmsnorm(h))
-
-    Pre-norm leaves the residual path unnormalized, which keeps activations stable
-    through 28 layers.
-    """
+    """One pre-norm block: h = x + attention(norm(x)); out = h + mlp(norm(h))."""
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor], rope: RoPE) -> None:
         self.config = config
@@ -339,14 +280,7 @@ class Qwen3Block:
 
 
 class Qwen3:
-    """The full dense model: embedding, blocks, final norm, tied LM head.
-    input_ids [B, L] -> logits [B, L, V].
-
-    No cache and no custom kernels -- one pass over a whole sequence, recomputing
-    the entire prefix every step. Qwen3Cached is diffed against this and Qwen3Paged
-    against that, so every fast path is ultimately justified by agreeing with this
-    class, itself diffed against HuggingFace.
-    """
+    """The dense oracle: input_ids [B, L] -> logits [B, L, V], no cache, no kernels."""
 
     def __init__(self, config: ModelConfig, weights: dict[str, torch.Tensor]) -> None:
         self.config = config
@@ -368,10 +302,7 @@ class Qwen3:
         positions: torch.Tensor | None = None,
         mask: torch.Tensor | str | None = "causal",
     ) -> torch.Tensor:
-        """Full forward over the whole sequence. positions defaults to arange(L), correct
-        here because there is no cache, but it stays an argument because that does not
-        hold for the cached and paged models.
-        """
+        """Full forward over the whole sequence; positions defaults to arange(L)."""
         _batch, length = input_ids.shape
         if positions is None:
             positions = torch.arange(length, device=input_ids.device)
@@ -384,13 +315,8 @@ class Qwen3:
         return self.embedding.as_linear(h)
 
 
-# --- 4. The dense-cache fork -------------------------------------------------
-
 class Qwen3CachedAttention(_AttentionWeights):
-    """Grouped-query attention against a growing KV cache. Rotated keys and values go
-    through cache.update_and_fetch and attention runs over everything accumulated,
-    so q has length L while k and v have length S.
-    """
+    """Grouped-query attention against a growing KV cache, so q has length L and k/v S."""
 
     def __init__(
         self,
@@ -419,22 +345,14 @@ class Qwen3CachedAttention(_AttentionWeights):
         q = kernels.rmsnorm(q, self.q_norm, config.rms_norm_eps, use_cuda=use_cuda)
         k = kernels.rmsnorm(k, self.k_norm, config.rms_norm_eps, use_cuda=use_cuda)
 
-        # RoPE is applied before the cache, so cached keys carry their position with
-        # them. Caching unrotated keys would require re-rotating on every read, which
-        # removes the saving.
+        # RoPE comes before the cache, so a cached key carries its position for good.
         q = kernels.rope(q, positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda)
         k = kernels.rope(k, positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda)
 
         # B x L x H x D -> B x H x L x D, which is also the cache's layout.
         keys, values, _offset = cache.update_and_fetch(k.transpose(1, 2), v.transpose(1, 2))
 
-        # A single decode token may attend to everything cached, so its mask is
-        # all-zeros and skipped outright: the common case.
-        #
-        # Prefill passes the shorthand rather than a tensor. The mask is a pure function
-        # of `(L, S)`, both known to the callee, and naming it lets the flash prefill
-        # kernel apply it as an index comparison instead of reading an `L x S` tensor.
-        # The oracle builds the same tensor from the same shorthand.
+        # A decode token attends over everything cached, so it needs no mask at all.
         mask = None if length == 1 else "causal"
 
         attended = kernels.attention(q.transpose(1, 2), keys, values, mask=mask, use_cuda=use_cuda)
@@ -475,15 +393,7 @@ class Qwen3CachedBlock:
 
 
 class Qwen3Cached:
-    """Qwen3 with a per-layer dense KV cache: it stops recomputing the past. input_ids
-    [B, L] is the new tokens only; logits [B, L, V], or [B, 1, V] with last_only.
-
-    A fork of Qwen3 rather than a replacement -- that class stays the oracle. Three
-    changes, all position bookkeeping: only new tokens are fed in, RoPE positions
-    become arange(offset, offset + L), and the mask becomes (L, S) so a decode token
-    may attend to the whole cache. That offset machinery is what chunked prefill
-    needs, which is why chunking is a scheduler change rather than a model rewrite.
-    """
+    """Qwen3 with a per-layer dense KV cache: input_ids [B, L] is the new tokens only."""
 
     def __init__(
         self,
@@ -518,12 +428,7 @@ class Qwen3Cached:
         positions: torch.Tensor | None = None,
         last_only: bool = False,
     ) -> torch.Tensor:
-        """Forward the new tokens, extending caches in place. positions defaults to
-        arange(offset, offset + L) read from the caches, so the caller tracks nothing.
-        last_only skips the LM head on every position but the last, saving about
-        20 GFLOP on a 128-token prefill; it defaults to False so the output stays
-        directly comparable to Qwen3.
-        """
+        """Forward the new tokens, extending caches in place and reading their offset."""
         if len(caches) != len(self.blocks):
             raise ValueError(f"expected {len(self.blocks)} caches, one per layer, got {len(caches)}")
 
@@ -543,13 +448,8 @@ class Qwen3Cached:
         return self.embedding.as_linear(h)
 
 
-# --- 5. The paged-pool fork --------------------------------------------------
-
 class Qwen3PagedAttention(_AttentionWeights):
-    """Grouped-query attention against the paged pool, for one layer. Rotated keys and
-    values are scattered into the pool through the batch's slot mapping, and
-    attention gathers them back through the block table inside the kernel.
-    """
+    """Grouped-query attention against the paged pool, for one layer."""
 
     def __init__(
         self,
@@ -575,9 +475,7 @@ class Qwen3PagedAttention(_AttentionWeights):
         q = kernels.rmsnorm(q, self.q_norm, config.rms_norm_eps, use_cuda=use_cuda)
         k = kernels.rmsnorm(k, self.k_norm, config.rms_norm_eps, use_cuda=use_cuda)
 
-        # RoPE needs a leading axis to broadcast the position across. Positions are per
-        # token and come from the batch, since a chunk's tokens may sit at 512..1023 and
-        # nothing in these shapes records that.
+        # RoPE needs a leading axis, and per-token positions: a chunk may sit at 512..1023.
         q = kernels.rope(
             q.unsqueeze(0), batch.positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda
         ).squeeze(0)
@@ -585,8 +483,6 @@ class Qwen3PagedAttention(_AttentionWeights):
             k.unsqueeze(0), batch.positions, self.rope.cos, self.rope.sin, use_cuda=use_cuda
         ).squeeze(0)
 
-        # Rotated keys go into the pool, so a cached key carries its position and is
-        # never re-rotated on a later read.
         manager.kv.write(self.layer, batch.slot_mapping, k, v)
 
         attended = kernels.paged_attention(
@@ -635,18 +531,7 @@ class Qwen3PagedBlock:
 
 
 class Qwen3Paged:
-    """Qwen3 over a ragged batch and a paged cache: the model the engine runs. Takes a
-    ForwardBatch of T tokens across N sequences, returns logits [N, V].
-
-    The third fork keeps no cache of its own, writing keys and values straight into
-    the pool. Two changes from Qwen3Cached, both shape rather than mathematics.
-    There is no batch axis -- activations are T x ... over every scheduled token,
-    since a padded rectangle would give back the memory paging buys. And attention
-    takes metadata instead of tensors: cu_seqlens_q, context_lens, and the block
-    tables, so one call covers a 512-token prefill chunk and eleven decode steps.
-    Only N rows come back because generation samples from a sequence's last position
-    and the head is a V-wide matmul; speculative verification asks for all T.
-    """
+    """Qwen3 over a ragged batch and the paged pool: T tokens in, logits [N, V] out."""
 
     def __init__(
         self,
@@ -688,15 +573,7 @@ class Qwen3Paged:
         return cls(config, weights, manager, use_cuda=use_cuda)
 
     def self_draft(self, num_layers: int, manager: BlockManager) -> Qwen3Paged:
-        """This model truncated to its first num_layers, over a separate KV pool.
-
-        The draft for speculative decoding on a machine that cannot afford a second
-        checkpoint. Running the target's early layers costs no additional memory -- the
-        blocks, embedding and head are the same tensors -- and a prefix of a transformer
-        is both cheaper and weaker, which is what a draft needs to be. It needs its own
-        manager because a draft keeps its own KV. Weakness is acceptable where wrongness
-        is not: rejection sampling is indifferent to draft quality.
-        """
+        """This model truncated to its first num_layers, over a separate KV pool."""
         if not 1 <= num_layers <= len(self.blocks):
             raise ValueError(
                 f"a self-draft needs between 1 and {len(self.blocks)} layers, got {num_layers}"
@@ -714,10 +591,7 @@ class Qwen3Paged:
 
     @torch.no_grad()
     def __call__(self, batch: ForwardBatch, all_rows: bool = False) -> torch.Tensor:
-        """One forward pass, returning [N, V] normally and [T, V] when all_rows. all_rows
-        exists for speculative verification, which forwards a pending token plus k
-        proposals and needs the target's distribution at all k + 1 positions in one pass.
-        """
+        """One forward pass, returning [N, V], or [T, V] for speculative verification."""
         if batch.slot_mapping is None or batch.block_tables is None:
             raise ValueError(
                 "this model writes into a paged pool, so it needs a batch built with a "
@@ -729,8 +603,7 @@ class Qwen3Paged:
             h = block(h, batch, self.manager)
 
         if not all_rows:
-            # One row per sequence: the last position it computed. Its only row for a
-            # decode step, the end of the chunk for a prefill.
+            # One row per sequence: the last position it computed.
             h = h.index_select(0, batch.last_row_indices)
 
         h = kernels.rmsnorm(h, self.final_norm, self.config.rms_norm_eps, use_cuda=self.use_cuda)

@@ -1,12 +1,9 @@
 """Every CUDA kernel against the PyTorch reference it replaces.
 
-The comparisons are differential: each kernel is pinned to the exact ops.py
-expression it replaces, on the boundary shapes where kernels break -- tile
-boundaries and late maxima for the online softmax, shuffled block tables for
-the paged gather, proof the flash prefill cannot see the future, and
-bit-identity for FP8 quantize-scatter. The whole file carries the cuda marker
-and skips cleanly without a GPU; oracle tests additionally need the real
-weights.
+The comparisons are differential and land on the boundary shapes where kernels break:
+tile boundaries and late maxima for the online softmax, shuffled block tables for the
+paged gather, proof the flash prefill cannot see the future, and bit-identity for FP8
+quantize-scatter. The whole file carries the cuda marker.
 """
 
 from __future__ import annotations
@@ -16,18 +13,21 @@ import math
 import pytest
 import torch
 from conftest import (
+    FP8_MAX_ERROR,
     KERNEL_DRIFT_LIMIT,
     TINY_QWEN3_DIMS,
     assert_allclose,
     assert_relative_error_below,
     assert_tokens_equal,
     config_from_hf,
+    relative_error,
     weights_from_hf,
 )
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from mini_vllm import kernels, ops
 from mini_vllm.engine import generate_ids_cached
-from mini_vllm.model import Qwen3Cached
+from mini_vllm.model import Qwen3Cached, resolve_model_path
 
 pytestmark = pytest.mark.cuda
 
@@ -38,8 +38,6 @@ QWEN3_HEADS = (16, 8, 128)  # H_q, H_k, D for Qwen3-0.6B
 def kernel(device):
     return kernels.load_extension()
 
-
-# --- The extension -----------------------------------------------------------
 
 def test_every_claimed_kernel_is_callable(kernel):
     """The dispatch table cannot claim a kernel that is missing or misspelled."""
@@ -55,8 +53,6 @@ def test_the_dispatch_report_names_every_op(kernel):
     line = next(row for row in report.splitlines() if "flash_prefill" in row)
     assert "torch" in line, "a kernel measured slower must not be the default"
 
-
-# --- RMSNorm -----------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_rmsnorm_matches_the_oracle(kernel, dtype):
@@ -74,16 +70,13 @@ def test_rmsnorm_over_the_head_dimension(kernel):
 
 
 def test_rmsnorm_dispatch_declines_mixed_dtypes(kernel):
-    """PyTorch would promote; returning a different dtype than the oracle is worse
-    than declining the kernel, so the wrapper falls back."""
+    """PyTorch would promote, so the wrapper falls back rather than return another dtype."""
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(64, device="cuda", dtype=torch.float32)
 
     got = kernels.rmsnorm(x, weight, use_cuda=True)
     assert_allclose(got, ops.rms_norm(x, weight))
 
-
-# --- RoPE --------------------------------------------------------------------
 
 def test_rope_matches_the_oracle_at_explicit_positions(kernel):
     """Positions are per token and non-contiguous: the ragged-batch case."""
@@ -106,8 +99,6 @@ def test_rope_keeps_low_precision_activations(kernel, dtype):
     assert_allclose(got, ops.apply_rope(x, positions, tables.cos, tables.sin))
 
 
-# --- SwiGLU ------------------------------------------------------------------
-
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_swiglu_matches_the_oracle(kernel, dtype):
     gate = torch.randn(65, 3072, device="cuda", dtype=dtype)
@@ -122,8 +113,6 @@ def test_swiglu_fp32_is_bitwise(kernel):
     up = torch.randn_like(gate)
     assert torch.equal(kernel.swiglu(gate, up), ops.silu(gate) * up)
 
-
-# --- Decode attention --------------------------------------------------------
 
 def attend(kernel, q, k, v):
     return kernel.decode_attention(q, k, v, 1.0 / math.sqrt(q.shape[-1]))
@@ -144,8 +133,7 @@ def test_decode_matches_the_oracle_at_qwen3_shapes(kernel, dtype):
 
 @pytest.mark.parametrize("source_len", [1, 63, 64, 65, 127, 129, 513, 1000])
 def test_decode_at_every_tile_boundary(kernel, source_len):
-    """The tile is 64 keys wide, so these are the lengths that break kernels: a partial
-    final tile is where a loop bound reads one key too many or one too few."""
+    """The tile is 64 keys wide, so a partial final tile is where a loop bound is wrong."""
     q, k, v = triple(1, *QWEN3_HEADS[:2], source_len, QWEN3_HEADS[2], torch.float32)
     assert_allclose(attend(kernel, q, k, v), ops.scaled_dot_product_attention_grouped(q, k, v))
 
@@ -153,10 +141,8 @@ def test_decode_at_every_tile_boundary(kernel, source_len):
 def test_decode_survives_a_late_spike(kernel):
     """The maximum arrives in the last tile, so every accumulator must be rescaled.
 
-    The recurrence's classic failure: a kernel that rescales the running sum `l` but
-    not the running output `O` still produces weights that sum to one — a plausible
-    convex combination, just the wrong one. Putting the spike last maximizes the
-    already-accumulated `O` a missing correction would leave un-rescaled.
+    A kernel that rescales the running sum but not the running output still produces
+    weights that sum to one — a plausible convex combination, just the wrong one.
     """
     head_dim = 64
     q = torch.ones(1, 1, 1, head_dim, device="cuda")
@@ -171,8 +157,7 @@ def test_decode_survives_a_late_spike(kernel):
 
 
 def test_decode_survives_an_early_spike(kernel):
-    """The mirror image: a kernel applying the correction with the wrong sign is
-    correct on this input and wrong on the one above, so both are needed."""
+    """The mirror image: a correction with the wrong sign passes one of these and not both."""
     head_dim = 64
     q = torch.ones(1, 1, 1, head_dim, device="cuda")
     k = torch.full((1, 1, 200, head_dim), 0.01, device="cuda")
@@ -184,15 +169,13 @@ def test_decode_survives_an_early_spike(kernel):
 
 @pytest.mark.parametrize("source_len", [2049, 4096, 8192])
 def test_decode_splits_long_contexts_across_blocks(kernel, source_len):
-    """Past ~512 keys the cache is cut into pieces with their own (m, l, O) and merged:
-    new code that short contexts never touch."""
+    """Past ~512 keys the cache is cut into pieces with their own (m, l, O) and merged."""
     q, k, v = triple(1, *QWEN3_HEADS[:2], source_len, QWEN3_HEADS[2], torch.float32)
     assert_allclose(attend(kernel, q, k, v), ops.scaled_dot_product_attention_grouped(q, k, v))
 
 
 def test_the_split_merge_rescales_across_splits(kernel):
-    """A spike in the last split, which every earlier split must be rescaled by — the
-    late-spike test one level up, at the merge."""
+    """A spike in the last split: the late-spike test one level up, at the merge."""
     head_dim = 64
     q = torch.ones(1, 16, 1, head_dim, device="cuda")
     k = torch.full((1, 8, 4096, head_dim), 0.01, device="cuda")
@@ -219,9 +202,8 @@ def test_decode_handles_logits_that_would_overflow(kernel):
 
 
 def test_decode_output_is_a_convex_combination_of_values(kernel):
-    """Softmax weights are non-negative and sum to one, so every output element lies
-    between the smallest and largest value — a property no shared-wrong-reference
-    comparison can fake."""
+    """Every output element lies between the smallest and largest value: a property no
+    shared-wrong-reference comparison can fake."""
     q, k, v = triple(1, 4, 2, 300, 64, torch.float32)
 
     got = attend(kernel, q, k, v)
@@ -232,8 +214,7 @@ def test_decode_output_is_a_convex_combination_of_values(kernel):
 
 
 def test_decode_reads_strided_views_without_copying(kernel):
-    """A query sliced from a prefill tensor and a cache narrowed from a bigger buffer:
-    making them contiguous would copy the whole cache every step."""
+    """Making a narrowed cache contiguous would copy the whole thing every step."""
     num_query_heads, num_kv_heads, head_dim = QWEN3_HEADS
     prefill = torch.randn(2, num_query_heads, 8, head_dim, device="cuda")
     q = prefill[:, :, -1:, :]
@@ -253,16 +234,13 @@ def test_decode_refuses_shapes_it_cannot_serve(kernel):
         attend(kernel, q, empty, empty)
 
 
-# --- Flash prefill -----------------------------------------------------------
-
 def prefill(kernel, q, k, v):
     return kernel.flash_prefill(q, k, v, 1.0 / math.sqrt(q.shape[-1]))
 
 
 @pytest.mark.parametrize("length", [1, 16, 17, 63, 64, 65, 128, 200])
 def test_flash_prefill_matches_the_causal_oracle(kernel, length):
-    """Tiled causal attention at every tile-boundary size, including lengths that are
-    not multiples of the tile."""
+    """Tiled causal attention at every tile-boundary size, multiples of the tile or not."""
     num_query_heads, num_kv_heads, head_dim = 8, 4, 64
     q = torch.randn(1, num_query_heads, length, head_dim, device="cuda")
     k = torch.randn(1, num_kv_heads, length, head_dim, device="cuda")
@@ -276,9 +254,8 @@ def test_flash_prefill_matches_the_causal_oracle(kernel, length):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_flash_prefill_in_low_precision(kernel, dtype):
-    """Aggregate relative error rather than elementwise: the kernel keeps fp32 to the
-    store while the oracle rounds intermediates to the storage dtype, so a handful of
-    near-zero elements land one rounding apart without either being wrong."""
+    """Aggregate relative error, since the kernel keeps fp32 to the store while the
+    oracle rounds intermediates to the storage dtype."""
     q = torch.randn(1, 16, 128, 128, device="cuda", dtype=dtype)
     k = torch.randn(1, 8, 128, 128, device="cuda", dtype=dtype)
     v = torch.randn_like(k)
@@ -291,11 +268,7 @@ def test_flash_prefill_in_low_precision(kernel, dtype):
 
 
 def test_flash_prefill_cannot_see_the_future(kernel):
-    """Change a key and value the causal mask forbids, and nothing may move.
-
-    The kernel skips tiles above the diagonal rather than masking them, so this is the
-    test that the skip is exactly the mask.
-    """
+    """The kernel skips tiles above the diagonal, so this tests the skip is the mask."""
     q = torch.randn(1, 4, 65, 64, device="cuda")
     k = torch.randn(1, 2, 65, 64, device="cuda")
     v = torch.randn_like(k)
@@ -310,7 +283,7 @@ def test_flash_prefill_cannot_see_the_future(kernel):
 
 
 def test_flash_prefill_serves_a_decode_shaped_chunk_tail(kernel):
-    """L < S: the queries are the *last* L positions, so the diagonal is shifted."""
+    """L < S: the queries are the last L positions, so the diagonal is shifted."""
     q = torch.randn(1, 4, 5, 64, device="cuda")
     k = torch.randn(1, 2, 37, 64, device="cuda")
     v = torch.randn_like(k)
@@ -322,8 +295,7 @@ def test_flash_prefill_serves_a_decode_shaped_chunk_tail(kernel):
 
 
 def test_flash_prefill_stays_off_the_dispatch_path(kernel):
-    """Correct but measured slower than cuBLAS, so `use_cuda=True` still routes prefill
-    to the reference — the kernel earns the dispatch by being faster, not by existing."""
+    """Correct but measured slower than cuBLAS, so `use_cuda=True` still uses the oracle."""
     q = torch.randn(1, 16, 32, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 8, 32, 128, device="cuda", dtype=torch.bfloat16)
 
@@ -332,14 +304,12 @@ def test_flash_prefill_stays_off_the_dispatch_path(kernel):
     assert torch.equal(got, want), "prefill dispatch left the reference path"
 
 
-# --- Paged attention ---------------------------------------------------------
-
 def paged_setup(batch, context_len, block_size=16, dtype=torch.bfloat16,
                 kv_dtype=None, query_len=1):
     """A shuffled paged pool with `batch` sequences of `context_len` tokens each.
 
-    Shuffled deliberately: a pool in logical order gives the kernel sequential reads
-    an aged allocator never would, and hides gather bugs besides.
+    Shuffled deliberately: a pool in logical order gives the kernel sequential reads an
+    aged allocator never would, and hides gather bugs besides.
     """
     num_query_heads, num_kv_heads, head_dim = QWEN3_HEADS
     blocks_each = -(-context_len // block_size)
@@ -380,8 +350,7 @@ def test_paged_decode_matches_the_gather_oracle(kernel, batch, context_len):
 
 
 def test_paged_decode_on_partial_final_blocks(kernel):
-    """A context that is not a multiple of the block size: the last page is partial and
-    the walk must stop inside it."""
+    """A context that is not a multiple of the block size: the walk stops inside a page."""
     got, want = run_both(kernel, paged_setup(3, 37), 1, 37)
     assert_relative_error_below(got, want, KERNEL_DRIFT_LIMIT)
 
@@ -443,10 +412,7 @@ def test_a_ragged_paged_batch_matches_each_sequence_alone(kernel):
 
 
 def test_paged_attention_reads_an_fp8_pool(kernel):
-    """e4m3 storage with explicit scales: the key scale folds into the softmax scale
-    and the value scale rides on the output, dequantized in registers."""
-    from conftest import FP8_MAX_ERROR
-
+    """e4m3 storage with explicit scales, dequantized in registers."""
     setup = paged_setup(4, 64, dtype=torch.bfloat16, kv_dtype=torch.float8_e4m3fn)
     got, want = run_both(kernel, setup, 1, 64, k_scale=0.5, v_scale=0.25)
     assert_relative_error_below(got, want, FP8_MAX_ERROR)
@@ -466,18 +432,14 @@ def test_paged_dispatch_reaches_the_kernel(kernel):
     assert torch.equal(via_dispatch, direct)
 
 
-# --- FP8 quantize-scatter ----------------------------------------------------
-
 def test_quantize_scatter_is_bitwise_identical_to_the_two_pass_reference(kernel):
-    """Both divide by the scale in fp32 and round to nearest even, so the stored FP8
-    bytes must be identical rather than merely close — compared as uint8 so no
-    tolerance can hide a rounding disagreement."""
+    """Both round to nearest even, so the stored FP8 bytes must be identical rather than
+    merely close — compared as uint8 so no tolerance can hide a disagreement."""
     num_slots, num_kv_heads, head_dim, count = 64, 2, 64, 20
     k_scale, v_scale = 0.5, 0.25
     key = torch.randn(count, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
-    # Scattered, non-monotonic slots: the paged case. A kernel assuming contiguity
-    # would pass on arange.
+    # Scattered, non-monotonic slots: a kernel assuming contiguity would pass on arange.
     slots = torch.randperm(num_slots, device="cuda")[:count].to(torch.int32)
 
     def pools():
@@ -497,8 +459,6 @@ def test_quantize_scatter_is_bitwise_identical_to_the_two_pass_reference(kernel)
 
 
 def test_quantize_scatter_round_trips_within_fp8_tolerance(kernel):
-    from conftest import FP8_MAX_ERROR, relative_error
-
     count = 16
     key = torch.randn(count, 2, 64, device="cuda", dtype=torch.bfloat16)
     pool = torch.zeros(count, 2, 64, device="cuda", dtype=torch.float8_e4m3fn)
@@ -509,8 +469,6 @@ def test_quantize_scatter_round_trips_within_fp8_tolerance(kernel):
     assert relative_error(pool.float(), key.float()) < FP8_MAX_ERROR
 
 
-# --- The model, kernels on/off -----------------------------------------------
-
 def tiny_pair(tiny_qwen3, device, dtype):
     theirs = tiny_qwen3.to(device=device, dtype=dtype)
     config, weights = config_from_hf(theirs), weights_from_hf(theirs)
@@ -518,8 +476,8 @@ def tiny_pair(tiny_qwen3, device, dtype):
 
 
 def test_model_greedy_output_is_token_identical_with_kernels_on(tiny_qwen3, device):
-    """The property that matters more than the value: the kernels changed the speed,
-    not the text. Prefill and 24 decode steps, fp32, exact."""
+    """The property that matters more than the value: the kernels changed the speed, not
+    the text. Prefill and 24 decode steps, fp32, exact."""
     torch_path, cuda_path = tiny_pair(tiny_qwen3, device, torch.float32)
     ids = torch.randint(0, TINY_QWEN3_DIMS["vocab_size"], (1, 5), device=device)
 
@@ -545,13 +503,8 @@ def test_model_bf16_drift_stays_under_one_ulp(tiny_qwen3, device):
 
 @pytest.mark.oracle
 def test_real_model_is_token_identical_with_kernels_on():
-    """The real 0.6B checkpoint, 48 greedy tokens, kernels on vs off. Longer than the
-    tiny-model runs on purpose: decode attention's work grows with the context, so a
-    rescaling bug invisible in one tile appears once decode walks past 64 cached keys."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    from mini_vllm.model import resolve_model_path
-
+    """The real checkpoint, 48 greedy tokens, kernels on vs off. Longer than the tiny-model
+    runs on purpose: a rescaling bug invisible in one tile appears past 64 cached keys."""
     path = resolve_model_path()
     if not (path / "model.safetensors").is_file():
         pytest.skip("Qwen3-0.6B weights are not downloaded")

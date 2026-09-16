@@ -1,16 +1,4 @@
-// RMSNorm: out = x * rsqrt(mean(x^2) + eps) * weight, over the last dim.
-//
-// The oracle is `rms_norm` in mini_vllm/layer_norm.py; correctness here means agreeing
-// with it bit for bit. Two of its details are load bearing:
-//
-//   * the mean of squares accumulates in fp32 even when the tensor is bf16, and
-//   * the normalized value is rounded back to the input dtype before the weight
-//     multiply, matching HuggingFace.
-//
-// The structure — one block per row, a warp-shuffle reduction for the statistic, 16-byte
-// vectorized loads — is the pattern the other elementwise kernels in csrc/ reuse. The op
-// is memory-bound, so the figure of merit is achieved bandwidth against the card's peak
-// rather than wall-clock; `python -m mini_vllm.bench --mode kernels` prints it.
+// RMSNorm over the last dim; the oracle is `mini_vllm.ops.rms_norm`, bit for bit.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -22,8 +10,7 @@ namespace {
 
 using namespace mini_vllm;
 
-// One block per row. `chunk_t` is either Vector<scalar_t> or Scalar<scalar_t>,
-// which is the only difference between the fast and the fallback launch.
+// One block per row; `chunk_t` is Vector<scalar_t> or, unaligned, Scalar<scalar_t>.
 template <typename scalar_t, typename chunk_t>
 __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
                                const scalar_t* __restrict__ weight,
@@ -38,10 +25,7 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
   chunk_t* row_out = reinterpret_cast<chunk_t*>(out + row * dim);
   const chunk_t* row_weight = reinterpret_cast<const chunk_t*>(weight);
 
-  // Normalizing reads every element twice, once for the statistic and once to scale. When
-  // the row fits in one chunk per thread — true for every width Qwen3 uses, `E` = 1024 and
-  // `D` = 128 — the first read is held in registers and the second pass costs no memory
-  // traffic. Wider rows re-read, which is an L1 hit rather than a trip to DRAM.
+  // Each element is read twice, so hold the first read when the row fits one chunk.
   const bool resident = chunks <= static_cast<int64_t>(blockDim.x);
   chunk_t held;
 
@@ -74,9 +58,7 @@ __global__ void rmsnorm_kernel(const scalar_t* __restrict__ input,
     chunk_t result;
 #pragma unroll
     for (int j = 0; j < kLanes; ++j) {
-      // The round to scalar_t before the weight multiply is where the oracle's
-      // `weight * normalized.to(dtype)` loses its low bits. Skipping it would leave this
-      // kernel slightly more accurate than the reference it must match.
+      // Rounding to scalar_t here is where the oracle loses its low bits.
       const float scaled = static_cast<float>(chunk.lane[j]) * scale;
       const scalar_t normalized = static_cast<scalar_t>(scaled);
       const float weighted = static_cast<float>(normalized) * static_cast<float>(weights.lane[j]);
@@ -125,9 +107,7 @@ torch::Tensor rmsnorm(const torch::Tensor& x, const torch::Tensor& weight, doubl
               " but weight has ",
               weight.size(0),
               " elements");
-  // fp64 is refused rather than accumulated in fp32 like the rest: silently halving the
-  // precision of a double tensor is worse than declining, the PyTorch oracle handles it
-  // exactly, and the model never uses it.
+  // fp64 is declined rather than silently accumulated in fp32; the oracle handles it.
   TORCH_CHECK(x.scalar_type() != at::kDouble,
               "rmsnorm: float64 is not supported; this kernel accumulates in fp32, "
               "which would silently lose precision. Use the PyTorch path.");

@@ -1,37 +1,4 @@
-// Attention over a paged KV cache: the dense-cache attention kernels with the gather
-// moved inside.
-//
-// The mathematics is unchanged — the same online softmax recurrence as the dense-cache
-// decode kernel, the same causal offset as the PyTorch reference's mask. Only key
-// addressing differs: instead of `k[b][h][j][d]` in a contiguous per-sequence tensor,
-//
-//   slot = block_tables[seq][j / P] * P + (j % P)
-//   key  = key_pool[slot][h][d]
-//
-// one integer division and one modulo per key, both reducing to a shift and a mask
-// because `P` is a power of two. That is the entire cost of non-contiguous storage.
-// Doing it here rather than on the host avoids copying every sequence's whole cache
-// into a contiguous temporary every iteration, which is more traffic than the attention
-// itself and is what `mini_vllm/paged_attention.py` does as the oracle.
-//
-// Two kernels, since decode and prefill remain different problems:
-//
-//   decode   L == 1. One block per (sequence, query head), walking the whole context
-//            in tiles with the online softmax recurrence. Memory-bound; parallelism
-//            comes from the sequence axis, which a served batch supplies.
-//   prefill  L > 1. One warp per query row, with K and V tiles staged in shared
-//            memory so the warps in a block share each gather, and causal masking
-//            applied as an index comparison against the diagonal shifted by S - L.
-//
-// Both consume the ragged batch directly: `cu_seqlens_q` gives a sequence's first query
-// row, `seq_lens` its query count, `context_lens` how far back it may look. A block for
-// a sequence in the wrong phase returns immediately, so one launch of each covers a
-// mixed batch with no host-side branching and no synchronization to determine phases.
-// No-op blocks are bounded by the batch size, at most a few dozen.
-//
-// Query layout is `T x H_q x D`, the flattened token axis of `ForwardBatch`, rather than
-// `B x H x L x D`: demanding a rectangle here would reintroduce the padding paging
-// exists to avoid.
+// Attention over a paged KV cache: the dense kernels with the block-table walk inside.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
@@ -50,30 +17,14 @@ constexpr int kPrefillWarps = 8;
 constexpr int kPrefillThreads = kPrefillWarps * kWarpSize;  // one warp per query row
 constexpr int kPrefillTileKeys = 16;                        // K and V tiles in shared memory
 
-// How many keys a warp scores before touching the running softmax. Scoring one at a time
-// stalls: each key costs a cross-lane reduction of the dot product (five dependent
-// shuffles, blocking the warp until the last lands) plus a rescale of the whole
-// accumulator and two exponentials. Scoring a group first gives the scheduler that many
-// independent reduction chains to interleave, and lets one rescale and one
-// `expf(running_max - new_max)` cover the group.
-//
-// Eight measured fastest of 1, 4, 8 and 16 (13.3, 8.4, 7.5 and 11.7 ms for a 512-query
-// chunk over a 2048-token context, one layer, bf16). The curve has an interior optimum
-// because the scores and their weights are registers on top of the query and the
-// accumulator: too few and the reductions serialize, too many and occupancy falls.
+// Keys a warp scores per softmax update; 8 measured fastest of 1, 4, 8 and 16.
 constexpr int kPrefillKeysPerStep = 8;
 
-// The head dimension is held in registers, `head_dim / 32` floats per lane, twice
-// over (the query and the accumulator). 256 keeps that at 8 + 8 registers; Qwen3-0.6B
-// uses 128.
+// The query and the accumulator live in registers, `head_dim / 32` floats per lane each.
 constexpr int kMaxLanesPerThread = 8;
 constexpr int kMaxHeadDim = kMaxLanesPerThread * kWarpSize;
 
-// Splitting the key axis, as the dense-cache decode kernel does. A served batch usually
-// supplies enough parallelism on the sequence axis to make this unnecessary; the case it
-// misses is a single conversation with a long history. One sequence at S = 8192 is 16
-// blocks of work for 36 SMs, which measured 16 GB/s of a 384 GB/s card and lost to the
-// dense-gather oracle it replaces.
+// Splitting the key axis, for the one case a served batch misses: a long conversation.
 constexpr int kMaxSplits = 32;
 constexpr int kMinKeysPerSplit = 512;
 constexpr int kBlocksPerSm = 4;
@@ -87,17 +38,7 @@ __device__ __forceinline__ int64_t slot_of(const int32_t* __restrict__ table,
   return (block << block_shift) | (position & block_mask);
 }
 
-// FP8 requires no change to the inner loops. The scales are per-tensor scalars and
-// attention is linear in the keys (through the score) and in the values (through the
-// weighted sum), so a scalar factor on either can be hoisted. The key scale folds into
-// the softmax `scale` at the launch site: a stored key is `raw / k_scale`, so
-// `(q · stored) * (scale * k_scale)` is the logit the raw key would give. The value scale
-// rides on the output: a stored value is `raw / v_scale`, so the normalized accumulator
-// comes out `1 / v_scale` too small and one multiply at the end restores it. A `cache_t`
-// of `Float8_e4m3fn` then costs only its `operator float()` on load; for a bf16 pool
-// `cache_t == scalar_t` and both scales are 1.0.
-
-// ---------------------------------------------------------------------- decode
+// FP8 needs no change to the inner loops; the scales are hoisted, see README §15.
 
 template <typename scalar_t, typename cache_t>
 __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
@@ -132,9 +73,7 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   const int64_t row = cu_seqlens_q[sequence];
   const int32_t* table = block_tables + sequence * max_blocks;
 
-  // Cut on a tile boundary, and per sequence rather than per batch, so a short
-  // sequence beside a long one is divided by its own length instead of being handed
-  // splits that are all empty but one.
+  // Cut on a tile boundary and per sequence, so a short one is divided by its own length.
   const int64_t tiles = (context + kDecodeTileKeys - 1) / kDecodeTileKeys;
   const int64_t tiles_per_split = (tiles + splits - 1) / splits;
   const int64_t begin = split * tiles_per_split * kDecodeTileKeys;
@@ -149,8 +88,7 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   float* scratch = scores + kDecodeTileKeys;
   float* reduced = scratch + kDecodeThreads / kWarpSize;
 
-  // The tile's physical slots, resolved once per key rather than once per key and
-  // dimension: the score loop and the P·V loop both need them.
+  // The tile's physical slots, resolved once per key for both loops below.
   __shared__ int64_t slots[kDecodeTileKeys];
 
   const int thread = threadIdx.x;
@@ -176,7 +114,7 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
     }
     __syncthreads();
 
-    // --- QKᵀ: one warp per key, lanes striding over the head dimension.
+    // QKᵀ: one warp per key, lanes striding over the head dimension.
     for (int j = warp; j < tile; j += kWarps) {
       const cache_t* key = key_pool + (slots[j] * num_kv_heads + kv_head) * head_dim;
       float dot = 0.0f;
@@ -213,12 +151,11 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
     }
     __syncthreads();
 
-    // On the first tile the correction is exp(-inf) == 0, zeroing an accumulator
-    // that is already zero, so the first iteration needs no special case.
+    // On the first tile the correction is exp(-inf) == 0, zeroing an already-zero sum.
     const float correction = __expf(running_max - new_max);
     running_sum = running_sum * correction + reduced[1];
 
-    // --- P·V: one thread per dimension, walking the tile's keys.
+    // P·V: one thread per dimension, walking the tile's keys.
     for (int64_t d = thread; d < head_dim; d += kDecodeThreads) {
       float total = accumulator[d] * correction;
       for (int j = 0; j < tile; ++j) {
@@ -234,17 +171,13 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   if (partial_out == nullptr) {
     scalar_t* destination = out + (row * num_query_heads + query_head) * head_dim;
     for (int64_t d = thread; d < head_dim; d += kDecodeThreads) {
-      // v_scale undoes the value quantization: the accumulator summed stored values,
-      // each 1/v_scale of the real one. It is 1.0 for a bf16 pool.
+      // v_scale undoes the value quantization, and is 1.0 for a bf16 pool.
       destination[d] = static_cast<scalar_t>(accumulator[d] * v_scale / running_sum);
     }
     return;
   }
 
-  // Split path: hand the un-normalized state to the merge, which needs every split's
-  // `l` before it can divide. A split that got no keys (a short sequence in a batch
-  // sized by a long one) reports -inf and 0, which the merge's `exp(m - m_global) * l`
-  // contributes nothing.
+  // Split path: the merge needs every split's `l`, and an empty split reports -inf and 0.
   const int64_t slot = (sequence * num_query_heads + query_head) * splits + split;
   if (thread == 0) {
     partial_max[slot] = running_max;
@@ -255,8 +188,7 @@ __global__ void paged_decode_kernel(const scalar_t* __restrict__ q,
   }
 }
 
-// One block per (sequence, query head), combining that row's splits by applying the
-// same rescaling the tile loop uses, one level up.
+// One block per (sequence, query head), applying the tile loop's rescaling one level up.
 template <typename scalar_t>
 __global__ void paged_decode_merge_kernel(const float* __restrict__ partial_out,
                                           const float* __restrict__ partial_max,
@@ -270,9 +202,7 @@ __global__ void paged_decode_merge_kernel(const float* __restrict__ partial_out,
                                           const float v_scale) {
   const int64_t sequence = blockIdx.y;
   if (seq_lens[sequence] != 1) {
-    // Its partials were never written and its output row belongs to the prefill kernel.
-    // Writing here would overwrite a correct result with uninitialized memory, the one
-    // way these two kernels could interfere.
+    // Its partials were never written; writing here would clobber the prefill's row.
     return;
   }
 
@@ -309,8 +239,6 @@ __global__ void paged_decode_merge_kernel(const float* __restrict__ partial_out,
     destination[d] = static_cast<scalar_t>(total * v_scale / total_sum);
   }
 }
-
-// --------------------------------------------------------------------- prefill
 
 template <typename scalar_t, typename cache_t>
 __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
@@ -351,17 +279,14 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
   const int local_row = rows_before + warp;
   const bool active = local_row < query_len;
 
-  // The causal offset. These `L` queries are the last `L` positions of `S`, so query `i`
-  // may see keys up to `S - L + i`: the PyTorch reference's causal mask expressed as a
-  // comparison rather than a tensor. An incorrect offset lets a chunk attend to its own
-  // future, which prefills plausibly and then decodes nonsense.
+  // The reference's causal mask as a comparison: query i may see keys up to S - L + i.
   const int64_t offset = context - query_len;
   const int64_t visible = active ? offset + local_row + 1 : 0;
 
-  // Every warp in the block walks the same key tiles because they share the staged
-  // gather. The bound is the furthest any row in this tile may look, which must be
-  // block-uniform since the staging loop contains barriers.
-  const int64_t last_row = min(static_cast<int64_t>(rows_before + kPrefillWarps), static_cast<int64_t>(query_len)) - 1;
+  // Block-uniform because the staging loop has barriers: the furthest row sets it.
+  const int64_t last_row =
+      min(static_cast<int64_t>(rows_before + kPrefillWarps),
+          static_cast<int64_t>(query_len)) - 1;
   const int64_t block_visible = offset + last_row + 1;
 
   extern __shared__ float shared[];
@@ -393,10 +318,7 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
     const int64_t remaining = block_visible - tile_start;
     const int tile = static_cast<int>(remaining < kPrefillTileKeys ? remaining : kPrefillTileKeys);
 
-    // Stage the tile: one warp per key, lanes over the head dimension, so the gather
-    // reads consecutive addresses and every warp in the block reuses it. Prefill stages
-    // and decode does not because decode has one query row per block and would read each
-    // key exactly once either way.
+    // Stage the tile: one warp per key, so the gather coalesces and every warp reuses it.
     for (int j = warp; j < tile; j += kPrefillWarps) {
       const int64_t slot = slot_of(table, tile_start + j, block_shift, block_mask);
       const cache_t* key = key_pool + (slot * num_kv_heads + kv_head) * head_dim;
@@ -409,8 +331,7 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
     __syncthreads();
 
     if (active) {
-      // Keys ascend, so this row's tile ends at the first masked one and `scoreable` is
-      // how many of the staged keys it may see at all.
+      // Keys ascend, so this row's tile ends at the first masked one.
       const int scoreable =
           static_cast<int>(min(static_cast<int64_t>(tile), max(visible - tile_start, int64_t{0})));
 
@@ -430,9 +351,7 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
             }
           }
         }
-        // Every lane needs every score: each holds its own slice of the accumulator and
-        // rescales it by the same factors. Issuing the reductions together rather than
-        // one at a time is this loop's optimization.
+        // Every lane needs every score, so the reductions are issued together.
 #pragma unroll
         for (int u = 0; u < kPrefillKeysPerStep; ++u) {
           dots[u] = warp_all_reduce_sum(dots[u]) * scale;
@@ -481,9 +400,7 @@ __global__ void paged_prefill_kernel(const scalar_t* __restrict__ q,
   }
 }
 
-// How many pieces to cut the context into: enough blocks to fill the card, never so
-// many that a split is shorter than kMinKeysPerSplit. A batch that already has the
-// parallelism stays at one split and skips the merge entirely.
+// Enough blocks to fill the card, never so many that a split is under kMinKeysPerSplit.
 int splits_for(int64_t rows, int64_t context_len) {
   const int64_t affordable = (context_len + kMinKeysPerSplit - 1) / kMinKeysPerSplit;
   const int64_t wanted =
@@ -507,8 +424,7 @@ void launch_paged_attention(const at::Tensor& q,
                             const float scale,
                             const float k_scale,
                             const float v_scale) {
-  // Fold the key scale into the softmax scale, once, on the host: every logit is
-  // (q · stored_key) * effective_scale, and a stored key is the real one over k_scale.
+  // Fold the key scale into the softmax scale once, on the host.
   const float effective_scale = scale * k_scale;
   const int64_t num_sequences = seq_lens.size(0);
   const int64_t num_query_heads = q.size(1);
@@ -581,8 +497,7 @@ void launch_paged_attention(const at::Tensor& q,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  // Skipped for a pure-decode iteration, the common case: there is no prefill row to
-  // find, and `max_query_len` establishes that without a device read.
+  // Skipped for a pure-decode iteration, which `max_query_len` settles without a read.
   if (max_query_len > 1) {
     const int64_t query_tiles = (max_query_len + kPrefillWarps - 1) / kPrefillWarps;
     const size_t prefill_floats = 2 * kPrefillTileKeys * head_dim;
@@ -611,17 +526,7 @@ void launch_paged_attention(const at::Tensor& q,
   }
 }
 
-// Pick the storage type from the pool's dtype once the activation type is fixed. A
-// full-precision pool must match the query exactly — no scale bridges them, so mixing
-// would be a reinterpret rather than a conversion — and an FP8 pool pairs only with a
-// reduced-precision query.
-//
-// The `if constexpr` bounds compile memory rather than runtime cost. Every branch is
-// instantiated whether or not it is reachable, so without it an fp32 query would pull in
-// an unreachable `<float, Float8_e4m3fn>` specialization of three heavy kernels. Together
-// with supporting e4m3 alone (e5m2 is a legal storage type that takes the PyTorch oracle
-// path) this holds the translation unit to five instantiations instead of nine, which is
-// what lets nvcc fit in memory here.
+// Pick the storage type from the pool's dtype; `if constexpr` keeps nvcc's memory down.
 template <typename scalar_t>
 void dispatch_by_cache(const at::Tensor& q,
                        const at::Tensor& key_pool,
