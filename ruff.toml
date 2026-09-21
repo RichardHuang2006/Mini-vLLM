@@ -1,0 +1,25 @@
+# Correctness lint only. The source is hand-wrapped to be read, so there is no
+# `ruff format` gate; none of the rules below rewrite layout.
+line-length = 110
+indent-width = 4
+target-version = "py312"
+
+[lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # import sorting
+    "B",      # bugbear
+    "UP",     # modern Python syntax
+    "SIM",    # simplify code
+    "RET",    # return statement consistency
+    "RUF",    # Ruff-specific rules
+]
+
+# Wrapped "a b c".split() literals read better than the 300-character list
+# SIM905 rewrites them into.
+ignore = ["SIM905"]
+
+# The error-norm docstrings spell ‖a − b‖ with a real minus sign, not a hyphen.
+allowed-confusables = ["−"]

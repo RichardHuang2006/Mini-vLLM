@@ -36,21 +36,21 @@ BYTES_PER_JOB = 2 * 1024**3
 _extension: Any = None
 
 __all__ = [
-    "ToolchainError",
-    "load_extension",
-    "rebuild",
-    "toolchain_report",
     "CUDA_KERNELS",
-    "NOT_YET_FASTER",
     "FP8_KERNEL_DTYPE",
+    "NOT_YET_FASTER",
+    "ToolchainError",
+    "attention",
     "cuda_kernel_names",
     "dispatch_report",
+    "load_extension",
+    "paged_attention",
+    "quantize_scatter",
+    "rebuild",
     "rmsnorm",
     "rope",
     "swiglu",
-    "attention",
-    "paged_attention",
-    "quantize_scatter",
+    "toolchain_report",
 ]
 
 

@@ -10,7 +10,7 @@ from mini_vllm.config import EngineConfig, SamplingParams
 if TYPE_CHECKING:
     from mini_vllm.engine import LLM, Completion, StreamUpdate
 
-__all__ = ["LLM", "EngineConfig", "SamplingParams", "Completion", "StreamUpdate"]
+__all__ = ["LLM", "Completion", "EngineConfig", "SamplingParams", "StreamUpdate"]
 
 # Re-exported lazily so importing a reference op does not pull in transformers.
 _ENGINE_EXPORTS = frozenset({"LLM", "Completion", "StreamUpdate"})

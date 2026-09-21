@@ -5,7 +5,8 @@ from __future__ import annotations
 import enum
 import itertools
 from collections import deque
-from collections.abc import Iterable, Sequence as SequenceABC
+from collections.abc import Iterable
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 
 import torch
@@ -15,13 +16,13 @@ from mini_vllm.config import SamplingParams, SchedulerConfig
 from mini_vllm.ops import sample
 
 __all__ = [
-    "Sequence",
-    "SequenceStatus",
+    "DenseModelRunner",
     "ForwardBatch",
+    "Scheduler",
     "SchedulerConfig",
     "SchedulerOutput",
-    "Scheduler",
-    "DenseModelRunner",
+    "Sequence",
+    "SequenceStatus",
 ]
 
 
@@ -294,7 +295,7 @@ def _check_metadata(
     if offsets[-1] != num_tokens:
         raise ValueError(f"cu_seqlens_q ends at {offsets[-1]} but there are {num_tokens} tokens")
 
-    lengths = [after - before for before, after in zip(offsets, offsets[1:], strict=False)]
+    lengths = [after - before for before, after in itertools.pairwise(offsets)]
     if lengths != seq_lens:
         raise ValueError(f"cu_seqlens_q differences {lengths} disagree with seq_lens {seq_lens}")
 

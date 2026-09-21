@@ -11,13 +11,13 @@ from mini_vllm.ops import sampling_probabilities
 from mini_vllm.scheduler import ForwardBatch, Sequence, SequenceStatus
 
 __all__ = [
-    "ResidualError",
-    "residual_distribution",
-    "accept_proposals",
-    "Proposal",
     "DraftProposer",
-    "SpeculativeDecoder",
+    "Proposal",
+    "ResidualError",
     "SpecStats",
+    "SpeculativeDecoder",
+    "accept_proposals",
+    "residual_distribution",
 ]
 
 
@@ -94,7 +94,7 @@ def accept_proposals(
         if greedy:
             # Point masses: keep the proposal while the argmaxes agree, with no draw.
             if int(target_row.argmax()) != token:
-                return accepted + [int(target_row.argmax())], len(accepted)
+                return [*accepted, int(target_row.argmax())], len(accepted)
             accepted.append(token)
             continue
 
@@ -113,12 +113,12 @@ def accept_proposals(
 
         # Rejected: draw from the residual, and discard proposals conditioned on it.
         residual = residual_distribution(target_row, draft_row)
-        return accepted + [_draw(residual, generator)], len(accepted)
+        return [*accepted, _draw(residual, generator)], len(accepted)
 
     # Every proposal survived, so the target's next distribution is already computed.
     bonus_row = target_probs[num_proposals]
     bonus = int(bonus_row.argmax()) if greedy else _draw(bonus_row, generator)
-    return accepted + [bonus], len(accepted)
+    return [*accepted, bonus], len(accepted)
 
 
 @dataclass
@@ -194,7 +194,7 @@ class DraftProposer:
         existing = shadow.token_ids
 
         shared = 0
-        for mine, theirs in zip(existing, committed):
+        for mine, theirs in zip(existing, committed, strict=False):
             if mine != theirs:
                 break
             shared += 1

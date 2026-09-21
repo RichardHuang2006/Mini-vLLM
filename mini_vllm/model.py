@@ -25,14 +25,14 @@ from mini_vllm.scheduler import ForwardBatch
 
 __all__ = [
     "ModelConfig",
-    "load_weights",
-    "resolve_model_path",
-    "map_name",
-    "expected_names",
-    "expected_shape",
     "Qwen3",
     "Qwen3Cached",
     "Qwen3Paged",
+    "expected_names",
+    "expected_shape",
+    "load_weights",
+    "map_name",
+    "resolve_model_path",
 ]
 
 # Local names on the right, shortened where HF is verbose but structurally unchanged.
@@ -130,7 +130,9 @@ def iter_weights(model_path: Path, device: str = "cpu") -> Iterator[tuple[str, t
     """Yield (checkpoint_name, tensor) pairs from the memory-mapped shards."""
     for shard in shard_files(model_path):
         with safe_open(shard, framework="pt", device=device) as handle:
-            for name in handle.keys():
+            # A safe_open handle exposes keys() but is not iterable, so SIM118
+            # does not apply here.
+            for name in handle.keys():  # noqa: SIM118
                 yield name, handle.get_tensor(name)
 
 

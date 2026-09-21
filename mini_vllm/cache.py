@@ -16,17 +16,17 @@ if TYPE_CHECKING:
     from mini_vllm.scheduler import Sequence
 
 __all__ = [
-    "KvCache",
-    "DenseKvCache",
     "Block",
+    "BlockManager",
     "BlockPool",
     "BlockPoolError",
-    "OutOfBlocks",
     "BlockTable",
+    "DenseKvCache",
+    "KvCache",
+    "OutOfBlocks",
     "PagedKvPool",
-    "RadixNode",
     "PrefixCache",
-    "BlockManager",
+    "RadixNode",
 ]
 
 
@@ -604,7 +604,7 @@ class PagedKvPool:
 class RadixNode:
     """One cached block and the edge of tokens that reaches it; the root owns no page."""
 
-    __slots__ = ("parent", "token_key", "block_id", "children")
+    __slots__ = ("block_id", "children", "parent", "token_key")
 
     def __init__(
         self,

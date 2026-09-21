@@ -10,20 +10,23 @@ import torch
 from mini_vllm.config import SamplingParams
 
 __all__ = [
-    "linear",
     "Embedding",
-    "silu",
-    "softmax",
+    "RoPE",
+    "apply_rope",
+    "causal_mask",
+    "linear",
+    "paged_attention_gathered",
     "rms_norm",
     "rotate_half",
-    "apply_rope",
-    "RoPE",
-    "scaled_dot_product_attention_grouped",
-    "causal_mask",
-    "paged_attention_gathered",
-    "sampling_probabilities",
     "sample",
+    "sampling_probabilities",
+    "scaled_dot_product_attention_grouped",
+    "silu",
+    "softmax",
 ]
+
+# SamplingParams is frozen, so every caller can share one default instance.
+_DEFAULT_SAMPLING = SamplingParams()
 
 
 def linear(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -361,7 +364,7 @@ def sampling_probabilities(
 
 def sample(
     logits: torch.Tensor,
-    params: SamplingParams | Sequence[SamplingParams] = SamplingParams(),
+    params: SamplingParams | Sequence[SamplingParams] = _DEFAULT_SAMPLING,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Draw one token per row: logits [B, V] -> tokens [B]; greedy rows are one-hot."""
