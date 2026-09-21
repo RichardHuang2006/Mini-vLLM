@@ -1112,7 +1112,7 @@ def test_a_deterministic_stress_run_completes_and_leaks_nothing(tiny_qwen3):
                                    max_batched_tokens=32, max_sequences=6)
     generator = torch.Generator().manual_seed(0)
     sequences = []
-    for index in range(120):
+    for _index in range(120):
         length = int(torch.randint(1, 30, (1,), generator=generator))
         sequences.append(Sequence(
             prompt_token_ids=torch.randint(0, 512, (length,), generator=generator).tolist(),

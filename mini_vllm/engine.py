@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from collections.abc import Iterable, Iterator, Sequence as SequenceABC
+from collections.abc import Iterable, Iterator
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, replace
 from typing import NamedTuple
 
@@ -25,16 +26,16 @@ from mini_vllm.scheduler import ForwardBatch, Scheduler, Sequence
 from mini_vllm.speculative import DraftProposer, SpeculativeDecoder
 
 __all__ = [
+    "LLM",
+    "Completion",
+    "EngineStats",
     "Loaded",
+    "PagedModelRunner",
+    "StreamUpdate",
     "eos_token_ids_for",
-    "load",
     "generate_ids",
     "generate_ids_cached",
-    "PagedModelRunner",
-    "Completion",
-    "StreamUpdate",
-    "EngineStats",
-    "LLM",
+    "load",
 ]
 
 DEFAULT_MAX_TOKENS = 32
@@ -446,10 +447,7 @@ class LLM:
         `ignore_eos` is for the benchmarks: a run where some requests quit at token 9 and
         others at 64 measures the prompts rather than the engine.
         """
-        if isinstance(prompt, str):
-            token_ids = self.tokenizer(prompt).input_ids
-        else:
-            token_ids = list(prompt)
+        token_ids = self.tokenizer(prompt).input_ids if isinstance(prompt, str) else list(prompt)
         if not token_ids:
             raise ValueError("an empty prompt has nothing to forward")
 

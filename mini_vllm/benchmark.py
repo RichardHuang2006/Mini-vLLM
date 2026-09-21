@@ -16,7 +16,8 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence as SequenceABC
+from collections.abc import Callable
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 
 import torch
@@ -30,15 +31,15 @@ from mini_vllm.model import resolve_model_path
 from mini_vllm.ops import RoPE
 
 __all__ = [
-    "GpuState",
-    "gpu_state",
-    "ClockSampler",
     "BandwidthResult",
+    "ClockSampler",
+    "GpuState",
     "KernelCase",
     "LatencyStats",
     "StressRequest",
     "build_input_ids",
     "copy_ceiling",
+    "gpu_state",
     "kernel_cases",
     "measure_bandwidth",
     "percentile",
@@ -258,67 +259,66 @@ def mode_single(args) -> None:
     input_ids = build_input_ids(loaded.tokenizer, args.input_len, args.batch, device)
 
     rows: list[tuple[str, float, float]] = []  # label, ttft_ms, decode tok/s
-    with ClockSampler() as sampler:
-        with torch.no_grad():
-            if args.no_cache:
-                # No cache to prefill: TTFT is one full forward, decode is the naive loop.
-                for _ in range(args.warmup):
-                    generate_ids(loaded.model, input_ids, max_tokens=4)
-                _synchronize(device)
-                started = time.perf_counter()
-                loaded.model(input_ids)
-                _synchronize(device)
-                ttft = time.perf_counter() - started
-                started = time.perf_counter()
-                generate_ids(loaded.model, input_ids, max_tokens=args.output_len)
-                _synchronize(device)
-                total = time.perf_counter() - started
-                steps = max(args.output_len - 1, 1)
-                rows.append(("mini-vllm (no cache)", ttft * 1e3,
-                             steps * args.batch / max(total - ttft, 1e-9)))
-            else:
-                for _ in range(args.warmup):
-                    generate_ids_cached(loaded.model, input_ids, max_tokens=8)
-                _synchronize(device)
-                caches = loaded.model.create_kv_cache()
-                started = time.perf_counter()
-                logits = loaded.model(input_ids, caches, last_only=True)
+    with ClockSampler() as sampler, torch.no_grad():
+        if args.no_cache:
+            # No cache to prefill: TTFT is one full forward, decode is the naive loop.
+            for _ in range(args.warmup):
+                generate_ids(loaded.model, input_ids, max_tokens=4)
+            _synchronize(device)
+            started = time.perf_counter()
+            loaded.model(input_ids)
+            _synchronize(device)
+            ttft = time.perf_counter() - started
+            started = time.perf_counter()
+            generate_ids(loaded.model, input_ids, max_tokens=args.output_len)
+            _synchronize(device)
+            total = time.perf_counter() - started
+            steps = max(args.output_len - 1, 1)
+            rows.append(("mini-vllm (no cache)", ttft * 1e3,
+                         steps * args.batch / max(total - ttft, 1e-9)))
+        else:
+            for _ in range(args.warmup):
+                generate_ids_cached(loaded.model, input_ids, max_tokens=8)
+            _synchronize(device)
+            caches = loaded.model.create_kv_cache()
+            started = time.perf_counter()
+            logits = loaded.model(input_ids, caches, last_only=True)
+            token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            _synchronize(device)
+            ttft = time.perf_counter() - started
+            steps = max(args.output_len - 1, 1)
+            started = time.perf_counter()
+            for _ in range(steps):
+                logits = loaded.model(token, caches, last_only=True)
                 token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                _synchronize(device)
-                ttft = time.perf_counter() - started
-                steps = max(args.output_len - 1, 1)
-                started = time.perf_counter()
-                for _ in range(steps):
-                    logits = loaded.model(token, caches, last_only=True)
-                    token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                _synchronize(device)
-                decode = time.perf_counter() - started
-                rows.append(("mini-vllm", ttft * 1e3, steps * args.batch / decode))
+            _synchronize(device)
+            decode = time.perf_counter() - started
+            rows.append(("mini-vllm", ttft * 1e3, steps * args.batch / decode))
 
-            if args.compare == "hf":
-                print("loading the transformers baseline ...")
-                hf = (AutoModelForCausalLM.from_pretrained(
-                    resolve_model_path(args.model), dtype=torch.bfloat16).to(device).eval())
+        if args.compare == "hf":
+            print("loading the transformers baseline ...")
+            hf = (AutoModelForCausalLM.from_pretrained(
+                resolve_model_path(args.model), dtype=torch.bfloat16).to(device).eval())
 
-                def run(new_tokens: int):
-                    return hf.generate(
-                        input_ids, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
-                        do_sample=False, pad_token_id=hf.generation_config.pad_token_id)
+            def run(new_tokens: int):
+                return hf.generate(
+                    input_ids, max_new_tokens=new_tokens, min_new_tokens=new_tokens,
+                    do_sample=False, pad_token_id=hf.generation_config.pad_token_id)
 
-                for _ in range(args.warmup):
-                    run(8)
-                _synchronize(device)
-                started = time.perf_counter()
-                run(1)
-                _synchronize(device)
-                hf_ttft = time.perf_counter() - started
-                started = time.perf_counter()
-                run(args.output_len)
-                _synchronize(device)
-                hf_total = time.perf_counter() - started
-                steps = max(args.output_len - 1, 1)
-                rows.append(("transformers", hf_ttft * 1e3,
-                             steps * args.batch / max(hf_total - hf_ttft, 1e-9)))
+            for _ in range(args.warmup):
+                run(8)
+            _synchronize(device)
+            started = time.perf_counter()
+            run(1)
+            _synchronize(device)
+            hf_ttft = time.perf_counter() - started
+            started = time.perf_counter()
+            run(args.output_len)
+            _synchronize(device)
+            hf_total = time.perf_counter() - started
+            steps = max(args.output_len - 1, 1)
+            rows.append(("transformers", hf_ttft * 1e3,
+                         steps * args.batch / max(hf_total - hf_ttft, 1e-9)))
 
     print("\nops dispatch:")
     print(kernels.dispatch_report(args.use_cuda_kernels))
@@ -326,7 +326,7 @@ def mode_single(args) -> None:
     for label, ttft_ms, decode_rate in rows:
         print(f"{label:<22} TTFT {ttft_ms:8.1f} ms   decode {decode_rate:7.1f} tok/s")
     if len(rows) == 2:
-        (l0, t0, d0), (l1, t1, d1) = rows
+        (_l0, t0, d0), (l1, t1, d1) = rows
         print(f"\nrelative to {l1}: TTFT {t1 / t0:.2f}x, decode {d0 / d1:.2f}x")
     report_gpu_verdict(sampler.peak)
 
@@ -572,7 +572,7 @@ def kernel_cases(dtype: torch.dtype = torch.bfloat16) -> list[KernelCase]:
             pool_slots = max(4096, 4 * tokens)
             slots = torch.randperm(pool_slots, device="cuda")[:tokens].to(torch.int64)
 
-            def pools() -> tuple:
+            def pools(pool_slots=pool_slots, slots=slots) -> tuple:
                 shape = (pool_slots, kv_heads, head_dim)
                 empty = torch.zeros(shape, device="cuda", dtype=torch.float8_e4m3fn)
                 return (empty, torch.zeros_like(empty), slots)
