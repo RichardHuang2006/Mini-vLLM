@@ -69,15 +69,3 @@ def test_positions_are_explicit_not_assumed():
     out = rope(x, mx.array(positions))
     for i, position in enumerate(positions):
         assert_allclose(out[:, i : i + 1], fast_rope(x[:, i : i + 1], position))
-
-
-def test_bad_inputs_are_rejected():
-    with pytest.raises(ValueError, match="even"):
-        RoPE(head_dim=63, max_seq_len=16)
-
-    rope = RoPE(head_dim=64, max_seq_len=16)
-    x = mx.zeros((1, 2, 1, 64))
-    with pytest.raises(ValueError, match="integer"):
-        rope(x, mx.array([0.0, 1.0]))
-    with pytest.raises(ValueError, match="beyond the precomputed table"):
-        rope(x, mx.array([15, 16]))

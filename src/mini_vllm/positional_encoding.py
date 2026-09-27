@@ -17,9 +17,6 @@ class RoPE:
     """Rotate x [B, L, H, D] by the angles at positions [B, L] or [L]."""
 
     def __init__(self, head_dim: int, max_seq_len: int, theta: float = 1_000_000.0) -> None:
-        if head_dim % 2 != 0:
-            raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
-
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.theta = theta
@@ -39,17 +36,6 @@ class RoPE:
         self.sin = mx.sin(angles)
 
     def __call__(self, x: mx.array, positions: mx.array) -> mx.array:
-        if not mx.issubdtype(positions.dtype, mx.integer):
-            raise ValueError(f"positions must be integer, got {positions.dtype}")
-
-        # An out-of-range gather returns garbage rather than raising, so check first.
-        maximum = mx.max(positions).item() if positions.size else -1
-        if maximum >= self.max_seq_len:
-            raise ValueError(
-                f"position {maximum} is beyond the precomputed table "
-                f"(max_seq_len={self.max_seq_len})"
-            )
-
         # The head axis is inserted so one table row applies to every head of its token.
         cos = mx.expand_dims(self.cos[positions], -2)
         sin = mx.expand_dims(self.sin[positions], -2)

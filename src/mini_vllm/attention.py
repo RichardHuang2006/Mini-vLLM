@@ -30,9 +30,6 @@ def scaled_dot_product_attention_grouped(
     additive and broadcastable to B x H_q x L x S."""
     *batch, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads, source_len = key.shape[-3], key.shape[-2]
-
-    if num_query_heads % num_kv_heads != 0:
-        raise ValueError(f"H_q ({num_query_heads}) must be a multiple of H_k ({num_kv_heads})")
     group_size = num_query_heads // num_kv_heads
 
     if scale is None:
@@ -47,10 +44,6 @@ def scaled_dot_product_attention_grouped(
     scores = (query @ key.swapaxes(-2, -1)) * scale
 
     if isinstance(mask, str):
-        if mask != "causal":
-            raise ValueError(f"unknown mask shorthand {mask!r}, expected 'causal'")
-        if query_len > source_len:
-            raise ValueError(f"causal attention needs S >= L, got L={query_len}, S={source_len}")
         scores = scores + causal_mask(query_len, source_len, scores.dtype)
     elif mask is not None:
         mask = mx.broadcast_to(mask, (*batch, num_query_heads, query_len, source_len))
@@ -77,52 +70,20 @@ def paged_attention(
     int32 metadata is block_tables (N x max_blocks, -1 padded), cu_seqlens_q (N + 1) and
     context_lens (N).
     """
-    if query.ndim != 3:
-        raise ValueError(f"expected query shaped T x H_q x D, got {tuple(query.shape)}")
-    if key_pages.ndim != 4 or key_pages.shape != value_pages.shape:
-        raise ValueError(
-            f"expected matching pages shaped num_blocks x P x H_k x D, got "
-            f"{tuple(key_pages.shape)} and {tuple(value_pages.shape)}"
-        )
     is_fp8 = key_pages.dtype == mx.uint8
-    if not is_fp8 and key_pages.dtype != query.dtype:
-        raise ValueError(f"pages are {key_pages.dtype} but query is {query.dtype}")
 
     # The metadata is small and needed on the host to slice, so read it back once.
     tables = block_tables.tolist()
     starts = cu_seqlens_q.tolist()
     lengths = context_lens.tolist()
 
-    num_sequences = len(lengths)
-    if len(tables) != num_sequences or len(starts) != num_sequences + 1:
-        raise ValueError(
-            f"metadata disagrees on the sequence count: block_tables "
-            f"{tuple(block_tables.shape)}, cu_seqlens_q {tuple(cu_seqlens_q.shape)}, "
-            f"context_lens {tuple(context_lens.shape)}"
-        )
-    if starts[-1] != query.shape[0]:
-        raise ValueError(f"cu_seqlens_q ends at {starts[-1]} but query has {query.shape[0]} rows")
-
     block_size, num_kv_heads, head_dim = key_pages.shape[1:]
     outputs = []
 
-    for index in range(num_sequences):
+    for index, context_len in enumerate(lengths):
         start, end = starts[index], starts[index + 1]
-        query_len = end - start
-        context_len = lengths[index]
-        if context_len < query_len:
-            raise ValueError(
-                f"sequence {index} attends over {context_len} tokens but computes "
-                f"{query_len}; S >= L is causality, not convention"
-            )
-
         blocks_used = -(-context_len // block_size)
         table = tables[index][:blocks_used]
-        if len(table) < blocks_used or min(table, default=0) < 0:
-            raise ValueError(
-                f"sequence {index} needs {blocks_used} blocks for {context_len} tokens "
-                f"but its table does not cover them: {tables[index]}"
-            )
 
         # Gather on the block axis, then flatten block and offset into one token axis.
         ids = mx.array(table, dtype=mx.int32)

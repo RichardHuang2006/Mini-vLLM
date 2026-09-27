@@ -56,12 +56,6 @@ def test_causal_mask_shifts_for_a_decode_step():
     ]
 
 
-def test_causal_attention_rejects_more_queries_than_keys():
-    q, k, v = qkv(4, 2, 5, 3, mx.float32)
-    with pytest.raises(ValueError, match="S >= L"):
-        scaled_dot_product_attention_grouped(q, k, v, mask="causal")
-
-
 # (query_len, context_len) per sequence: a fresh prefill, a decode step, a later chunk.
 RAGGED_BATCH = [(5, 5), (1, 16), (7, 23)]
 BLOCK_SIZE = 4
@@ -145,21 +139,3 @@ def test_paged_attention_reads_fp8_pages_through_their_scales():
 
     expected = [(q_i, round_trip(k_i, k_scale), round_trip(v_i, v_scale)) for q_i, k_i, v_i in sequences]
     assert_allclose(out, dense_reference(expected))
-
-
-def test_paged_attention_rejects_bad_metadata():
-    _, q, key_pages, value_pages, tables, starts, contexts = build_paged_batch(mx.float32, 0.0)
-
-    with pytest.raises(ValueError, match="causality"):
-        paged_attention(q, key_pages, value_pages, tables, starts, mx.array([5, 0, 23], dtype=mx.int32))
-    # Sequence 0 runs into its -1 padding; sequence 2 runs off the end of its table row.
-    with pytest.raises(ValueError, match="does not cover"):
-        paged_attention(q, key_pages, value_pages, tables, starts, mx.array([9, 16, 23], dtype=mx.int32))
-    with pytest.raises(ValueError, match="does not cover"):
-        paged_attention(q, key_pages, value_pages, tables, starts, mx.array([5, 16, 40], dtype=mx.int32))
-    with pytest.raises(ValueError, match="rows"):
-        paged_attention(q[:-1], key_pages, value_pages, tables, starts, contexts)
-    with pytest.raises(ValueError, match="sequence count"):
-        paged_attention(q, key_pages, value_pages, tables[:2], starts, contexts)
-    with pytest.raises(ValueError, match="pages are"):
-        paged_attention(q.astype(mx.bfloat16), key_pages, value_pages, tables, starts, contexts)

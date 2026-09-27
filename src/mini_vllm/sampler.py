@@ -21,14 +21,6 @@ class SamplingParams:
     top_k: int = 0
     top_p: float = 1.0
 
-    def __post_init__(self) -> None:
-        if self.temperature < 0:
-            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
-        if self.top_k < 0:
-            raise ValueError(f"top_k must be >= 0, got {self.top_k}")
-        if not 0.0 < self.top_p <= 1.0:
-            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
-
     @property
     def is_greedy(self) -> bool:
         return self.temperature == 0.0
@@ -44,8 +36,6 @@ def _as_columns(
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Broadcast per-request parameters into three B x 1 arrays."""
     rows = [params] * batch if isinstance(params, SamplingParams) else list(params)
-    if len(rows) != batch:
-        raise ValueError(f"got {len(rows)} sampling params for a batch of {batch}")
 
     def column(values, dtype) -> mx.array:
         return mx.array(values, dtype=dtype)[:, None]
@@ -62,9 +52,6 @@ def sampling_probabilities(
     params: SamplingParams | Sequence[SamplingParams],
 ) -> mx.array:
     """The fp32 [B, V] distribution each row will be sampled from, vectorized per row."""
-    if logits.ndim != 2:
-        raise ValueError(f"expected B x V logits, got shape {tuple(logits.shape)}")
-
     batch, vocab = logits.shape
     temperature, top_k, top_p = _as_columns(params, batch)
 

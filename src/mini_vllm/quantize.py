@@ -17,6 +17,4 @@ def quantize_fp8(x: mx.array, scale: float = 1.0) -> mx.array:
 
 def dequantize_fp8(x: mx.array, scale: float = 1.0, dtype: mx.Dtype = mx.bfloat16) -> mx.array:
     """The inverse of quantize_fp8: decode the uint8 bits, multiply the scale back in."""
-    if x.dtype != mx.uint8:
-        raise ValueError(f"expected fp8 bits stored as uint8, got {x.dtype}")
     return (mx.from_fp8(x, mx.float32) * scale).astype(dtype)

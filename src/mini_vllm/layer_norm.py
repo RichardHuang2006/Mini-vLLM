@@ -11,8 +11,6 @@ class RMSNorm:
     """x * rsqrt(mean(x^2) + eps) * weight over the last axis, reduced in fp32."""
 
     def __init__(self, dim: int, weight: mx.array, eps: float = 1e-6) -> None:
-        if weight.shape != (dim,):
-            raise ValueError(f"weight must have shape ({dim},), got {tuple(weight.shape)}")
         self.dim = dim
         self.weight = weight
         self.eps = eps

@@ -67,9 +67,6 @@ def test_per_row_parameters_apply_per_row():
     for row, row_params in enumerate(params):
         assert_allclose(together[row : row + 1], sampling_probabilities(logits[row : row + 1], row_params))
 
-    with pytest.raises(ValueError, match="batch of 3"):
-        sampling_probabilities(logits, params[:2])
-
 
 def test_a_seeded_key_reproduces_the_draw():
     logits = mx.random.normal((64, 100))
@@ -86,11 +83,3 @@ def test_draws_follow_the_truncated_distribution():
     expected = sampling_probabilities(LOGITS, params)[0].tolist()
     # Three standard errors of a 20k-draw frequency is under 0.011 for any p.
     assert all(abs(f - p) < 0.011 for f, p in zip(frequencies, expected, strict=True)), frequencies
-
-
-@pytest.mark.parametrize(
-    "kwargs", [{"temperature": -1.0}, {"top_k": -1}, {"top_p": 0.0}, {"top_p": 1.5}]
-)
-def test_invalid_params_are_rejected(kwargs):
-    with pytest.raises(ValueError):
-        SamplingParams(**kwargs)

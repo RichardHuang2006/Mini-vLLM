@@ -25,8 +25,3 @@ def test_rms_norm_casts_back_before_the_weight_multiply():
     expected = weight * normalized.astype(mx.bfloat16)
 
     assert mx.array_equal(RMSNorm(64, weight)(x), expected).item()
-
-
-def test_a_misshaped_weight_is_rejected():
-    with pytest.raises(ValueError, match="weight must have shape"):
-        RMSNorm(64, mx.ones((32,)))

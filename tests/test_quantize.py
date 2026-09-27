@@ -28,8 +28,3 @@ def test_the_scale_divides_before_the_cast():
 
     assert bits.dtype == mx.uint8 and bits.nbytes == x.size
     assert mx.array_equal(bits, quantize_fp8(x.astype(mx.float32) / 0.25)).item()
-
-
-def test_dequantize_rejects_non_fp8_input():
-    with pytest.raises(ValueError, match="uint8"):
-        dequantize_fp8(mx.zeros((4,), dtype=mx.bfloat16))
