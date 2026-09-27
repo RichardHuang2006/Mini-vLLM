@@ -3,7 +3,6 @@ name = "mini-vllm"
 version = "0.1.0"
 description = "A paged-attention LLM inference engine for Apple silicon, on MLX and hand-written Metal."
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.32.0",
