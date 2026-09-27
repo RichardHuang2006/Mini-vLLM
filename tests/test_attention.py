@@ -33,6 +33,22 @@ def test_grouped_attention_matches_mx_fast(dtype, heads, lengths, mask):
     )
 
 
+def test_bf16_attention_rounds_only_its_output():
+    """bf16 in, fp32 inside: the only error left is the final cast, however sharp the scores."""
+    q = (3 * mx.random.normal((2, 16, 9, 128))).astype(mx.bfloat16)
+    k = (3 * mx.random.normal((2, 8, 40, 128))).astype(mx.bfloat16)
+    v = mx.random.normal((2, 8, 40, 128)).astype(mx.bfloat16)
+
+    out = scaled_dot_product_attention_grouped(q, k, v, mask="causal").astype(mx.float32)
+    exact = mx.fast.scaled_dot_product_attention(
+        q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale=128**-0.5, mask="causal"
+    )
+
+    # One bf16 rounding is ~2^-9 relative; rounding the scores to bf16 as well measures ~0.01.
+    relative = (mx.linalg.norm(out - exact) / mx.linalg.norm(exact)).item()
+    assert relative < 2**-8, relative
+
+
 @pytest.mark.parametrize("mask_shape", [(5, 9), (2, 4, 5, 9)])  # shared, per batch and head
 def test_an_additive_mask_broadcasts_like_mx_fast(mask_shape):
     q, k, v = qkv(4, 2, 5, 9, mx.float32)

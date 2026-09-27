@@ -31,9 +31,14 @@ def scaled_dot_product_attention_grouped(
     *batch, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads, source_len = key.shape[-3], key.shape[-2]
     group_size = num_query_heads // num_kv_heads
+    dtype = query.dtype
 
     if scale is None:
         scale = 1.0 / math.sqrt(head_dim)
+
+    # Scores, softmax and the weighted sum stay fp32: a bf16 score near 10 is only good to
+    # 0.06, which is enough to flip Qwen3-0.6B's greedy choice.
+    query, key, value = (x.astype(mx.float32) for x in (query, key, value))
 
     # Split the query heads into (kv_head, group) so K and V broadcast over the group
     # instead of being repeated G times.
@@ -50,7 +55,7 @@ def scaled_dot_product_attention_grouped(
         scores = scores + mask.reshape(*batch, num_kv_heads, group_size, query_len, source_len)
 
     out = softmax(scores, axis=-1) @ value
-    return out.reshape(*batch, num_query_heads, query_len, head_dim)
+    return out.reshape(*batch, num_query_heads, query_len, head_dim).astype(dtype)
 
 
 def paged_attention(
