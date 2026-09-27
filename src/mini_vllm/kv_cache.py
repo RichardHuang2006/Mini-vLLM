@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from mini_vllm.attention import scaled_dot_product_attention_grouped
+
 __all__ = ["KvFullCache"]
 
 
@@ -24,3 +26,9 @@ class KvFullCache:
             self.values = mx.concatenate([self.values, value], axis=-2)
         self.offset += key.shape[-2]
         return self.keys, self.values
+
+    def attend(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
+        """Append this step's keys and values, then attend causally over the whole history.
+        With S > L, the causal mask's S - L offset lines the new tokens up after it."""
+        keys, values = self.update_and_fetch(k, v)
+        return scaled_dot_product_attention_grouped(q, keys, values, mask="causal")

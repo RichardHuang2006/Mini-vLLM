@@ -12,7 +12,11 @@ from mini_vllm.basics import linear, swiglu
 from mini_vllm.embedding import Embedding
 from mini_vllm.kv_cache import KvFullCache
 from mini_vllm.layer_norm import RMSNorm
+from mini_vllm.paged_kv_cache import PagedKvCache
 from mini_vllm.positional_encoding import RoPE
+
+# What a layer attends through: a dense history, or one layer's view of a paged batch.
+Cache = KvFullCache | PagedKvCache
 
 __all__ = ["ModelConfig", "Qwen3MLP", "Qwen3Model", "Qwen3MultiHeadAttention", "Qwen3TransformerBlock"]
 
@@ -59,7 +63,7 @@ class Qwen3MultiHeadAttention:
         self.q_norm, self.k_norm = q_norm, k_norm
         self.rope = rope
 
-    def __call__(self, x: mx.array, positions: mx.array, cache: KvFullCache | None = None) -> mx.array:
+    def __call__(self, x: mx.array, positions: mx.array, cache: Cache | None = None) -> mx.array:
         batch, length, _ = x.shape
 
         q = linear(x, self.wq).reshape(batch, length, self.num_heads, self.head_dim)
@@ -71,11 +75,12 @@ class Qwen3MultiHeadAttention:
         k = self.rope(self.k_norm(k), positions).swapaxes(1, 2)
         v = v.swapaxes(1, 2)
 
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        # With a cache S > L, and the causal mask's S - L offset lines the chunk up with its history.
-        out = scaled_dot_product_attention_grouped(q, k, v, mask="causal")
+        # The cache writes this step's k and v and attends over everything it holds: a dense
+        # history, or each ragged sequence's own pages. Without one, the tokens see only each other.
+        if cache is None:
+            out = scaled_dot_product_attention_grouped(q, k, v, mask="causal")
+        else:
+            out = cache.attend(q, k, v)
         return linear(out.swapaxes(1, 2).reshape(batch, length, -1), self.wo)
 
 
@@ -104,7 +109,7 @@ class Qwen3TransformerBlock:
         self.input_layernorm = input_layernorm
         self.post_attention_layernorm = post_attention_layernorm
 
-    def __call__(self, x: mx.array, positions: mx.array, cache: KvFullCache | None = None) -> mx.array:
+    def __call__(self, x: mx.array, positions: mx.array, cache: Cache | None = None) -> mx.array:
         h = x + self.attention(self.input_layernorm(x), positions, cache)
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -113,7 +118,8 @@ class Qwen3Model:
     """Token ids [B, L] at positions [L] or [B, L] -> logits [B, L, V].
 
     With no caches every call attends only over its own tokens: the full-recompute oracle.
-    With one cache per layer, each call appends to the history and attends over all of it.
+    With a KvFullCache per layer, each call appends to one dense history per row. With the
+    PagedKvCache views of a ForwardBatch, B = 1 and L is the batch's T flattened tokens.
     """
 
     def __init__(
@@ -134,7 +140,7 @@ class Qwen3Model:
         self,
         inputs: mx.array,
         positions: mx.array,
-        caches: list[KvFullCache] | None = None,
+        caches: list[Cache] | None = None,
     ) -> mx.array:
         h = self.embedding(inputs)
         for index, layer in enumerate(self.layers):

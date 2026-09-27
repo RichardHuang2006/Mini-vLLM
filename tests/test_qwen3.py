@@ -5,8 +5,11 @@ import pytest
 from conftest import make_tiny_qwen3
 from utils import assert_allclose
 
+from mini_vllm.batch import ForwardBatch
 from mini_vllm.kv_cache import KvFullCache
 from mini_vllm.models import from_mlx
+from mini_vllm.paged_kv_cache import BlockManager, PagedKvPool
+from mini_vllm.scheduler import Request
 
 
 def caches_for(model):
@@ -86,3 +89,43 @@ def test_real_logits_sit_close_to_mlx_lm(real_qwen3):
     relative = (mx.linalg.norm(ours - theirs) / mx.linalg.norm(theirs)).item()
     assert relative < 0.05, relative
     assert mx.array_equal(mx.argmax(ours, axis=-1), mx.argmax(theirs, axis=-1)).item()
+
+
+def paged_setup(model, num_blocks=32, block_size=4):
+    c = model.config
+    kv = PagedKvPool(c.num_hidden_layers, num_blocks, block_size, c.num_key_value_heads, c.head_dim,
+                     dtype=mx.float32)
+    return kv, BlockManager(kv)
+
+
+def paged_forward(model, kv, manager, scheduled):
+    for request, count in scheduled:
+        manager.allocate(request, count)
+    batch = ForwardBatch.from_scheduled(scheduled, manager)
+    logits = model(batch.input_ids[None], batch.positions, kv.caches(batch))[0]
+    for request, count in scheduled:
+        request.num_computed_tokens += count
+    return logits, batch
+
+
+def test_a_ragged_paged_batch_matches_each_dense_run(tiny_qwen3):
+    """The ladder's last rung: prefill two sequences, then one pass carrying a decode for
+    each beside a third's prefill, every row against the full recompute of its sequence."""
+    model = from_mlx(tiny_qwen3)
+    kv, manager = paged_setup(model)
+    first, second = Request(prompt_token_ids=list(range(1, 8))), Request(prompt_token_ids=list(range(20, 25)))
+
+    prefill, _ = paged_forward(model, kv, manager, [(first, 7), (second, 5)])
+    assert_allclose(prefill[:7], model(mx.array([first.token_ids]), mx.arange(7))[0])
+
+    first.output_token_ids.append(11)
+    second.output_token_ids.append(12)
+    third = Request(prompt_token_ids=list(range(40, 46)))
+    logits, batch = paged_forward(model, kv, manager, [(first, 1), (second, 1), (third, 6)])
+
+    starts = batch.cu_seqlens_q.tolist()
+    for index, request in enumerate((first, second, third)):
+        rows = logits[starts[index] : starts[index + 1]]
+        ids = mx.array([request.token_ids])
+        dense = model(ids, mx.arange(len(request)))[0, len(request) - rows.shape[0] :]
+        assert_allclose(rows, dense)
