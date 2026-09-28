@@ -30,7 +30,10 @@ TINY_QWEN3 = {
     "max_position_embeddings": 256,
     "rms_norm_eps": 1e-6,
     "rope_theta": 1_000_000.0,
-    "tie_word_embeddings": True,
+    # Untied, unlike Qwen3-0.6B: a random tied model's logits are dominated by the current
+    # token's own embedding, so greedy decoding repeats one token whatever the context and a
+    # token-identity test proves nothing. Untied, 12-token runs hold 7-12 distinct tokens.
+    "tie_word_embeddings": False,
 }
 
 

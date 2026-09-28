@@ -117,6 +117,8 @@ class Qwen3TransformerBlock:
 class Qwen3Model:
     """Token ids [B, L] at positions [L] or [B, L] -> logits [B, L, V].
 
+    rows selects which token rows get logits; None means all of them.
+
     With no caches every call attends only over its own tokens: the full-recompute oracle.
     With a KvFullCache per layer, each call appends to one dense history per row. With the
     PagedKvCache views of a ForwardBatch, B = 1 and L is the batch's T flattened tokens.
@@ -141,10 +143,16 @@ class Qwen3Model:
         inputs: mx.array,
         positions: mx.array,
         caches: list[Cache] | None = None,
+        rows: mx.array | None = None,
     ) -> mx.array:
         h = self.embedding(inputs)
         for index, layer in enumerate(self.layers):
             h = layer(h, positions, None if caches is None else caches[index])
+
+        # Only these token rows reach the LM head: one per sequence when serving, rather
+        # than a V-wide row for every prompt token in a chunk.
+        if rows is not None:
+            h = h[:, rows]
         h = self.norm(h)
 
         if self.lm_head is None:

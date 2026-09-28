@@ -197,6 +197,26 @@ def test_preemption_frees_now_and_requeues_at_the_front():
     assert scheduler.schedule().scheduled == [(request, 5)], "4 prompt + 1 emitted, recomputed"
 
 
+def test_a_chunked_recompute_takes_no_token_until_it_catches_up():
+    """A preempted request re-prefills its prompt and its output. A chunk that ends past the
+    prompt but short of the output is still mid-recompute: its row predicts a token the
+    request already has, so nothing may be appended until every token is computed again."""
+    scheduler = make_scheduler(chunk_size=4)
+    request = make(4, max_tokens=8)
+    scheduler.add(request)
+    for token in (11, 12, 13):
+        scheduler.commit(scheduler.schedule(), [token])
+    scheduler.preempt(request)
+
+    first = scheduler.schedule()
+    scheduler.commit(first, [777])
+    assert first.tokens_for(request) == 4 and request.output_token_ids == [11, 12, 13]
+
+    second = scheduler.schedule()
+    scheduler.commit(second, [14])
+    assert second.tokens_for(request) == 3 and request.output_token_ids == [11, 12, 13, 14]
+
+
 def test_admission_waits_rather_than_preempting_for_a_new_request():
     """Memory pressure preempts for a request already in flight, and merely postpones one
     that has not started: a queued request holds nothing."""

@@ -4,6 +4,7 @@ from .attention import *
 from .basics import *
 from .batch import *
 from .embedding import *
+from .engine import *
 from .generate import *
 from .kv_cache import *
 from .layer_norm import *

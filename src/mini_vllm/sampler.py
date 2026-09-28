@@ -20,6 +20,7 @@ class SamplingParams:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
+    n: int = 1  # completions per prompt: one prefill, then n branches sharing its pages
 
     @property
     def is_greedy(self) -> bool:

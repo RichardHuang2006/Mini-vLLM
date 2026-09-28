@@ -144,8 +144,10 @@ class Scheduler:
         tokens = tokens or [None] * len(output.scheduled)
         for (request, count), token in zip(output.scheduled, tokens, strict=True):
             request.num_computed_tokens += count
-            # Mid-prompt, the sampled row belongs to no token: sampling it would invent one.
-            if not request.is_prefill() and token is not None:
+            # Only a request whose every token is now computed takes one. A chunk that stopped
+            # mid-prompt, or mid-recompute after preemption, sampled a row predicting a token
+            # the request already has.
+            if request.num_computed_tokens == len(request) and token is not None:
                 request.output_token_ids.append(token)
 
         finished = [request for request in self.running if request.is_done()]
