@@ -217,6 +217,18 @@ def test_a_chunked_recompute_takes_no_token_until_it_catches_up():
     assert second.tokens_for(request) == 3 and request.output_token_ids == [11, 12, 13, 14]
 
 
+def test_admission_records_the_prompt_tokens_the_prefix_cache_served():
+    scheduler = Scheduler(SchedulerConfig(), BlockManager(PagedKvPool(1, 64, 16, 1, 1), True))
+    first, second = make(40, max_tokens=1), make(40)
+    scheduler.add(first)
+    scheduler.commit(scheduler.schedule(), [99])  # finishes, caching its two full pages
+    scheduler.add(second)
+    scheduler.schedule()
+
+    assert first.num_cached_tokens == 0
+    assert second.num_cached_tokens == 32
+
+
 def test_admission_waits_rather_than_preempting_for_a_new_request():
     """Memory pressure preempts for a request already in flight, and merely postpones one
     that has not started: a queued request holds nothing."""

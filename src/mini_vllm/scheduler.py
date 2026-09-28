@@ -41,6 +41,7 @@ class Request:
     # A draft's guesses, awaiting verification: attended over, but not yet output.
     proposed_token_ids: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
+    num_cached_tokens: int = 0  # prompt tokens the prefix cache served when it was admitted
     status: RequestStatus = RequestStatus.WAITING
     block_table: BlockTable | None = None
 
@@ -224,7 +225,7 @@ class Scheduler:
         while self.waiting and len(self.running) < self.config.max_sequences:
             candidate = self.waiting[0]
             # Before the prefill is sized, so only the uncached part is scheduled.
-            self.manager.apply_prefix_cache(candidate)
+            cached = self.manager.apply_prefix_cache(candidate)
             count = self._tokens_for(candidate, budget)
             if count == 0 and not output.scheduled:
                 # Chunking off and nothing else running: it overruns the budget rather
@@ -240,6 +241,7 @@ class Scheduler:
                 break
 
             self.waiting.popleft()
+            candidate.num_cached_tokens = cached
             candidate.status = RequestStatus.RUNNING
             self.running.append(candidate)
             self._schedule(output, candidate, count, promised)
