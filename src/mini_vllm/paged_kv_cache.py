@@ -143,12 +143,26 @@ class PagedKvPool:
         self.keys = [mx.zeros(shape, dtype=storage) for _ in range(num_layers)]
         self.values = [mx.zeros(shape, dtype=storage) for _ in range(num_layers)]
 
-    def write(self, layer: int, slot_mapping: mx.array, key: mx.array, value: mx.array) -> None:
+    def write(
+        self, layer: int, slot_mapping: mx.array, key: mx.array, value: mx.array, use_metal: bool = False
+    ) -> None:
         """Scatter key/value [T, H_k, D] into the slots slot_mapping names.
 
         MLX donates the pool's buffer to the scatter when nothing else holds it, so this
-        costs the T slots written, not a copy of the pool.
+        costs the T slots written, not a copy of the pool. The Metal kernels write in place
+        by construction, quantizing to fp8 in the same pass.
         """
+        if use_metal:
+            import mini_vllm_ext
+
+            if self.fp8:
+                scatter = mini_vllm_ext.kv_quantize_scatter
+                self.keys[layer] = scatter(self.keys[layer], slot_mapping, key, self.k_scale)
+                self.values[layer] = scatter(self.values[layer], slot_mapping, value, self.v_scale)
+            else:
+                self.keys[layer] = mini_vllm_ext.paged_cache_update(self.keys[layer], slot_mapping, key)
+                self.values[layer] = mini_vllm_ext.paged_cache_update(self.values[layer], slot_mapping, value)
+            return
         if self.fp8:
             key, value = quantize_fp8(key, self.k_scale), quantize_fp8(value, self.v_scale)
         self.keys[layer][slot_mapping] = key.astype(self.keys[layer].dtype)
@@ -181,11 +195,11 @@ class PagedKvCache:
         self.layer = layer
         self.batch = batch
 
-    def attend(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
+    def attend(self, q: mx.array, k: mx.array, v: mx.array, use_metal: bool = False) -> mx.array:
         """Write this batch's keys and values into their slots, then attend each sequence
         over its own pages."""
         pool, batch = self.pool, self.batch
-        pool.write(self.layer, batch.slot_mapping, k[0].swapaxes(0, 1), v[0].swapaxes(0, 1))
+        pool.write(self.layer, batch.slot_mapping, k[0].swapaxes(0, 1), v[0].swapaxes(0, 1), use_metal)
         key_pages, value_pages = pool.pages(self.layer)
         out = paged_attention(
             q[0].swapaxes(0, 1),
@@ -196,6 +210,7 @@ class PagedKvCache:
             batch.context_lens,
             k_scale=pool.k_scale,
             v_scale=pool.v_scale,
+            use_metal=use_metal,
         )
         return out.swapaxes(0, 1)[None]
 

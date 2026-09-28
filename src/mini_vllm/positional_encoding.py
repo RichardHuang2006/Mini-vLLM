@@ -16,7 +16,10 @@ def rotate_half(x: mx.array) -> mx.array:
 class RoPE:
     """Rotate x [B, L, H, D] by the angles at positions [B, L] or [L]."""
 
-    def __init__(self, head_dim: int, max_seq_len: int, theta: float = 1_000_000.0) -> None:
+    def __init__(
+        self, head_dim: int, max_seq_len: int, theta: float = 1_000_000.0, use_metal: bool = False
+    ) -> None:
+        self.use_metal = use_metal
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.theta = theta
@@ -36,6 +39,12 @@ class RoPE:
         self.sin = mx.sin(angles)
 
     def __call__(self, x: mx.array, positions: mx.array) -> mx.array:
+        if self.use_metal:
+            import mini_vllm_ext
+
+            # The same fp32 tables, gathered in the kernel.
+            return mini_vllm_ext.rope(x, positions, self.cos, self.sin)
+
         # The head axis is inserted so one table row applies to every head of its token.
         cos = mx.expand_dims(self.cos[positions], -2)
         sin = mx.expand_dims(self.sin[positions], -2)

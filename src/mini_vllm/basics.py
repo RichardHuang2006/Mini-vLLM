@@ -29,6 +29,10 @@ def silu(x: mx.array) -> mx.array:
     return x * mx.sigmoid(x)
 
 
-def swiglu(gate: mx.array, up: mx.array) -> mx.array:
+def swiglu(gate: mx.array, up: mx.array, use_metal: bool = False) -> mx.array:
     """silu(gate) * up: the MLP's two up-projections merged before the down-projection."""
+    if use_metal:
+        import mini_vllm_ext
+
+        return mini_vllm_ext.swiglu(gate, up)
     return silu(gate) * up

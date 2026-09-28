@@ -4,7 +4,7 @@ commits and rolls back exactly, and greedy speculation changes no token."""
 import mlx.core as mx
 import pytest
 from test_engine import PROMPTS, assert_nothing_held, engine
-from utils import assert_allclose
+from utils import assert_allclose, requires_metal
 
 from mini_vllm.generate import generate_with_kv_cache
 from mini_vllm.paged_kv_cache import BlockManager, PagedKvPool
@@ -206,3 +206,15 @@ def test_sampled_speculation_replays_under_a_seed_and_leaks_nothing(tiny_qwen3):
         assert_nothing_held(llm)
     assert runs[0] == runs[1]
     assert all(len(tokens) == 8 and max(tokens) < 512 for tokens in runs[0])
+
+
+@requires_metal
+def test_greedy_speculation_on_the_kernels_changes_no_token(tiny_qwen3):
+    from mini_vllm.models import from_mlx
+
+    llm = engine(tiny_qwen3, use_metal=True, num_speculative_tokens=3, num_draft_layers=1, num_blocks=14,
+                 max_batched_tokens=16)
+    pure = from_mlx(tiny_qwen3)
+    for prompt, completion in zip(PROMPTS, llm.generate(PROMPTS, max_tokens=8), strict=True):
+        assert completion.token_ids == generate_with_kv_cache(pure, prompt, 8)
+    assert_nothing_held(llm)

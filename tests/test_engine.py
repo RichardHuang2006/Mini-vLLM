@@ -3,6 +3,7 @@ batch API, prefix caching, parallel sampling, stop tokens, and cleanup."""
 
 import mlx.core as mx
 import pytest
+from utils import with_and_without_metal
 
 from mini_vllm.engine import LLM, EngineConfig
 from mini_vllm.generate import generate_with_kv_cache
@@ -23,10 +24,10 @@ class LetterTokenizer:
         return "".join(chr(ord("a") + i % 26) for i in ids)
 
 
-def engine(tiny_qwen3, eos_token_ids=(), **config) -> LLM:
+def engine(tiny_qwen3, eos_token_ids=(), use_metal=False, **config) -> LLM:
     config.setdefault("num_blocks", 64)
     config.setdefault("block_size", 4)
-    return LLM(from_mlx(tiny_qwen3), LetterTokenizer(eos_token_ids), EngineConfig(**config))
+    return LLM(from_mlx(tiny_qwen3, use_metal), LetterTokenizer(eos_token_ids), EngineConfig(**config))
 
 
 def assert_nothing_held(llm: LLM) -> None:
@@ -47,12 +48,15 @@ PROMPTS = [[1, 2, 3], [5], [7] * 9, [2, 4], [9, 8, 7, 6, 5], [1], list(range(30,
         {"num_blocks": 14, "max_batched_tokens": 16},
     ],
 )
-def test_every_request_matches_running_it_alone(tiny_qwen3, config):
-    llm = engine(tiny_qwen3, **config)
+@with_and_without_metal
+def test_every_request_matches_running_it_alone(tiny_qwen3, config, use_metal):
+    llm = engine(tiny_qwen3, use_metal=use_metal, **config)
     completions = llm.generate(PROMPTS, max_tokens=8)
 
+    # Against the dense loop on the pure-MLX model, so the kernels are checked too.
+    pure = from_mlx(tiny_qwen3)
     for prompt, completion in zip(PROMPTS, completions, strict=True):
-        assert completion.token_ids == generate_with_kv_cache(llm.model, prompt, 8)
+        assert completion.token_ids == generate_with_kv_cache(pure, prompt, 8)
         assert completion.finish_reason == "length"
     # A continuation that repeats one token would match whatever the history held.
     assert sum(len(set(c.token_ids)) for c in completions) > 3 * len(PROMPTS), "degenerate outputs"
@@ -155,11 +159,15 @@ def test_abandoning_a_stream_releases_everything(tiny_qwen3):
     assert_nothing_held(llm)
 
 
-def test_an_fp8_kv_cache_serves_to_completion(tiny_qwen3):
-    llm = engine(tiny_qwen3, fp8_kv_cache=True)
+@with_and_without_metal
+def test_an_fp8_kv_cache_serves_to_completion(tiny_qwen3, use_metal):
+    llm = engine(tiny_qwen3, fp8_kv_cache=True, use_metal=use_metal)
     assert llm.kv.keys[0].dtype == mx.uint8
     completions = llm.generate(PROMPTS, max_tokens=8)
     assert all(len(c.token_ids) == 8 for c in completions)
+    # The kernels quantize the same bytes and dequantize in fp32, as this fp32 model's oracle does.
+    pure = engine(tiny_qwen3, fp8_kv_cache=True).generate(PROMPTS, max_tokens=8)
+    assert [c.token_ids for c in completions] == [c.token_ids for c in pure]
     assert_nothing_held(llm)
 
 

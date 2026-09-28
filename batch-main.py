@@ -26,10 +26,12 @@ parser.add_argument("--max-tokens", type=int, default=128)
 parser.add_argument("--num-blocks", type=int, default=2048, help="KV pages of 16 tokens")
 parser.add_argument("--prefix-caching", action="store_true")
 parser.add_argument("--fp8-kv-cache", action="store_true")
+parser.add_argument("--metal", action="store_true", help="run on the Metal kernels in src/extensions/")
 args = parser.parse_args()
 
 llm = LLM.from_pretrained(
     args.model,
+    use_metal=args.metal,
     num_blocks=args.num_blocks,
     max_sequences=args.concurrency,
     enable_prefix_caching=args.prefix_caching,

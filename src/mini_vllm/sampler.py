@@ -90,6 +90,11 @@ def sample(
     key: mx.array | None = None,
 ) -> mx.array:
     """Draw one token per row: logits [B, V] -> int32 tokens [B]; greedy rows are exact."""
+    # All greedy, the default: each row's argmax, with no sort over the vocabulary. The
+    # distribution below would be one-hot at that same argmax, at ~50x the cost.
+    rows = [params] if isinstance(params, SamplingParams) else params
+    if all(row.is_greedy for row in rows):
+        return mx.argmax(logits, axis=-1).astype(mx.int32)
     probabilities = sampling_probabilities(logits, params)
     # log(0) = -inf, so truncated tokens and the zeros of a greedy one-hot are never drawn.
     return mx.random.categorical(mx.log(probabilities), axis=-1, key=key).astype(mx.int32)

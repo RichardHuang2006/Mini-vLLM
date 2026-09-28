@@ -10,12 +10,18 @@ __all__ = ["RMSNorm"]
 class RMSNorm:
     """x * rsqrt(mean(x^2) + eps) * weight over the last axis, reduced in fp32."""
 
-    def __init__(self, dim: int, weight: mx.array, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int, weight: mx.array, eps: float = 1e-6, use_metal: bool = False) -> None:
         self.dim = dim
         self.weight = weight
         self.eps = eps
+        self.use_metal = use_metal
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.use_metal:
+            import mini_vllm_ext
+
+            return mini_vllm_ext.rms_norm(x, self.weight, self.eps)
+
         input_dtype = x.dtype
 
         x32 = x.astype(mx.float32)

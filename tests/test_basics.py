@@ -3,7 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from utils import DTYPES, assert_allclose
+from utils import DTYPES, assert_allclose, requires_metal
 
 from mini_vllm.basics import linear, silu, softmax, swiglu
 
@@ -40,3 +40,13 @@ def test_softmax_is_stable_at_large_logits():
 
     assert not mx.any(mx.isnan(out)).item()
     assert_allclose(out, mx.softmax(x, axis=-1, precise=True))
+
+
+@requires_metal
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_the_swiglu_kernel_matches_the_oracle(dtype):
+    gate = (4 * mx.random.normal((5, 3072))).astype(dtype)
+    up = mx.random.normal((5, 3072)).astype(dtype)
+    assert_allclose(swiglu(gate, up, use_metal=True), swiglu(gate, up))
+    # A transposed view is made contiguous before the kernel reads it.
+    assert_allclose(swiglu(gate.T, up.T, use_metal=True), swiglu(gate.T, up.T))

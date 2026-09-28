@@ -27,3 +27,5 @@ allowed-confusables = ["−"]
 # The package re-exports each module's __all__ with star imports, as tiny-llm does.
 [lint.per-file-ignores]
 "src/mini_vllm/__init__.py" = ["F403"]
+# The extension package re-exports every kernel the compiled _ext module defines.
+"src/extensions/mini_vllm_ext/__init__.py" = ["F403", "F405"]

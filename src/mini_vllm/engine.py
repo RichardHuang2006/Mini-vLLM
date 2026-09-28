@@ -131,7 +131,7 @@ class LLM:
         """The draft and the pool of its own it caches in: as many layers as the draft has."""
         config = self.config
         if config.draft_model is not None:
-            draft = load(config.draft_model)[0]
+            draft = load(config.draft_model, self.model.layers[0].attention.use_metal)[0]
         else:
             draft = self_draft(self.model, config.num_draft_layers or self.model.config.num_hidden_layers)
         k = config.num_speculative_tokens
@@ -151,8 +151,9 @@ class LLM:
         return SpeculativeDecoder(DraftProposer(draft, kv, k), self.manager)
 
     @classmethod
-    def from_pretrained(cls, model: str = DEFAULT_MODEL, **config: Any) -> LLM:
-        qwen3, tokenizer = load(model)
+    def from_pretrained(cls, model: str = DEFAULT_MODEL, use_metal: bool = False, **config: Any) -> LLM:
+        """use_metal runs every operator with a kernel on src/extensions/, which must be built."""
+        qwen3, tokenizer = load(model, use_metal)
         return cls(qwen3, tokenizer, EngineConfig(**config))
 
     def add_request(

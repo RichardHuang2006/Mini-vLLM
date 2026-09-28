@@ -4,7 +4,7 @@ import math
 
 import mlx.core as mx
 import pytest
-from utils import DTYPES, assert_allclose
+from utils import DTYPES, assert_allclose, requires_metal
 
 from mini_vllm.positional_encoding import RoPE
 
@@ -69,3 +69,16 @@ def test_positions_are_explicit_not_assumed():
     out = rope(x, mx.array(positions))
     for i, position in enumerate(positions):
         assert_allclose(out[:, i : i + 1], fast_rope(x[:, i : i + 1], position))
+
+
+@requires_metal
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("per_row", [False, True])
+def test_the_rope_kernel_matches_the_oracle(dtype, per_row):
+    """The kernel gathers the same fp32 tables, so even far positions agree to rounding."""
+    rope = RoPE(head_dim=128, max_seq_len=40_000, theta=THETA)
+    metal = RoPE(head_dim=128, max_seq_len=40_000, theta=THETA, use_metal=True)
+    x = mx.random.normal((2, 7, 4, 128)).astype(dtype)
+    far = mx.array([[39_000 + 3 * i + b for i in range(7)] for b in range(2)])
+    positions = far if per_row else mx.arange(5, 12)
+    assert_allclose(metal(x, positions), rope(x, positions))

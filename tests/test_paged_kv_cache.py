@@ -3,7 +3,7 @@ and attention through the pool against a dense cache."""
 
 import mlx.core as mx
 import pytest
-from utils import assert_allclose
+from utils import assert_allclose, requires_metal, with_and_without_metal
 
 from mini_vllm.attention import scaled_dot_product_attention_grouped
 from mini_vllm.batch import ForwardBatch
@@ -337,14 +337,14 @@ def nan_manager(num_blocks=16, block_size=4) -> BlockManager:
     return manager
 
 
-def attend(manager: BlockManager, scheduled, q, k, v) -> mx.array:
+def attend(manager: BlockManager, scheduled, q, k, v, use_metal=False) -> mx.array:
     """Allocate, build the batch, and attend through layer 0 on [T, H, D] inputs."""
     for r, count in scheduled:
         manager.allocate(r, count)
     batch = ForwardBatch.from_scheduled(scheduled, manager)
     cache = PagedKvCache(manager.kv, 0, batch)
     as_row = lambda x: x.swapaxes(0, 1)[None]  # noqa: E731
-    out = cache.attend(as_row(q), as_row(k), as_row(v))
+    out = cache.attend(as_row(q), as_row(k), as_row(v), use_metal)
     for r, count in scheduled:
         r.num_computed_tokens += count
     return out[0].swapaxes(0, 1)
@@ -366,10 +366,11 @@ def qkv(length):
     )
 
 
-def test_attending_through_the_pool_matches_a_dense_cache():
+@with_and_without_metal
+def test_attending_through_the_pool_matches_a_dense_cache(use_metal):
     manager = nan_manager()
     q, k, v = qkv(10)
-    assert_allclose(attend(manager, [(request(range(10)), 10)], q, k, v), dense(q, k, v))
+    assert_allclose(attend(manager, [(request(range(10)), 10)], q, k, v, use_metal), dense(q, k, v))
 
 
 def test_a_shuffled_block_table_changes_nothing():
@@ -387,7 +388,8 @@ def test_a_shuffled_block_table_changes_nothing():
     assert_allclose(attend(manager, [(r, 12)], q, k, v), dense(q, k, v))
 
 
-def test_a_mixed_batch_matches_each_sequence_alone():
+@with_and_without_metal
+def test_a_mixed_batch_matches_each_sequence_alone(use_metal):
     """Two decodes beside a fresh prefill in one call: the shape the paged kernel serves.
     Block size 4 against lengths 7 and 5, so both decodes land mid-page."""
     manager = nan_manager()
@@ -395,14 +397,14 @@ def test_a_mixed_batch_matches_each_sequence_alone():
     history = {}
     for r in old:
         q, k, v = qkv(len(r))
-        attend(manager, [(r, len(r))], q, k, v)
+        attend(manager, [(r, len(r))], q, k, v, use_metal)
         history[r.request_id] = (k, v)
         r.output_token_ids.append(9)
 
     fresh = request(range(6))
     scheduled = [(old[0], 1), (old[1], 1), (fresh, 6)]
     q, k, v = qkv(8)
-    together = attend(manager, scheduled, q, k, v)
+    together = attend(manager, scheduled, q, k, v, use_metal)
 
     rows = {old[0].request_id: slice(0, 1), old[1].request_id: slice(1, 2), fresh.request_id: slice(2, 8)}
     for r, _ in scheduled:
@@ -410,3 +412,26 @@ def test_a_mixed_batch_matches_each_sequence_alone():
         past_k, past_v = history.get(r.request_id, (k[:0], v[:0]))
         expected = dense(q[mine], mx.concatenate([past_k, k[mine]]), mx.concatenate([past_v, v[mine]]))
         assert_allclose(together[mine], expected)
+
+
+@requires_metal
+@pytest.mark.parametrize("fp8", [False, True])
+def test_the_metal_write_is_the_pure_write_in_place(fp8):
+    """Both pools start from the same random contents, so a slot the kernel should not have
+    touched would show. fp8 pages must match to the bit: the kernel quantizes as mx.to_fp8 does."""
+    scales = {"k_scale": 0.5, "v_scale": 0.25}
+    pools = [PagedKvPool(2, 8, 4, 2, 8, dtype=mx.bfloat16, fp8=fp8, **scales) for _ in range(2)]
+    start = mx.random.randint(0, 255, pools[0].keys[0].shape).astype(pools[0].keys[0].dtype)
+    for pool in pools:
+        pool.keys = [start + 0 for _ in pool.keys]
+        pool.values = [start + 1 for _ in pool.values]
+
+    slots = mx.array([5, 17, 3, 30], dtype=mx.int32)
+    key = mx.random.normal((4, 2, 8)).astype(mx.bfloat16)
+    value = mx.random.normal((4, 2, 8)).astype(mx.bfloat16)
+    pools[0].write(1, slots, key, value)
+    pools[1].write(1, slots, key, value, use_metal=True)
+
+    for layer in range(2):
+        assert mx.array_equal(pools[1].keys[layer], pools[0].keys[layer]).item()
+        assert mx.array_equal(pools[1].values[layer], pools[0].values[layer]).item()

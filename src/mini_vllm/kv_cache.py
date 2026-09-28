@@ -27,8 +27,8 @@ class KvFullCache:
         self.offset += key.shape[-2]
         return self.keys, self.values
 
-    def attend(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
+    def attend(self, q: mx.array, k: mx.array, v: mx.array, use_metal: bool = False) -> mx.array:
         """Append this step's keys and values, then attend causally over the whole history.
         With S > L, the causal mask's S - L offset lines the new tokens up after it."""
         keys, values = self.update_and_fetch(k, v)
-        return scaled_dot_product_attention_grouped(q, keys, values, mask="causal")
+        return scaled_dot_product_attention_grouped(q, keys, values, mask="causal", use_metal=use_metal)

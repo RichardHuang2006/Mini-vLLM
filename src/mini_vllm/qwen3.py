@@ -55,7 +55,9 @@ class Qwen3MultiHeadAttention:
         q_norm: RMSNorm,
         k_norm: RMSNorm,
         rope: RoPE,
+        use_metal: bool = False,
     ) -> None:
+        self.use_metal = use_metal
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
@@ -78,20 +80,22 @@ class Qwen3MultiHeadAttention:
         # The cache writes this step's k and v and attends over everything it holds: a dense
         # history, or each ragged sequence's own pages. Without one, the tokens see only each other.
         if cache is None:
-            out = scaled_dot_product_attention_grouped(q, k, v, mask="causal")
+            out = scaled_dot_product_attention_grouped(q, k, v, mask="causal", use_metal=self.use_metal)
         else:
-            out = cache.attend(q, k, v)
+            out = cache.attend(q, k, v, self.use_metal)
         return linear(out.swapaxes(1, 2).reshape(batch, length, -1), self.wo)
 
 
 class Qwen3MLP:
     """down(silu(gate(x)) * up(x))."""
 
-    def __init__(self, w_gate: mx.array, w_up: mx.array, w_down: mx.array) -> None:
+    def __init__(self, w_gate: mx.array, w_up: mx.array, w_down: mx.array, use_metal: bool = False) -> None:
         self.w_gate, self.w_up, self.w_down = w_gate, w_up, w_down
+        self.use_metal = use_metal
 
     def __call__(self, x: mx.array) -> mx.array:
-        return linear(swiglu(linear(x, self.w_gate), linear(x, self.w_up)), self.w_down)
+        gate, up = linear(x, self.w_gate), linear(x, self.w_up)
+        return linear(swiglu(gate, up, self.use_metal), self.w_down)
 
 
 class Qwen3TransformerBlock:
