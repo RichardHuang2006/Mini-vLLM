@@ -27,8 +27,8 @@ _next_request_id = itertools.count()
 class Request:
     """A request in flight: its tokens, how many of them the KV cache holds, its pages.
 
-    token_ids is prompt + output, and num_computed_tokens says how much of it is cached;
-    the difference is what the next iteration can compute.
+    token_ids is prompt + output + unverified proposals, and num_computed_tokens says how
+    much of it is cached; the difference is what the next iteration can compute.
     """
 
     prompt_token_ids: list[int]
@@ -38,16 +38,18 @@ class Request:
     request_id: int = field(default_factory=lambda: next(_next_request_id))
 
     output_token_ids: list[int] = field(default_factory=list)
+    # A draft's guesses, awaiting verification: attended over, but not yet output.
+    proposed_token_ids: list[int] = field(default_factory=list)
     num_computed_tokens: int = 0
     status: RequestStatus = RequestStatus.WAITING
     block_table: BlockTable | None = None
 
     @property
     def token_ids(self) -> list[int]:
-        return self.prompt_token_ids + self.output_token_ids
+        return self.prompt_token_ids + self.output_token_ids + self.proposed_token_ids
 
     def __len__(self) -> int:
-        return len(self.prompt_token_ids) + len(self.output_token_ids)
+        return len(self.prompt_token_ids) + len(self.output_token_ids) + len(self.proposed_token_ids)
 
     @property
     def num_uncomputed_tokens(self) -> int:
@@ -61,6 +63,25 @@ class Request:
         if len(self.output_token_ids) >= self.max_tokens:
             return True
         return bool(self.output_token_ids) and self.output_token_ids[-1] in self.stop_token_ids
+
+    def accept(self, tokens: list[int], num_accepted: int) -> int:
+        """Commit a verified step: the accepted proposals, then the token the target drew
+        after them, stopping early if one of them finishes the request. Returns how many
+        of this step's slots to give back.
+
+        The pass computed the pending token and every proposal; what stays cached is the
+        pending token and the proposals that were both accepted and kept.
+        """
+        num_proposed = len(self.proposed_token_ids)
+        self.proposed_token_ids = []
+        kept = 0
+        for index, token in enumerate(tokens):
+            self.output_token_ids.append(token)
+            kept += index < num_accepted
+            if self.is_done():
+                break
+        self.num_computed_tokens += 1 + kept
+        return num_proposed - kept
 
 
 @dataclass(frozen=True)
@@ -138,11 +159,19 @@ class Scheduler:
             self.manager.allocate(request, count)
         return output
 
-    def commit(self, output: SchedulerOutput, tokens: list[int] | None = None) -> list[Request]:
-        """Record an iteration: tokens holds one sampled token per scheduled request.
-        Returns the requests that finished, whose blocks are already freed."""
+    def commit(
+        self,
+        output: SchedulerOutput,
+        tokens: list[int] | None = None,
+        verified: frozenset[int] | set[int] = frozenset(),
+    ) -> list[Request]:
+        """Record an iteration: tokens holds one sampled token per scheduled request, and
+        verified names the requests speculative decoding already committed through
+        Request.accept. Returns the requests that finished, whose blocks are already freed."""
         tokens = tokens or [None] * len(output.scheduled)
         for (request, count), token in zip(output.scheduled, tokens, strict=True):
+            if request.request_id in verified:
+                continue
             request.num_computed_tokens += count
             # Only a request whose every token is now computed takes one. A chunk that stopped
             # mid-prompt, or mid-recompute after preemption, sampled a row predicting a token
@@ -161,6 +190,8 @@ class Scheduler:
         """Evict a running request: its pages go back now, and it is requeued at the front
         to be recomputed over its prompt and its output so far."""
         self.running.remove(request)
+        # Proposals were drafted for the context it is about to lose.
+        request.proposed_token_ids = []
         self.manager.free(request)
         request.num_computed_tokens = 0
         request.status = RequestStatus.WAITING
@@ -254,6 +285,7 @@ class Scheduler:
     def _tokens_for(self, request: Request, budget: int) -> int:
         """How many of this request's tokens fit in what is left of the budget."""
         wanted = request.num_uncomputed_tokens
-        if not self.config.enable_chunked_prefill:
+        # A speculative group is atomic: the verifier reads its k + 1 rows together.
+        if request.proposed_token_ids or not self.config.enable_chunked_prefill:
             return wanted if wanted <= budget else 0
         return min(wanted, self.config.chunk_size, max(budget, 0))

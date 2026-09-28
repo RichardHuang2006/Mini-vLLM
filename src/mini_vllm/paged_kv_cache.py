@@ -259,6 +259,17 @@ class BlockManager:
         request.num_computed_tokens = reused
         return reused
 
+    def trim(self, request: Request, num_tokens: int) -> int:
+        """Give back the last num_tokens slots, a rejected speculative tail, returning how
+        many blocks that freed."""
+        table = request.block_table
+        table.num_tokens -= num_tokens
+        blocks_used = -(-table.num_tokens // self.block_size)
+        released = 0
+        while len(table.block_ids) > blocks_used:
+            released += self.pool.decref(table.block_ids.pop())
+        return released
+
     def fork(self, parent: Request, child: Request) -> None:
         """Point child at every one of parent's blocks, copying nothing."""
         for block_id in parent.block_table.block_ids:

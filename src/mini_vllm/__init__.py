@@ -16,3 +16,4 @@ from .quantize import *
 from .qwen3 import *
 from .sampler import *
 from .scheduler import *
+from .speculative import *

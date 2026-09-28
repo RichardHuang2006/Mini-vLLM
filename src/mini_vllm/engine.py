@@ -16,6 +16,7 @@ from mini_vllm.paged_kv_cache import BlockManager, PagedKvPool
 from mini_vllm.qwen3 import Qwen3Model
 from mini_vllm.sampler import SamplingParams, sample
 from mini_vllm.scheduler import Request, RequestStatus, Scheduler, SchedulerConfig, SchedulerOutput
+from mini_vllm.speculative import DraftProposer, SpeculativeDecoder, self_draft
 
 __all__ = ["LLM", "Completion", "EngineConfig", "StreamUpdate", "blocks_that_fit"]
 
@@ -37,6 +38,12 @@ class EngineConfig:
     chunk_size: int = 512
     enable_chunked_prefill: bool = True
     prefill_priority: bool = False
+
+    # Speculative decoding: k > 0 drafts k tokens per decode step for the target to verify.
+    num_speculative_tokens: int = 0
+    draft_model: str | None = None        # a separate checkpoint sharing the tokenizer, or
+    num_draft_layers: int | None = None   # None: a self-draft of the target's first N layers
+    draft_blocks: int | None = None       # None: the target's pool plus room for k per request
 
     seed: int | None = None  # seeds MLX's global RNG; greedy decoding is deterministic anyway
 
@@ -115,9 +122,33 @@ class LLM:
         mx.eval(self.kv.keys, self.kv.values)  # take the whole pool now, not on the first write
         self.manager = BlockManager(self.kv, config.enable_prefix_caching)
         self.scheduler = Scheduler(config.scheduler_config(), self.manager)
+        self.spec = self._build_speculation() if config.num_speculative_tokens else None
 
         if config.seed is not None:
             mx.random.seed(config.seed)
+
+    def _build_speculation(self) -> SpeculativeDecoder:
+        """The draft and the pool of its own it caches in: as many layers as the draft has."""
+        config = self.config
+        if config.draft_model is not None:
+            draft = load(config.draft_model)[0]
+        else:
+            draft = self_draft(self.model, config.num_draft_layers or self.model.config.num_hidden_layers)
+        k = config.num_speculative_tokens
+        # It caches every target token plus k proposals, for every request in flight.
+        per_request = -(-k // config.block_size) + 1
+        dc = draft.config
+        kv = PagedKvPool(
+            dc.num_hidden_layers,
+            config.draft_blocks or self.kv.num_blocks + config.max_sequences * per_request,
+            config.block_size,
+            dc.num_key_value_heads,
+            dc.head_dim,
+            dtype=draft.embedding.weight.dtype,
+            fp8=config.fp8_kv_cache,
+        )
+        mx.eval(kv.keys, kv.values)
+        return SpeculativeDecoder(DraftProposer(draft, kv, k), self.manager)
 
     @classmethod
     def from_pretrained(cls, model: str = DEFAULT_MODEL, **config: Any) -> LLM:
@@ -144,12 +175,32 @@ class LLM:
 
     def step(self) -> tuple[list[tuple[Request, int]], list[tuple[Request, Request]]]:
         """One iteration for everything in flight. Returns the (request, token) pairs it
-        emitted and the (leader, branch) pairs parallel sampling forked."""
+        emitted, in order, and the (leader, branch) pairs parallel sampling forked."""
+        # Proposals come first: they lengthen a request, and schedule() reserves their slots.
+        decoding = []
+        if self.spec is not None:
+            running = self.scheduler.running
+            decoding = [r for r in running if r.output_token_ids and r.num_uncomputed_tokens == 1]
+            self.spec.propose(decoding)
         output = self.scheduler.schedule()
+        scheduled = {request.request_id for request in output.requests}
+        for request in decoding:
+            if request.request_id not in scheduled:
+                self.spec.discard(request)
+
+        # A speculated request needs logits for every row it computed, to verify each
+        # proposal; everything else needs only its last row.
+        rows, spans, start = [], [], 0
+        for request, count in output.scheduled:
+            first = len(rows)
+            rows.extend(range(start, start + count) if request.proposed_token_ids else [start + count - 1])
+            spans.append(slice(first, len(rows)))
+            start += count
         batch = ForwardBatch.from_scheduled(output.scheduled, self.manager)
         caches = self.kv.caches(batch)
-        logits = self.model(batch.input_ids[None], batch.positions, caches, rows=batch.last_rows)[0]
-        tokens = sample(logits, [request.sampling_params for request in output.requests])
+        logits = self.model(batch.input_ids[None], batch.positions, caches, rows=mx.array(rows))[0]
+        last = logits[mx.array([span.stop - 1 for span in spans])]
+        tokens = sample(last, [request.sampling_params for request in output.requests])
 
         # The one synchronization per step. The tokens are needed on the host anyway, and
         # evaluating every layer's pages with them ends this step's graph there: the next
@@ -159,13 +210,29 @@ class LLM:
         tokens = tokens.tolist()
 
         # Read before commit advances them: a request takes a token only once caught up.
-        emitting = [r for r, count in output.scheduled if r.num_computed_tokens + count == len(r)]
+        emitting = [
+            request
+            for request, count in output.scheduled
+            if request.num_computed_tokens + count == len(request) and not request.proposed_token_ids
+        ]
+        runs = {
+            request.request_id: self.spec.verify(request, logits[span])
+            for (request, _), span in zip(output.scheduled, spans, strict=True)
+            if request.proposed_token_ids
+        }
         # Before commit, which frees a leader that finishes on its first token.
-        forked = self._fork_after_prefill(output, logits)
-        self.scheduler.commit(output, tokens)
+        forked = self._fork_after_prefill(output, last)
+        finished = self.scheduler.commit(output, tokens, verified=runs.keys())
 
         emitted = [(request, request.output_token_ids[-1]) for request in emitting]
+        for request in output.requests:
+            emitted += [(request, token) for token in runs.get(request.request_id, [])]
         emitted += [(branch, branch.output_token_ids[-1]) for _, branch in forked]
+
+        # A preempted request recomputes, so its draft cache is released rather than repaired.
+        if self.spec is not None:
+            for request in finished + output.preempted:
+                self.spec.release(request)
         return emitted, forked
 
     def _fork_after_prefill(
@@ -213,7 +280,9 @@ class LLM:
         # (prompt index, sample index) for each request; a branch takes its leader's index.
         where = {leader.request_id: (index, 0) for index, leader in enumerate(leaders)}
         samples = [1] * len(leaders)
-        shown = {leader.request_id: 0 for leader in leaders}  # characters of text already yielded
+        # Per request: how many of its tokens, and how many characters of text, were yielded.
+        yielded = {leader.request_id: 0 for leader in leaders}
+        shown = {leader.request_id: 0 for leader in leaders}
         owned = list(leaders)
         try:
             while any(request.status is not RequestStatus.FINISHED for request in owned):
@@ -222,20 +291,24 @@ class LLM:
                     index = where[leader.request_id][0]
                     where[branch.request_id] = (index, samples[index])
                     samples[index] += 1
-                    shown[branch.request_id] = 0
+                    yielded[branch.request_id] = shown[branch.request_id] = 0
                     owned.append(branch)
 
                 for request, token in emitted:
                     if request.request_id not in where:
                         continue  # another caller's request, sharing the engine
                     index, sample_index = where[request.request_id]
-                    finished = request.status is RequestStatus.FINISHED
+                    # A speculative step emits a run of tokens at once; each update covers
+                    # the output up to its own token, and only the run's last can finish.
+                    yielded[request.request_id] += 1
+                    upto = request.output_token_ids[: yielded[request.request_id]]
+                    is_last = len(upto) == len(request.output_token_ids)
+                    finished = request.status is RequestStatus.FINISHED and is_last
                     stopped = token in request.stop_token_ids
-                    # Decode the whole output and yield what is new: a token is not a character,
+                    # Decode the output so far and yield what is new: a token is not a character,
                     # and a multi-byte character split across tokens decodes to U+FFFD until its
                     # last byte arrives. A stop token ends the text rather than appearing in it.
-                    visible = request.output_token_ids[:-1] if stopped else request.output_token_ids
-                    text = self.tokenizer.decode(visible)
+                    text = self.tokenizer.decode(upto[:-1] if stopped else upto)
                     delta = ""
                     if finished or not text.endswith("\ufffd"):
                         delta = text[shown[request.request_id] :]
@@ -251,6 +324,8 @@ class LLM:
                     else:
                         self.scheduler.waiting.remove(request)
                     self.manager.free(request)
+                if self.spec is not None:
+                    self.spec.release(request)
 
     def generate(
         self,
