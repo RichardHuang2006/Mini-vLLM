@@ -6,9 +6,12 @@ Qwen3-0.6B shapes in bf16.
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
-from utils import METAL_BUILT, evidence, per_call_us
+from matplotlib.figure import Figure
+from utils import METAL_BUILT, evidence, grouped_bars, per_call_us, save_plot
 
 from mini_vllm import PagedKvPool, RMSNorm, RoPE, paged_attention, swiglu
 from mini_vllm import scaled_dot_product_attention_grouped as sdpa
@@ -96,7 +99,8 @@ def cases() -> list[tuple[str, int, object, object, object | None]]:
 
 def main() -> None:
     mx.random.seed(0)
-    with evidence("Operators: Metal kernel vs pure MLX vs MLX's own"):
+    title = "Operators: Metal kernel vs pure MLX vs MLX's own"
+    with evidence(title):
         ceiling = normal(64 * 2**20)  # 128 MB: a copy's read + write is the bandwidth ceiling
         copy_us = per_call_us(lambda: ceiling * 1, calls=4)
         copy_gbps = 2 * ceiling.nbytes / copy_us / 1e3
@@ -104,6 +108,7 @@ def main() -> None:
 
         print("| op | pure | metal | speedup | metal GB/s | MLX's own |")
         print("|---|---|---|---|---|---|")
+        names, pure_times, metal_times, own_times = [], [], [], []
         for name, nbytes, pure, metal, own in cases():
             # A write case makes its own WRITES calls per graph; everything else is batched here.
             calls, per = (1, WRITES) if "write" in name else (50, 1)
@@ -114,8 +119,22 @@ def main() -> None:
                   + (f"{metal_us:.0f} µs | {pure_us / metal_us:.1f}x | {nbytes / metal_us / 1e3:.0f} | "
                      if metal_us else "— | — | — | ")
                   + (f"{own_us:.0f} µs |" if own_us else "— |"))
+            names.append(name)
+            pure_times.append(pure_us)
+            metal_times.append(metal_us if metal_us else math.nan)
+            own_times.append(own_us if own_us else math.nan)
         print("\nGB/s counts the bytes the op must move at least, so it is a floor on what it moved."
               " Per-call times batch 50 calls per mx.eval, so the per-eval launch cost is amortized.")
+
+        figure = Figure(figsize=(10, 8))
+        figure.suptitle(title)
+        axes = figure.subplots()
+        series = {"pure": pure_times, "metal": metal_times, "MLX's own": own_times}
+        grouped_bars(axes, names, series, horizontal=True)
+        axes.invert_yaxis()
+        axes.set_xscale("log")
+        axes.set_xlabel("µs per call (log)")
+        save_plot(figure, "bench_operators")
 
 
 if __name__ == "__main__":

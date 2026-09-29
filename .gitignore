@@ -14,7 +14,7 @@ dist/
 venv/
 
 # benchmark artifacts
-bench_results/
+results/
 *.ncu-rep
 *.nsys-rep
 

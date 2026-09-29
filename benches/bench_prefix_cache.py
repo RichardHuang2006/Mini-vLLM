@@ -11,7 +11,8 @@ import argparse
 import statistics
 import time
 
-from utils import engine, evidence, load_mlx_lm, random_prompts
+from matplotlib.figure import Figure
+from utils import engine, evidence, load_mlx_lm, random_prompts, save_plot
 
 from mini_vllm import DEFAULT_MODEL, LLM, RequestStatus
 
@@ -38,8 +39,9 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=32)
     args = parser.parse_args()
 
-    with evidence(f"Prefix caching: {args.requests} requests, one after another, behind a shared "
-                  f"{args.preamble_len}-token preamble, {'metal' if args.metal else 'pure'}"):
+    title = (f"Prefix caching: {args.requests} requests, one after another, behind a shared "
+             f"{args.preamble_len}-token preamble, {'metal' if args.metal else 'pure'}")
+    with evidence(title):
         mlx_model, tokenizer = load_mlx_lm(args.model)
         vocab = len(tokenizer.vocab)
         preamble = random_prompts(1, [args.preamble_len], vocab)[0]
@@ -49,14 +51,28 @@ def main() -> None:
         print("| prefix caching | first request TTFT | later requests' mean TTFT | prompt tokens from cache "
               "| total |")
         print("|---|---|---|---|---|")
+        ttfts_by_setting = {}
         for enabled in (False, True):
             llm = engine(mlx_model, tokenizer, args.metal, num_blocks=1024, enable_prefix_caching=enabled)
             start = time.perf_counter()
             ttfts, cached = zip(*(run_alone(llm, prompt, args.max_tokens) for prompt in prompts), strict=True)
             total = time.perf_counter() - start
+            ttfts_by_setting["on" if enabled else "off"] = ttfts
             print(f"| {'on' if enabled else 'off'} | {ttfts[0] * 1e3:.0f} ms | "
                   f"{statistics.mean(ttfts[1:]) * 1e3:.0f} ms | {sum(cached):,} of "
                   f"{sum(map(len, prompts)):,} | {total:.2f} s |")
+
+        figure = Figure(figsize=(9, 4))
+        figure.suptitle(title)
+        axes = figure.subplots()
+        numbers = range(1, args.requests + 1)
+        for setting, ttfts in ttfts_by_setting.items():
+            axes.plot(numbers, [ttft * 1e3 for ttft in ttfts], marker="o", label=f"prefix caching {setting}")
+        axes.set_xticks(numbers)
+        axes.set_xlabel("request")
+        axes.set_ylabel("TTFT (ms)")
+        axes.legend()
+        save_plot(figure, "bench_prefix_cache")
 
 
 if __name__ == "__main__":

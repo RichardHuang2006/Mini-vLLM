@@ -10,7 +10,8 @@ import argparse
 import time
 
 import mlx_lm
-from utils import engine, evidence, load_mlx_lm, random_prompts, variants
+from matplotlib.figure import Figure
+from utils import engine, evidence, load_mlx_lm, random_prompts, save_plot, variants
 
 from mini_vllm import DEFAULT_MODEL
 
@@ -23,8 +24,9 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=128)
     args = parser.parse_args()
 
-    with evidence(f"Throughput: 2 x concurrency requests, prompts of {args.prompt_lens} tokens, "
-                  f"{args.max_tokens} output tokens each"):
+    title = (f"Throughput: 2 x concurrency requests, prompts of {args.prompt_lens} tokens, "
+             f"{args.max_tokens} output tokens each")
+    with evidence(title):
         mlx_model, tokenizer = load_mlx_lm(args.model)
         rows = {concurrency: {} for concurrency in args.concurrency}
 
@@ -55,6 +57,19 @@ def main() -> None:
         print("|---" * (len(labels) + 1) + "|")
         for concurrency, row in rows.items():
             print(f"| {concurrency} | " + " | ".join(f"{row[label]:,.0f} tok/s" for label in labels) + " |")
+
+        figure = Figure(figsize=(9, 5))
+        figure.suptitle(title)
+        axes = figure.subplots()
+        for label in labels:
+            throughputs = [rows[concurrency][label] for concurrency in args.concurrency]
+            axes.plot(args.concurrency, throughputs, marker="o", label=label)
+        axes.set_xscale("log", base=2)
+        axes.set_xticks(args.concurrency, [str(concurrency) for concurrency in args.concurrency])
+        axes.set_xlabel("concurrency")
+        axes.set_ylabel("throughput (tok/s)")
+        axes.legend()
+        save_plot(figure, "bench_serving")
 
 
 if __name__ == "__main__":

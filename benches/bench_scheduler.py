@@ -13,7 +13,8 @@ import time
 from collections import deque
 from itertools import pairwise
 
-from utils import engine, evidence, load_mlx_lm, percentile, random_prompts
+from matplotlib.figure import Figure
+from utils import engine, evidence, grouped_bars, load_mlx_lm, percentile, random_prompts, save_plot
 
 from mini_vllm import DEFAULT_MODEL, LLM, Request
 
@@ -53,9 +54,10 @@ def main() -> None:
     parser.add_argument("--chunk-sizes", type=int, nargs="+", default=[128, 512])
     args = parser.parse_args()
 
-    with evidence(f"Scheduler: {args.requests} requests at {args.rate:g}/s, {args.short_len}-token "
-                  f"prompts with a {args.long_len}-token one every 20th, {args.max_tokens} output "
-                  f"tokens each, {'metal' if args.metal else 'pure'}"):
+    title = (f"Scheduler: {args.requests} requests at {args.rate:g}/s, {args.short_len}-token "
+             f"prompts with a {args.long_len}-token one every 20th, {args.max_tokens} output "
+             f"tokens each, {'metal' if args.metal else 'pure'}")
+    with evidence(title):
         mlx_model, tokenizer = load_mlx_lm(args.model)
         vocab = len(tokenizer.vocab)
         lengths = [args.long_len if i % 20 == 19 else args.short_len for i in range(args.requests)]
@@ -73,13 +75,35 @@ def main() -> None:
 
         print("| prefill | TTFT p50 | TTFT p99 | inter-token p50 | inter-token p99 | inter-token max |")
         print("|---|---|---|---|---|---|")
+        ttft_ms = {"p50": [], "p99": []}
+        gap_ms = {"p50": [], "p99": [], "max": []}
         for label, config in policies:
             llm = engine(mlx_model, tokenizer, args.metal, num_blocks=4096, max_sequences=32, **config)
             arrived, times = replay(llm, prompts, arrivals, args.max_tokens)
             ttfts = [times[r][0] - arrived[r] for r in times]
             gaps = [(b - a) * 1e3 for t in times.values() for a, b in pairwise(t)]
-            print(f"| {label} | {percentile(ttfts, 50) * 1e3:.0f} ms | {percentile(ttfts, 99) * 1e3:.0f} ms"
-                  f" | {percentile(gaps, 50):.1f} ms | {percentile(gaps, 99):.1f} ms | {max(gaps):.1f} ms |")
+            ttft_p50 = percentile(ttfts, 50) * 1e3
+            ttft_p99 = percentile(ttfts, 99) * 1e3
+            gap_p50 = percentile(gaps, 50)
+            gap_p99 = percentile(gaps, 99)
+            gap_max = max(gaps)
+            print(f"| {label} | {ttft_p50:.0f} ms | {ttft_p99:.0f} ms"
+                  f" | {gap_p50:.1f} ms | {gap_p99:.1f} ms | {gap_max:.1f} ms |")
+            ttft_ms["p50"].append(ttft_p50)
+            ttft_ms["p99"].append(ttft_p99)
+            gap_ms["p50"].append(gap_p50)
+            gap_ms["p99"].append(gap_p99)
+            gap_ms["max"].append(gap_max)
+
+        figure = Figure(figsize=(11, 4))
+        figure.suptitle(title)
+        ttft_axes, gap_axes = figure.subplots(1, 2)
+        labels = [label for label, _ in policies]
+        grouped_bars(ttft_axes, labels, ttft_ms)
+        ttft_axes.set_ylabel("TTFT (ms)")
+        grouped_bars(gap_axes, labels, gap_ms)
+        gap_axes.set_ylabel("inter-token latency (ms)")
+        save_plot(figure, "bench_scheduler")
 
 
 if __name__ == "__main__":

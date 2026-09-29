@@ -11,8 +11,18 @@ import statistics
 import time
 
 import mlx.core as mx
+from matplotlib.figure import Figure
 from mlx_lm.generate import generate_step
-from utils import engine, evidence, load_mlx_lm, random_prompts, token_times, variants
+from utils import (
+    engine,
+    evidence,
+    grouped_bars,
+    load_mlx_lm,
+    random_prompts,
+    save_plot,
+    token_times,
+    variants,
+)
 
 from mini_vllm import DEFAULT_MODEL
 
@@ -43,7 +53,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3, help="the median of this many runs")
     args = parser.parse_args()
 
-    with evidence(f"Single request: {args.max_tokens} output tokens, median of {args.repeats}"):
+    title = f"Single request: {args.max_tokens} output tokens, median of {args.repeats}"
+    with evidence(title):
         mlx_model, tokenizer = load_mlx_lm(args.model)
         prompts = random_prompts(len(args.prompt_lens), args.prompt_lens, len(tokenizer.vocab))
 
@@ -64,6 +75,22 @@ def main() -> None:
         print("|---|---|---|---|")
         for (label, length), (ttft, decode) in results.items():
             print(f"| {label} | {length} | {ttft:.1f} ms | {decode:.0f} tok/s |")
+
+        labels = list(dict.fromkeys(label for label, _ in results))
+        lengths = args.prompt_lens
+        groups = [str(length) for length in lengths]
+        figure = Figure(figsize=(11, 4))
+        figure.suptitle(title)
+        ttft_axes, decode_axes = figure.subplots(1, 2)
+        ttft_series = {label: [results[label, n][0] for n in lengths] for label in labels}
+        decode_series = {label: [results[label, n][1] for n in lengths] for label in labels}
+        grouped_bars(ttft_axes, groups, ttft_series)
+        grouped_bars(decode_axes, groups, decode_series)
+        ttft_axes.set_ylabel("TTFT (ms)")
+        decode_axes.set_ylabel("decode (tok/s)")
+        for axes in (ttft_axes, decode_axes):
+            axes.set_xlabel("prompt tokens")
+        save_plot(figure, "bench_generate")
 
 
 if __name__ == "__main__":

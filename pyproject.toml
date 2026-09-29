@@ -11,6 +11,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "matplotlib>=3.9",
     "nanobind==2.15.0",
     "pytest>=8.3",
     "setuptools>=62",

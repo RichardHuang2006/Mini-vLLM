@@ -1,5 +1,5 @@
 """Shared by every bench: timing at mx.eval boundaries, the evidence header, the thermal verdict,
-and the models every engine in a run shares."""
+the models every engine in a run shares, and the plots written to results/."""
 
 from __future__ import annotations
 
@@ -16,10 +16,13 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from importlib.metadata import version
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import mlx_lm
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 
 from mini_vllm import LLM, EngineConfig, StreamUpdate, from_mlx
 
@@ -29,6 +32,8 @@ try:
     METAL_BUILT = True
 except ImportError:
     METAL_BUILT = False
+
+RESULTS = Path(__file__).resolve().parent.parent / "results"
 
 
 def per_call_us(fn: Callable[[], Any], calls: int = 50, repeats: int = 20) -> float:
@@ -141,3 +146,30 @@ def random_prompts(count: int, lengths: Iterable[int], vocab: int, seed: int = 0
 def variants() -> list[tuple[str, bool]]:
     """(label, use_metal) for each engine this machine can run."""
     return [("mini-vllm pure", False)] + ([("mini-vllm metal", True)] if METAL_BUILT else [])
+
+
+def grouped_bars(axes: Axes, groups: list[str], series: dict[str, list[float]],
+                 horizontal: bool = False) -> None:
+    """One cluster of bars per group, one bar per series in each; a nan value draws no bar."""
+    width = 0.8 / len(series)
+    for i, (label, values) in enumerate(series.items()):
+        positions = [group + i * width for group in range(len(groups))]
+        if horizontal:
+            axes.barh(positions, values, width, label=label)
+        else:
+            axes.bar(positions, values, width, label=label)
+    centers = [group + width * (len(series) - 1) / 2 for group in range(len(groups))]
+    if horizontal:
+        axes.set_yticks(centers, groups)
+    else:
+        axes.set_xticks(centers, groups)
+        axes.margins(y=0.4)  # headroom, so the legend sits above the bars
+    axes.legend()
+
+
+def save_plot(figure: Figure, name: str) -> None:
+    """Write figure to results/<name>.png, replacing the previous run's."""
+    RESULTS.mkdir(exist_ok=True)
+    path = RESULTS / f"{name}.png"
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"\nPlot: {path.relative_to(RESULTS.parent)}")

@@ -11,7 +11,8 @@ import argparse
 import statistics
 import time
 
-from utils import engine, evidence, load_mlx_lm, random_prompts
+from matplotlib.figure import Figure
+from utils import engine, evidence, load_mlx_lm, random_prompts, save_plot
 
 from mini_vllm import DEFAULT_MODEL, LLM
 
@@ -52,8 +53,9 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=256)
     args = parser.parse_args()
 
-    with evidence(f"FP8 KV: {args.requests} requests of {args.prompt_len} + {args.max_tokens} tokens "
-                  f"in {args.kv_mb} MB of KV, {'metal' if args.metal else 'pure'}"):
+    title = (f"FP8 KV: {args.requests} requests of {args.prompt_len} + {args.max_tokens} tokens "
+             f"in {args.kv_mb} MB of KV, {'metal' if args.metal else 'pure'}")
+    with evidence(title):
         mlx_model, tokenizer = load_mlx_lm(args.model)
         a = mlx_model.args
         prompts = random_prompts(args.requests, [args.prompt_len], len(tokenizer.vocab))
@@ -61,12 +63,16 @@ def main() -> None:
         print("| KV pages | bytes per token | pages in budget | most requests in flight | throughput |")
         print("|---|---|---|---|---|")
         greedy = {}
+        dtypes, rates, peaks = [], [], []
         for fp8 in (False, True):
             per_token = 2 * a.num_hidden_layers * a.num_key_value_heads * a.head_dim * (1 if fp8 else 2)
             num_blocks = args.kv_mb * 2**20 // (16 * per_token)
             llm = engine(mlx_model, tokenizer, args.metal, num_blocks=num_blocks,
                          max_sequences=args.requests, fp8_kv_cache=fp8)
             rate, peak = serve(llm, prompts, args.max_tokens)
+            dtypes.append("fp8" if fp8 else "bf16")
+            rates.append(rate)
+            peaks.append(peak)
             print(f"| {'fp8' if fp8 else 'bf16'} | {per_token:,} B | {num_blocks} | {peak} "
                   f"| {rate:,.0f} tok/s |")
             # Each prompt alone, so the only difference between the two runs is the page dtype.
@@ -76,6 +82,15 @@ def main() -> None:
         print(f"\nGreedy, 64 tokens on {len(PROMPTS)} text prompts: fp8 matches bf16 exactly on "
               f"{sum(d == 64 for d in divergences)}; the median first difference is at token "
               f"{statistics.median(divergences):.0f}.")
+
+        figure = Figure(figsize=(9, 4))
+        figure.suptitle(title)
+        rate_axes, peak_axes = figure.subplots(1, 2)
+        rate_axes.bar(dtypes, rates)
+        rate_axes.set_ylabel("throughput (tok/s)")
+        peak_axes.bar(dtypes, peaks)
+        peak_axes.set_ylabel("most requests in flight")
+        save_plot(figure, "bench_quantize")
 
 
 if __name__ == "__main__":
